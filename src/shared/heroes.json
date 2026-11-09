@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "description": "Identity-only hero roster from the supplied artwork; abilities and gameplay statistics are not defined here.",
+  "heroes": [
+    {
+      "id": "adsiz",
+      "name": "Adsiz"
+    },
+    {
+      "id": "bazmut",
+      "name": "Bazmut"
+    },
+    {
+      "id": "gordunhao",
+      "name": "Gordunhao"
+    },
+    {
+      "id": "howler",
+      "name": "Howler"
+    },
+    {
+      "id": "jia-oshi",
+      "name": "Jia Oshi"
+    },
+    {
+      "id": "kira",
+      "name": "Kira"
+    },
+    {
+      "id": "krugg",
+      "name": "Krugg"
+    },
+    {
+      "id": "kylia",
+      "name": "Kylia"
+    },
+    {
+      "id": "la-morte",
+      "name": "La Morte"
+    },
+    {
+      "id": "magjistar",
+      "name": "Magjistar"
+    },
+    {
+      "id": "sandgespenst",
+      "name": "Sandgespenst"
+    },
+    {
+      "id": "sangar-tedra",
+      "name": "Sangar Tedra"
+    },
+    {
+      "id": "shilla",
+      "name": "Shilla"
+    },
+    {
+      "id": "vlko-dlak",
+      "name": "Vlko Dlak"
+    }
+  ]
+}
