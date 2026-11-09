@@ -27,7 +27,7 @@ public sealed class GuestLobbyCommands(
         // Invite codes are 128-bit opaque bearer references. Never accept one
         // supplied by the creator; no enumeration or guessable sequential IDs.
         var roomId = "room-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
-        coordinator.CreateWithOwner(roomId, teamIds, trustedPlayerId, initialTeam, MaxRooms);
+        coordinator.CreateWithOwner(roomId, teamIds!, trustedPlayerId, initialTeam, MaxRooms);
         return reader.ForMember(roomId, trustedPlayerId);
     }
 
