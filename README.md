@@ -62,3 +62,18 @@ Lo script legge esclusivamente i 20 file PNG consentiti, valida percorsi e dimen
 ## Sicurezza del movimento PvP (issue #8)
 
 `MatchStateSnapshot` conserva lo stato completo degli eroi **solo sul server**; `MatchObservationProjector` produce una vista differenziata per osservatore. Senza grants verificati sul backend, non vengono esposti altri personaggi. Anche quando la posizione di un altro eroe è autorizzata, la sua **destinazione prevista non compare mai nel DTO**. La presenza di questa proiezione non implica che matchmaking, autenticazione, visibilità di squadra o movimento siano già stati implementati. Si veda [docs/architecture/match-observation-security.md](docs/architecture/match-observation-security.md).
+ 
+## Lobby pre-partita (issue #10)
+
+I nuovi componenti `LobbyDefinition`, `LobbyState` e
+`InMemoryLobbyCoordinator` supportano squadre configurabili, registrazione,
+uscita e scelta di un singolo eroe per giocatore. Lo stato è immutabile e
+versionato: due modifiche contemporanee sulla stessa revisione non possono
+sovrascriversi. Il roster originale di 14 eroi viene importato da
+`src/shared/heroes.json` come risorsa embedded dal progetto .NET Application.
+
+**Non è ancora una lobby online:** mancano identità/autenticazione, API,
+SignalR, persistenza e regole ufficiali di avvio partita. Nessun endpoint
+consente di impersonare un giocatore. Dettagli:
+`docs/architecture/lobby-foundation.md`.
+

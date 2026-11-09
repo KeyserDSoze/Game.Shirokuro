@@ -4,5 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../domains/Shirokuro.Domain/Shirokuro.Domain.csproj" />
+    <EmbeddedResource Include="../../../shared/heroes.json" LogicalName="Shirokuro.Application.Heroes.OriginalHeroes.json" />
   </ItemGroup>
 </Project>
+
