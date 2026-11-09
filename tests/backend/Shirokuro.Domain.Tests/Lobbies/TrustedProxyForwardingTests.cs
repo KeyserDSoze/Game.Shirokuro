@@ -26,15 +26,20 @@ public sealed class TrustedProxyForwardingTests
     public void WithoutConfiguredProxiesMiddlewareStaysOffIncludingLoopback()
     {
         var services = new ServiceCollection();
-        Assert.False(TrustedProxyForwarding.Configure(services, Config()));
+        TrustedProxyForwarding.Configure(services, Config());
+        using var provider = services.BuildServiceProvider();
+        var options = provider.GetRequiredService<IOptions<ForwardedHeadersOptions>>().Value;
+        Assert.Equal(ForwardedHeaders.None, options.ForwardedHeaders);
+        Assert.Empty(options.KnownProxies);
+        Assert.Empty(options.KnownIPNetworks);
     }
 
     [Fact]
     public void ExplicitProxiesOnlyAllowSingleHopForAndProtoNeverHost()
     {
         var services = new ServiceCollection();
-        Assert.True(TrustedProxyForwarding.Configure(
-            services, Config("192.0.2.10", "2001:db8::10")));
+        TrustedProxyForwarding.Configure(
+            services, Config("192.0.2.10", "2001:db8::10"));
         using var provider = services.BuildServiceProvider();
         var options = provider.GetRequiredService<IOptions<ForwardedHeadersOptions>>().Value;
 
@@ -61,20 +66,28 @@ public sealed class TrustedProxyForwardingTests
     public void InvalidOrNonCanonicalTrustedProxiesFailAtStartup(string entry)
     {
         var services = new ServiceCollection();
+        TrustedProxyForwarding.Configure(services, Config(entry));
+        using var provider = services.BuildServiceProvider();
         Assert.Throws<InvalidOperationException>(() =>
-            TrustedProxyForwarding.Configure(services, Config(entry)));
+            provider.GetRequiredService<IOptions<ForwardedHeadersOptions>>().Value);
     }
 
     [Fact]
     public void DuplicateTrustedProxyAndExcessiveEntryCountFailAtStartup()
     {
-        Assert.Throws<InvalidOperationException>(() =>
-            TrustedProxyForwarding.Configure(new ServiceCollection(),
-                Config("192.0.2.10", "192.0.2.10")));
+        static void Invalid(params string[] entries)
+        {
+            var services = new ServiceCollection();
+            TrustedProxyForwarding.Configure(services, Config(entries));
+            using var provider = services.BuildServiceProvider();
+            Assert.Throws<InvalidOperationException>(() =>
+                provider.GetRequiredService<IOptions<ForwardedHeadersOptions>>().Value);
+        }
+
+        Invalid("192.0.2.10", "192.0.2.10");
         var tooMany = Enumerable.Range(1, 33)
             .Select(index => "192.0.2." + index).ToArray();
-        Assert.Throws<InvalidOperationException>(() =>
-            TrustedProxyForwarding.Configure(new ServiceCollection(), Config(tooMany)));
+        Invalid(tooMany);
     }
 
     private static WebApplicationFactory<Program> Server(params string[] knownProxies) =>
