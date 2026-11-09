@@ -10,7 +10,7 @@ namespace Shirokuro.Api.Lobbies;
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record CreateRoomRequest(string[]? TeamIds, string? TeamId);
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
-public sealed record JoinRoomRequest(string? TeamId, long ExpectedRevision);
+public sealed record JoinRoomRequest(string? TeamId, long? ExpectedRevision);
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ChangeTeamRequest(string? TeamId, long ExpectedRevision);
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]

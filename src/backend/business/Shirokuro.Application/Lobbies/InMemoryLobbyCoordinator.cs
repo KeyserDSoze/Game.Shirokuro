@@ -55,19 +55,19 @@ public sealed class InMemoryLobbyCoordinator
 
     public LobbyState JoinBounded(
         string lobbyId, string trustedPlayerId, string teamId,
-        long expectedRevision, int maxParticipants)
+        long? expectedRevision, int maxParticipants)
     {
         lock (_gate)
         {
             var state = Find(lobbyId);
-            if (state.Revision != expectedRevision)
+            if (expectedRevision.HasValue && state.Revision != expectedRevision.Value)
                 throw new LobbyRevisionConflictException(expectedRevision, state.Revision);
 
             if (state.Participants.Count >= maxParticipants &&
                 !state.Participants.Any(p => p.PlayerId == trustedPlayerId))
                 throw new LobbyCapacityException();
 
-            var next = state.Join(trustedPlayerId, teamId, expectedRevision);
+            var next = state.Join(trustedPlayerId, teamId, state.Revision);
             _lobbies[lobbyId] = next;
             return next;
         }

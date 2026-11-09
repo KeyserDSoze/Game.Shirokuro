@@ -32,7 +32,7 @@ public sealed class GuestLobbyCommands(
     }
 
     public LobbyRosterView Join(
-        string roomId, string trustedPlayerId, string? teamId, long expectedRevision)
+        string roomId, string trustedPlayerId, string? teamId, long? expectedRevision)
     {
         if (teamId is null || teamId.Length == 0 || teamId.Length > 24)
             throw new ArgumentException("Invalid team.");

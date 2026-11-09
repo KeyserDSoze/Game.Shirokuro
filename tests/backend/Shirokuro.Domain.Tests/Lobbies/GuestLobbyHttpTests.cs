@@ -118,6 +118,29 @@ public sealed class GuestLobbyHttpTests
             Assert.Equal(HttpStatusCode.OK, stillThere.StatusCode);
     }
 
+
+    [Fact]
+    public async Task InvitationAloneAllowsSecureJoinWithoutKnowingCurrentRoomRevision()
+    {
+        using var server = Server();
+        using var creator = Client(server);
+        var (_, firstCookie) = await SignIn(creator);
+        using var member = Client(server, firstCookie);
+        var (room, _) = await Create(member);
+
+        using var secondVisitor = Client(server);
+        var (secondId, secondCookie) = await SignIn(secondVisitor);
+        using var second = Client(server, secondCookie);
+        using var request = Write(HttpMethod.Post, "/api/lobbies/" + room + "/join",
+            new { teamId = "black" });
+        using var response = await second.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal(secondId, json.RootElement.GetProperty("participants")[1]
+            .GetProperty("playerId").GetString());
+        Assert.Equal(2, json.RootElement.GetProperty("revision").GetInt64());
+    }
+
     [Fact]
     public async Task MembershipCannotBeSpoofedByHeadersQueriesOrExtraJsonFields()
     {
