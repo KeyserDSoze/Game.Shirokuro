@@ -11,12 +11,23 @@ public static class AuthenticatedPlayerIdentity
 {
     public static string? FromPrincipal(ClaimsPrincipal? principal)
     {
-        if (principal?.Identity?.IsAuthenticated != true)
+        if (principal is null)
         {
             return null;
         }
 
-        var identifiers = principal.FindAll(ClaimTypes.NameIdentifier).ToArray();
+        // Claims in an unauthenticated secondary identity are untrusted.
+        // Multiple authenticated identities are ambiguous until a single
+        // real identity provider and policy have been explicitly selected.
+        var authenticated = principal.Identities
+            .Where(identity => identity.IsAuthenticated)
+            .ToArray();
+        if (authenticated.Length != 1)
+        {
+            return null;
+        }
+
+        var identifiers = authenticated[0].FindAll(ClaimTypes.NameIdentifier).ToArray();
         if (identifiers.Length != 1)
         {
             return null;
@@ -29,4 +40,3 @@ public static class AuthenticatedPlayerIdentity
             : value;
     }
 }
-

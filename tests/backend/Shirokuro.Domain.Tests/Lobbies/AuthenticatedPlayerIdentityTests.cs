@@ -47,7 +47,34 @@ public sealed class AuthenticatedPlayerIdentityTests
         Assert.Null(AuthenticatedPlayerIdentity.FromPrincipal(Build(id)));
     }
 
+
+    [Fact]
+    public void UnauthenticatedSecondaryIdentityCannotProvideThePlayerId()
+    {
+        var signedInWithoutId = new ClaimsIdentity([
+            new Claim(ClaimTypes.Name, "anonymous-cookie")
+        ], "Cookies");
+        var untrustedSecondary = new ClaimsIdentity([
+            new Claim(ClaimTypes.NameIdentifier, "alice")
+        ]);
+        var principal = new ClaimsPrincipal([signedInWithoutId, untrustedSecondary]);
+
+        Assert.Null(AuthenticatedPlayerIdentity.FromPrincipal(principal));
+    }
+
+    [Fact]
+    public void MultipleAuthenticatedIdentitiesAreAmbiguousEvenIfOnlyOneHasAnId()
+    {
+        var signedIn = new ClaimsIdentity([
+            new Claim(ClaimTypes.NameIdentifier, "alice")
+        ], "Cookies");
+        var anotherSignedIn = new ClaimsIdentity([
+            new Claim(ClaimTypes.Name, "bob")
+        ], "Other-Identity");
+        Assert.Null(AuthenticatedPlayerIdentity.FromPrincipal(
+            new ClaimsPrincipal([signedIn, anotherSignedIn])));
+    }
+
     private static ClaimsPrincipal Build(string id) => new(
         new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, id)], "Cookies"));
 }
-
