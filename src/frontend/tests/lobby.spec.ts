@@ -101,3 +101,54 @@ test('malformed invitation is rejected locally and does not trigger a join reque
   expect(joined).toEqual([])
 })
 
+test('a copied signed guest cookie stops accessing a lobby as soon as its owner signs out', async ({ browser }) => {
+  const ownerContext = await browser.newContext()
+  const stolenContext = await browser.newContext()
+  try {
+    const owner = await ownerContext.newPage()
+    await owner.goto('/')
+    await owner.getByTestId('lobby-sign-in').click()
+    await expect(owner.getByTestId('lobby-player')).toContainText('guest-')
+    await owner.getByTestId('lobby-create').click()
+    const room = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
+
+    const originalCookies = await ownerContext.cookies()
+    expect(originalCookies.some(cookie => cookie.name === 'Shirokuro.Session')).toBe(true)
+    await stolenContext.addCookies(originalCookies)
+    const baseUrl = 'http://127.0.0.1:5173'
+
+    const readable = await stolenContext.request.get(baseUrl + '/api/lobbies/' + room + '/roster')
+    expect(readable.status()).toBe(200)
+
+    await owner.getByTestId('lobby-sign-out').click()
+    await expect(owner.getByTestId('lobby-sign-in')).toBeVisible()
+
+    const revoked = await stolenContext.request.get(baseUrl + '/api/sessions/me')
+    expect(revoked.status()).toBe(401)
+    const hidden = await stolenContext.request.get(baseUrl + '/api/lobbies/' + room + '/roster')
+    expect(hidden.status()).toBe(401)
+    const signalr = await stolenContext.request.post(
+      baseUrl + '/hubs/lobbies/negotiate?negotiateVersion=1',
+    )
+    expect(signalr.status()).toBe(401)
+  } finally {
+    await ownerContext.close()
+    await stolenContext.close()
+  }
+})
+
+test('guest refresh can rejoin the same room without minting another identity', async ({ page }) => {
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  const firstIdentity = await page.getByTestId('lobby-player').textContent()
+  await page.getByTestId('lobby-create').click()
+  const code = (await page.getByTestId('lobby-room-code').textContent())!.trim()
+  await page.reload()
+  await expect(page.getByTestId('lobby-player')).toHaveText(firstIdentity!)
+  await page.getByTestId('lobby-invite-input').fill(code)
+  await page.getByTestId('lobby-join-team').fill('white')
+  await page.getByTestId('lobby-join').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-revision')).toContainText('1')
+  await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+})

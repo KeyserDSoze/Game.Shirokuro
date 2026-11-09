@@ -40,6 +40,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       await action()
     } catch (error) {
       if (error instanceof LobbyHttpError) {
+        // A stale/expired private room must not remain presented as current.
+        if (error.status === 404) setRoom(null)
         const key = error.status === 409 ? 'lobbyConflict' :
           error.status === 404 ? 'lobbyMissing' :
           error.status === 429 ? 'lobbyLimited' :

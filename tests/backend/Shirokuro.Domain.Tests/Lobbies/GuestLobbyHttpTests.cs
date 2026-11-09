@@ -2,6 +2,9 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
@@ -9,6 +12,21 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 public sealed class GuestLobbyHttpTests
 {
     private static WebApplicationFactory<Program> Server() => new();
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private long _timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        public override DateTimeOffset GetUtcNow() =>
+            DateTimeOffset.FromUnixTimeMilliseconds(Interlocked.Read(ref _timestamp));
+        public void Advance(TimeSpan duration) =>
+            Interlocked.Add(ref _timestamp, (long)duration.TotalMilliseconds);
+    }
+
+    private static WebApplicationFactory<Program> ServerWithClock(ManualClock clock) =>
+        Server().WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+                services.AddSingleton<TimeProvider>(clock)));
+
 
     private static HttpClient Client(WebApplicationFactory<Program> server, string? cookie = null)
     {
@@ -53,6 +71,63 @@ public sealed class GuestLobbyHttpTests
         using var data = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return (data.RootElement.GetProperty("lobbyId").GetString()!,
             data.RootElement.GetProperty("revision").GetInt64());
+    }
+
+
+    [Fact]
+    public async Task ExpiredRoomIsNotVisibleAndInviteCannotReviveIt()
+    {
+        var clock = new ManualClock();
+        using var server = ServerWithClock(clock);
+        using var guestVisitor = Client(server);
+        var (_, cookie) = await SignIn(guestVisitor);
+        using var owner = Client(server, cookie);
+        var (room, _) = await Create(owner);
+
+        clock.Advance(TimeSpan.FromMinutes(30));
+        using (var expired = await owner.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
+
+        using var secondVisitor = Client(server);
+        var (_, anotherCookie) = await SignIn(secondVisitor);
+        using var second = Client(server, anotherCookie);
+        using var join = Write(HttpMethod.Post, "/api/lobbies/" + room + "/join",
+            new { teamId = "black" });
+        using var result = await second.SendAsync(join);
+        Assert.Equal(HttpStatusCode.NotFound, result.StatusCode);
+    }
+
+    [Fact]
+    public async Task MemberReadExtendsRoomExpiryButIntruderReadCannot()
+    {
+        var clock = new ManualClock();
+        using var server = ServerWithClock(clock);
+        using var guestVisitor = Client(server);
+        var (_, cookie) = await SignIn(guestVisitor);
+        using var member = Client(server, cookie);
+        var (room, _) = await Create(member);
+
+        using var strangerVisitor = Client(server);
+        var (_, outsiderCookie) = await SignIn(strangerVisitor);
+        using var outsider = Client(server, outsiderCookie);
+        clock.Advance(TimeSpan.FromMinutes(20));
+        using (var denied = await outsider.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, denied.StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(9));
+        using (var refreshed = await member.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.OK, refreshed.StatusCode);
+
+        clock.Advance(TimeSpan.FromMinutes(29));
+        using (var alive = await member.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.OK, alive.StatusCode);
+
+        // A later outsider read must not change the TTL.
+        clock.Advance(TimeSpan.FromMinutes(29));
+        using (var denied = await outsider.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, denied.StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(1));
+        using var last = await member.GetAsync("/api/lobbies/" + room + "/roster");
+        Assert.Equal(HttpStatusCode.NotFound, last.StatusCode);
     }
 
     [Fact]
