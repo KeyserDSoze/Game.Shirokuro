@@ -58,3 +58,7 @@ Il file ZIP originale è volutamente escluso dal repository: le immagini grezze 
 
 Lo script legge esclusivamente i 20 file PNG consentiti, valida percorsi e dimensioni dello ZIP, li converte in WebP e produce `src/frontend/public/art/{heroes,tiles}/` insieme a `src/frontend/src/generated/art-manifest.json`. Il selettore visualizza i veri ritratti quando sono presenti nel manifest; altrimenti mostra un fallback privo di richieste HTTP mancanti. I file generati possono essere verificati e committati separatamente; le abilità dei personaggi restano da definire.
 
+
+## Sicurezza del movimento PvP (issue #8)
+
+`MatchStateSnapshot` conserva lo stato completo degli eroi **solo sul server**; `MatchObservationProjector` produce una vista differenziata per osservatore. Senza grants verificati sul backend, non vengono esposti altri personaggi. Anche quando la posizione di un altro eroe è autorizzata, la sua **destinazione prevista non compare mai nel DTO**. La presenza di questa proiezione non implica che matchmaking, autenticazione, visibilità di squadra o movimento siano già stati implementati. Si veda [docs/architecture/match-observation-security.md](docs/architecture/match-observation-security.md).
