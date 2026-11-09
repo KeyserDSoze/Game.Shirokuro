@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Security;
+using Shirokuro.Application.Lobbies;
 using Xunit;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
@@ -222,6 +223,36 @@ public sealed class GuestSessionTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+
+    [Fact]
+    public async Task GuestSessionCannotReadALobbyBeforeTrustedServerAddsMembership()
+    {
+        using var server = CreateServer();
+        using var anonymous = Client(server);
+        var (guestId, cookie) = await Issue(anonymous);
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create("invited-room", ["white", "black"]);
+
+        using var guest = Client(server, cookie);
+        using (var before = await guest.GetAsync("/api/lobbies/invited-room/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, before.StatusCode);
+
+        // The server, not the client's supplied playerId, authorizes admission.
+        coordinator.Join("invited-room", guestId, "white", 0);
+        using var after = await guest.GetAsync(
+            "/api/lobbies/invited-room/roster?playerId=another-user");
+        Assert.Equal(HttpStatusCode.OK, after.StatusCode);
+        var body = await after.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(guestId, doc.RootElement.GetProperty("participants")[0]
+            .GetProperty("playerId").GetString());
+        Assert.DoesNotContain("plannedDestination", body, StringComparison.OrdinalIgnoreCase);
+
+        using var negotiate = await guest.PostAsync(
+            "/hubs/lobbies/negotiate?negotiateVersion=1", null);
+        Assert.Equal(HttpStatusCode.OK, negotiate.StatusCode);
+    }
+
     [Fact]
     public async Task ThirteenthGuestIssuanceInOneMinuteIsRateLimited()
     {
@@ -239,4 +270,3 @@ public sealed class GuestSessionTests
         Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
     }
 }
-
