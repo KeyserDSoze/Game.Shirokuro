@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -16,6 +17,14 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 
 public sealed class TrustedProxyForwardingTests
 {
+    // The low-level TestServer.SendAsync API does not infer whether the
+    // request has a body from an HttpClient transport. Minimal API JSON
+    // binding consults this feature before reading the supplied MemoryStream.
+    private sealed class JsonBodyPresentFeature : IHttpRequestBodyDetectionFeature
+    {
+        public bool CanHaveBody => true;
+    }
+
     private static IConfiguration Config(params string[] entries) =>
         new ConfigurationBuilder().AddInMemoryCollection(
             entries.Select((value, index) =>
@@ -137,6 +146,8 @@ public sealed class TrustedProxyForwardingTests
                 context.Request.ContentType = "application/json";
                 context.Request.ContentLength = bytes.Length;
                 context.Request.Body = new MemoryStream(bytes);
+                context.Features.Set<IHttpRequestBodyDetectionFeature>(
+                    new JsonBodyPresentFeature());
             }
         });
     }
