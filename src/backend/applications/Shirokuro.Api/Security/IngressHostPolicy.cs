@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.HostFiltering;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -47,6 +48,18 @@ public sealed class IngressHostPolicy
         }
         return new IngressHostPolicy(allowed);
     }
+
+    /// <summary>
+    /// ASP.NET's built-in HostFiltering middleware compares hostnames only,
+    /// while Shirokuro additionally compares the exact port. Feed the
+    /// built-in filter hostnames without ports to avoid incorrectly rejecting
+    /// explicitly configured non-default ports.
+    /// </summary>
+    public IReadOnlyList<string> AllowedHostnamesForFramework =>
+        _allowedHosts is null ? [] : _allowedHosts
+            .Select(authority => new Uri("http://" + authority).Host)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
     public bool Allows(HttpRequest request)
     {
@@ -116,5 +129,16 @@ public static class IngressHostPolicyRegistration
                 options.Policy = IngressHostPolicy.Create(
                     configuration, env.IsDevelopment()))
             .ValidateOnStart();
+
+        // The framework's built-in filter works on names, not (name,port).
+        // Keep its defense in depth for the host portion, then enforce the
+        // exact Host+port with Shirokuro's strict ingress guard.
+        services.PostConfigure<HostFilteringOptions, IConfiguration, IHostEnvironment>(
+            (options, configuration, env) =>
+            {
+                if (!env.IsDevelopment())
+                    options.AllowedHosts = IngressHostPolicy.Create(configuration, false)
+                        .AllowedHostnamesForFramework;
+            });
     }
 }
