@@ -56,7 +56,7 @@ Il file ZIP originale è volutamente escluso dal repository: le immagini grezze 
     python -m pip install -r scripts/requirements-art.txt
     python scripts/import_art.py /percorso/allo/shirokurozip.zip
 
-Lo script legge esclusivamente i 20 file PNG consentiti, valida percorsi e dimensioni dello ZIP, li converte in WebP e produce `src/frontend/public/art/{heroes,tiles}/` insieme a `src/frontend/src/generated/art-manifest.json`. Il selettore visualizza i veri ritratti quando sono presenti nel manifest; altrimenti mostra un fallback privo di richieste HTTP mancanti. I file generati possono essere verificati e committati separatamente; le abilità dei personaggi restano da definire.
+Lo script legge esclusivamente i 20 file PNG consentiti, valida percorsi e dimensioni dello ZIP, li converte in WebP e produce `src/frontend/public/art/{heroes,tiles}/` insieme a `src/frontend/src/generated/art-manifest.json`. Il selettore mostra i ritratti dettagliati quando sono presenti nel manifest; altrimenti usa l'atlas delle miniature originali già incluso nella repository, senza richieste HTTP a file mancanti. I file generati possono essere verificati e committati separatamente; le abilità dei personaggi restano da definire.
 
 
 ## Sicurezza del movimento PvP (issue #8)
@@ -89,4 +89,3 @@ Per rigenerarlo da `shirokurozip.zip`:
 
 La mappa R3F contiene ancora una pedina 3D provvisoria. I ritratti dettagliati,
 le carte e le texture originali della mappa saranno trattati in #4.
-
