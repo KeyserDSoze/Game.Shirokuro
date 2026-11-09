@@ -253,6 +253,95 @@ public sealed class GuestSessionTests
         Assert.Equal(HttpStatusCode.OK, negotiate.StatusCode);
     }
 
+
+    [Fact]
+    public async Task StolenGuestCookieIsRejectedImmediatelyAfterOriginalLogout()
+    {
+        using var server = CreateServer();
+        using var visitor = Client(server);
+        var (id, stolenCookie) = await Issue(visitor);
+
+        using var owner = Client(server, stolenCookie);
+        using var attackerWithCopiedTicket = Client(server, stolenCookie);
+
+        using (var before = await attackerWithCopiedTicket.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, before.StatusCode);
+
+        using (var request = Mutation(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var response = await owner.SendAsync(request))
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using (var after = await attackerWithCopiedTicket.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, after.StatusCode);
+        using (var hub = await attackerWithCopiedTicket.PostAsync(
+            "/hubs/lobbies/negotiate?negotiateVersion=1", null))
+            Assert.Equal(HttpStatusCode.Unauthorized, hub.StatusCode);
+
+        // A new login cannot silently reuse the revoked guest ticket.
+        using var freshRequest = Mutation(HttpMethod.Post, "/api/sessions/guest");
+        using var freshResponse = await attackerWithCopiedTicket.SendAsync(freshRequest);
+        Assert.Equal(HttpStatusCode.OK, freshResponse.StatusCode);
+        using var data = JsonDocument.Parse(await freshResponse.Content.ReadAsStringAsync());
+        Assert.NotEqual(id, data.RootElement.GetProperty("playerId").GetString());
+    }
+
+    [Fact]
+    public async Task RevokingOneGuestCannotInvalidateAnotherVisitorsSession()
+    {
+        using var server = CreateServer();
+        using var first = Client(server);
+        using var second = Client(server);
+        var (_, firstCookie) = await Issue(first);
+        var (secondId, secondCookie) = await Issue(second);
+        using var firstMember = Client(server, firstCookie);
+        using var secondMember = Client(server, secondCookie);
+
+        using (var logout = Mutation(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var response = await firstMember.SendAsync(logout))
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using var stillValid = await secondMember.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, stillValid.StatusCode);
+        using var doc = JsonDocument.Parse(await stillValid.Content.ReadAsStringAsync());
+        Assert.Equal(secondId, doc.RootElement.GetProperty("playerId").GetString());
+    }
+
+    [Fact]
+    public async Task UnregisteredOrLegacySignedGuestTicketsFailClosed()
+    {
+        using var server = CreateServer();
+        var legacy = SignedCookie(server,
+            new Claim(ClaimTypes.NameIdentifier, "guest-" + new string('a', 32)),
+            new Claim(GuestSessions.SessionKindClaim, GuestSessions.GuestKind));
+        using var legacyClient = Client(server, legacy);
+        using var deniedLegacy = await legacyClient.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedLegacy.StatusCode);
+
+        var phantomToken = SignedCookie(server,
+            new Claim(ClaimTypes.NameIdentifier, "guest-" + new string('a', 32)),
+            new Claim(GuestSessions.SessionKindClaim, GuestSessions.GuestKind),
+            new Claim(GuestSessions.SessionIdClaim, new string('b', 32)));
+        using var phantomClient = Client(server, phantomToken);
+        using var deniedPhantom = await phantomClient.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedPhantom.StatusCode);
+    }
+
+    [Fact]
+    public async Task InvalidLogoutCsrfCannotRevokeAnExistingGuestTicket()
+    {
+        using var server = CreateServer();
+        using var visitor = Client(server);
+        var (_, cookie) = await Issue(visitor);
+        using var member = Client(server, cookie);
+
+        using (var bad = Mutation(HttpMethod.Delete, "/api/sessions/guest", "https://evil.example"))
+        using (var result = await member.SendAsync(bad))
+            Assert.Equal(HttpStatusCode.Forbidden, result.StatusCode);
+
+        using var stillValid = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, stillValid.StatusCode);
+    }
+
     [Fact]
     public async Task ThirteenthGuestIssuanceInOneMinuteIsRateLimited()
     {
