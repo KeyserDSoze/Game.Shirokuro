@@ -1,8 +1,11 @@
 # Lobby foundation (issue #10)
 
 This is a **server-side pre-match building block**, not a player-connectable
-lobby. No HTTP endpoint, SignalR hub, matchmaking, user account or game rules
-are implemented here.
+lobby. Issue #18 has subsequently added a **member-scoped, read-only** HTTP
+roster endpoint and SignalR `GetRoster` hub behind signed-session checks.
+There is still no cookie-issuing identity provider, room admission, matchmaking,
+lobby mutation endpoint or live game rules. See
+`docs/architecture/authenticated-lobby-readonly.md`.
 
 ## Domain
 
@@ -34,7 +37,8 @@ All `trustedPlayerId` method arguments mean **a player identity already
 verified by a server-side authentication boundary**. Never expose such
 methods as unauthenticated HTTP endpoints that accept arbitrary player IDs.
 
-A future authenticated API/SignalR implementation (issue #9) must:
+The read-only authenticated roster boundary in #18 is the first transport step.
+The later **writable** lobby and match implementation (#9 and dependent issues) must:
 1. Derive player identity exclusively from a validated session.
 2. Authorize lobby creation, join, leave and all selection updates.
 3. Keep revision checks and handle reconnect/retry scenarios.
@@ -52,4 +56,3 @@ or capture-the-treasure rules are assumed.
 Tested with xUnit: invariants, multiple teams, legitimate/invalid choices,
 unknown participants, immutable snapshots, revision conflicts, simultaneous
 writes, independent rooms and roster parity.
-
