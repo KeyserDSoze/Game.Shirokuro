@@ -6,6 +6,7 @@ import HexWorld from '@/game/HexWorld'
 import HeroSelector from '@/features/heroes/HeroSelector'
 import HeroReferenceCards from '@/features/heroes/HeroReferenceCards'
 import MovementCardGallery from '@/features/heroes/MovementCardGallery'
+import LobbyPanel from '@/features/lobbies/LobbyPanel'
 import { heroRoster } from '@/features/heroes/catalog'
 import TerrainEditor from '@/features/terrain/TerrainEditor'
 import MapDocumentEditor from '@/features/terrain/MapDocumentEditor'
@@ -85,6 +86,7 @@ export default function App() {
               </div>
             </CardContent>
           </Card>
+          <LobbyPanel previewHeroId={selectedHeroId} />
           <HeroSelector selectedId={selectedHeroId} onSelect={setSelectedHeroId} />
         </aside>
 
@@ -157,6 +159,7 @@ export default function App() {
     </div>
   )
 }
+
 
 
 
