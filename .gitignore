@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/.vite/
+**/test-results/
+**/playwright-report/
+**/coverage/
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode/
+.idea/
+*.user
+

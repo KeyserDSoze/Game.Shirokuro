@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <RootNamespace>Shirokuro.Api</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../business/Shirokuro.Application/Shirokuro.Application.csproj" />
+    <ProjectReference Include="../../infrastructure/Shirokuro.Infrastructure/Shirokuro.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
