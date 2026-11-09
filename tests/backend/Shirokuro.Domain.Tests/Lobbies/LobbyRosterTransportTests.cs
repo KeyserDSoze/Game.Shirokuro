@@ -222,6 +222,39 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal("room", hub.GetRoster("room").LobbyId);
     }
 
+
+    [Fact]
+    public void ExistingSignalRConnectionCannotReadAfterGuestLogoutRevocation()
+    {
+        var playerId = "guest-" + new string('a', 32);
+        var clock = TimeProvider.System;
+        var registry = new GuestSessionRegistry(clock);
+        var token = registry.Register(playerId, clock.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(playerId, token);
+
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create("secret", ["white", "black"]);
+        coordinator.Join("secret", playerId, "white", 0);
+
+        // The same Context.User survives as a cached principal across a
+        // long-lived socket; the registry must be consulted per invocation.
+        var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator), registry)
+        {
+            Context = new FakeHubContext(principal)
+        };
+        Assert.Equal("secret", hub.GetRoster("secret").LobbyId);
+        Assert.True(registry.Revoke(principal));
+        Assert.Equal("Lobby unavailable.",
+            Assert.Throws<HubException>(() => hub.GetRoster("secret")).Message);
+
+        // A valid ticket with a session ID no longer registered also fails.
+        var newHub = new LobbyRosterHub(new LobbyRosterReader(coordinator), registry)
+        {
+            Context = new FakeHubContext(principal)
+        };
+        Assert.Throws<HubException>(() => newHub.GetRoster("secret"));
+    }
+
     [Fact]
     public void SessionCookieSettingsHaveStrictSecurityDefaults()
     {

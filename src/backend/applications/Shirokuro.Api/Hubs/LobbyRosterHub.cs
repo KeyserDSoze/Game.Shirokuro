@@ -11,12 +11,22 @@ namespace Shirokuro.Api.Hubs;
 /// notifications must reauthorize every receiver before sending.
 /// </summary>
 [Authorize]
-public sealed class LobbyRosterHub(LobbyRosterReader reader) : Hub
+public sealed class LobbyRosterHub(LobbyRosterReader reader, GuestSessionRegistry? sessions = null) : Hub
 {
     public LobbyRosterView GetRoster(string lobbyId)
     {
         var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(Context.User);
         if (trustedPlayerId is null)
+        {
+            throw new HubException("Lobby unavailable.");
+        }
+
+        // SignalR connections may outlive cookie logout. Never trust only the
+        // principal cached when the socket connected: check active guest
+        // registration again on every Hub method invocation.
+        var isGuestLike = trustedPlayerId.StartsWith("guest-", StringComparison.Ordinal) ||
+            Context.User?.FindAll(GuestSessions.SessionKindClaim).Any() == true;
+        if (isGuestLike && sessions?.IsActive(Context.User) != true)
         {
             throw new HubException("Lobby unavailable.");
         }
