@@ -4,9 +4,11 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 using Shirokuro.Api.Security;
 using Xunit;
 
@@ -80,21 +82,32 @@ public sealed class IngressHostPolicyTests
         }
         var missing = new DefaultHttpContext().Request;
         Assert.False(policy.Allows(missing));
+
+        var multiple = new DefaultHttpContext().Request;
+        multiple.Headers["Host"] = new StringValues(
+            new[] { "game.example", "evil.example" });
+        Assert.False(policy.Allows(multiple));
     }
 
     private static WebApplicationFactory<Program> Server(
         string environment = "Production",
         string? hosts = "localhost;game.example",
-        string? origin = "https://game.example") =>
+        string? origin = "https://game.example",
+        string? knownProxy = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment(environment);
             builder.ConfigureAppConfiguration((_, config) =>
-                config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                var settings = new Dictionary<string, string?>
                 {
                     ["AllowedHosts"] = hosts,
                     ["Security:AllowedOrigins:0"] = origin
-                }));
+                };
+                if (knownProxy is not null)
+                    settings["Security:KnownProxies:0"] = knownProxy;
+                config.AddInMemoryCollection(settings);
+            });
         });
 
     private static HttpClient Client(WebApplicationFactory<Program> server,
@@ -226,14 +239,52 @@ public sealed class IngressHostPolicyTests
     [Fact]
     public async Task ForwardedHostCannotBypassConfiguredHostEvenWhenProxyIsTrusted()
     {
-        using var server = Server();
+        using var server = Server(knownProxy: "192.0.2.10");
+
+        async Task<HttpContext> Send(string rawHost, string forwardedHost) =>
+            await server.Server.SendAsync(context =>
+            {
+                // The remote address is a transport-level fact, not an XFF
+                // value supplied by the browser.
+                context.Connection.RemoteIpAddress = IPAddress.Parse("192.0.2.10");
+                context.Request.Method = "GET";
+                context.Request.Scheme = "http";
+                context.Request.Host = new HostString(rawHost);
+                context.Request.Path = "/api/health";
+                context.Request.Headers["X-Forwarded-For"] = "203.0.113.10";
+                context.Request.Headers["X-Forwarded-Proto"] = "https";
+                context.Request.Headers["X-Forwarded-Host"] = forwardedHost;
+            });
+
+        var rejected = await Send("evil.example", "game.example");
+        Assert.Equal(400, rejected.Response.StatusCode);
+
+        // The trusted proxy is allowed to report the client IP/scheme but
+        // must not overwrite a valid Host with its forwarded host value.
+        var allowed = await Send("game.example", "evil.example");
+        Assert.Equal(200, allowed.Response.StatusCode);
+        Assert.Equal("game.example", allowed.Request.Host.Host);
+    }
+
+    [Fact]
+    public async Task NonDefaultAllowedHostPortMustMatchExactly()
+    {
+        using var server = Server(hosts: "game.example:8443");
         using var client = Client(server);
-        using var request = Request(HttpMethod.Get, "/api/health", "evil.example");
-        request.Headers.TryAddWithoutValidation("X-Forwarded-Host", "game.example");
-        request.Headers.TryAddWithoutValidation("X-Forwarded-Proto", "https");
-        request.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
-        using var result = await client.SendAsync(request);
-        Assert.Equal(HttpStatusCode.BadRequest, result.StatusCode);
+        using (var exact = Request(HttpMethod.Get, "/api/health",
+            "game.example:8443"))
+        using (var result = await client.SendAsync(exact))
+            Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+
+        using (var different = Request(HttpMethod.Get, "/api/health",
+            "game.example:8444"))
+        using (var denied = await client.SendAsync(different))
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+
+        using var unqualified = Request(HttpMethod.Get, "/api/health",
+            "game.example");
+        using var blocked = await client.SendAsync(unqualified);
+        Assert.Equal(HttpStatusCode.BadRequest, blocked.StatusCode);
     }
 
     [Theory]
