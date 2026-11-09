@@ -33,7 +33,7 @@ Backend:
 Frontend (separate terminal):
 
     cd src/frontend
-    npm install
+    npm ci
     npm run dev
 
 The frontend currently renders a **local preview board** without calling the API. The API provides GET /api/health and GET /api/preview/board?radius=2 as scaffolding. No match, player, fog-of-war or movement state exists yet.

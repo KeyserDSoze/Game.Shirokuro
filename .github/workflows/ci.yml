@@ -30,12 +30,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm install --no-audit --no-fund
-      - name: Export generated lockfile (bootstrap only)
-        run: |
-          echo SHIROKURO_LOCK_BEGIN
-          base64 -w 4096 package-lock.json
-          echo SHIROKURO_LOCK_END
+      - run: npm ci --no-audit --no-fund
       - run: npm run test:unit
       - run: npm run build
       - run: npx playwright install --with-deps chromium
