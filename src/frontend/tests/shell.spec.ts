@@ -90,3 +90,48 @@ test('original art remains available on mobile and after changing language and t
   await expect(page.getByTestId('selected-hero')).toHaveText('Kylia')
 })
 
+test('serves the original six-terrain WebP atlas and displays its swatches', async ({ page }) => {
+  const response = await page.request.get('/art/terrain-original-atlas.webp')
+  expect(response.ok()).toBeTruthy()
+  expect(response.headers()['content-type']).toContain('image/webp')
+  expect((await response.body()).length).toBeLessThan(10_000)
+
+  await page.goto('/')
+  const types = page.getByRole('group', { name: 'Tipi di terreno' })
+  await expect(types.getByRole('button')).toHaveCount(6)
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  await expect(page.getByTestId('terrain-art-water')).toHaveCSS('background-position', '-48px -48px')
+  await expect(page.getByTestId('terrain-art-black')).toHaveCSS('background-image', /terrain-original-atlas/)
+})
+
+test('terrain editor paints only the selected local hex and can reset without a match', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Scegli Acqua' }).click()
+  await expect(page.getByTestId('terrain-brush-water')).toHaveAttribute('aria-pressed', 'true')
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+
+  await page.getByRole('button', { name: 'Scegli Natura' }).focus()
+  await page.keyboard.press('Enter')
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Natura')
+
+  await page.getByTestId('terrain-reset').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  await expect(page.getByText('nessuna partita attiva', { exact: false }).first()).toBeVisible()
+})
+
+test('terrain editor works on mobile in English and dark mode', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await expect(page.getByRole('heading', { name: 'Original terrains' })).toBeVisible()
+  await page.getByRole('button', { name: 'Choose Sand' }).click()
+  await page.getByRole('button', { name: 'Apply terrain' }).click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Sand')
+  await page.getByRole('button', { name: 'Reset preview' }).click()
+  await expect(page.getByTestId('terrain-current')).toContainText('City')
+  await expect(page.getByTestId('world-stage')).toBeVisible()
+})
+

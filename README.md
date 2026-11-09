@@ -89,3 +89,19 @@ Per rigenerarlo da `shirokurozip.zip`:
 
 La mappa R3F contiene ancora una pedina 3D provvisoria. I ritratti dettagliati,
 le carte e le texture originali della mappa saranno trattati in #4.
+ 
+## Anteprima 3D dei terreni (issue #12)
+
+Le **sei immagini originali** `tasselli/{black,white,city,sand,water,wild}.png`
+sono ora incluse in un piccolo atlas `src/frontend/public/art/terrain-original-atlas.webp`
+usato sia per le superfici degli esagoni 3D (Three.js) sia per i controlli
+di selezione. Per rigenerare dal materiale originale, con Pillow installato:
+
+    python scripts/build_terrain_atlas.py /percorso/allo/shirokurozip.zip
+
+Il pannello **Terreni originali** permette di assegnare temporaneamente una
+texture all'esagono selezionato e ripristinare la distribuzione dimostrativa.
+Tutte le modifiche restano nel browser e **non** costituiscono mappa ufficiale,
+regole di movimento, né dati inviati al backend. La qualità dei materiali e le
+carte restano tracciate dall'issue #4.
+

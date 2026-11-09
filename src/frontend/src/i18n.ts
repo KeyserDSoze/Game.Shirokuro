@@ -23,6 +23,15 @@ void i18n.use(initReactI18next).init({
       heroHint: 'Modello 3D provvisorio. Le abilità saranno definite dalle regole.',
       selection: 'Esagono selezionato',
       selectionHint: 'Coordinate assiali · soltanto un esempio visivo.',
+      terrainTitle: 'Terreni originali',
+      terrainDescription: 'Prova le sei texture originali sugli esagoni 3D.',
+      terrainChoices: 'Tipi di terreno',
+      terrainCurrent: 'Terreno della casella: {{name}}',
+      terrainChoose: 'Scegli {{name}}',
+      terrainApply: 'Applica terreno',
+      terrainReset: 'Ripristina anteprima',
+      terrainLocalNotice: 'Modifiche soltanto locali: nessuna partita attiva, nessuna regola di movimento.',
+      terrainNames: { black: 'Nero', white: 'Bianco', city: 'Città', sand: 'Sabbia', water: 'Acqua', wild: 'Natura' },
       status: 'Stato del progetto',
       statusHint: 'Scena locale, nessuna partita attiva e nessun movimento inviato.',
       hidden: 'Movimenti nascosti',
@@ -53,6 +62,15 @@ void i18n.use(initReactI18next).init({
       heroHint: 'Placeholder 3D model. Abilities will be defined by the rules.',
       selection: 'Selected hexagon',
       selectionHint: 'Axial coordinates · visual example only.',
+      terrainTitle: 'Original terrains',
+      terrainDescription: 'Preview the six original terrain textures on the 3D hexes.',
+      terrainChoices: 'Terrain types',
+      terrainCurrent: 'Selected hex terrain: {{name}}',
+      terrainChoose: 'Choose {{name}}',
+      terrainApply: 'Apply terrain',
+      terrainReset: 'Reset preview',
+      terrainLocalNotice: 'Local preview only: no active match and no movement rules.',
+      terrainNames: { black: 'Black', white: 'White', city: 'City', sand: 'Sand', water: 'Water', wild: 'Wild' },
       status: 'Project status',
       statusHint: 'Local scene, no active match and no movement submitted.',
       hidden: 'Hidden movement',
@@ -70,5 +88,6 @@ void i18n.use(initReactI18next).init({
 })
 
 export default i18n
+
 
 

@@ -67,4 +67,15 @@ non leggibili o ZIP non sicuri; i relativi test CI usano fixture sintetiche.
 
 L'issue #4 resta aperta per le immagini dettagliate, i terreni, le carte,
 gli aspetti di attribuzione/licenza dell'arte e la verifica del rilascio.
+ 
+## Texture terreni nella scena 3D (issue #12)
+
+Atlas leggero `terrain-original-atlas.webp` con disposizione 3×2 da
+`tasselli/black.png`, `white.png`, `city.png`, `sand.png`, `water.png`
+e `wild.png`, in quest'ordine; celle WebP di riferimento da 64×64 pixel.
+Il frontend mostra le texture sulle facce superiori degli esagoni reali
+Three.js, mantenendo i lati tridimensionali. L'assegnazione alle celle
+è *solo dimostrativa*, modificabile localmente, senza regole di terreno
+o visibilità approvate. Il generatore è `scripts/build_terrain_atlas.py`;
+l'issue #4 segue l'importazione completa e l'autorizzazione all'uso pubblico.
 

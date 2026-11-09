@@ -1,12 +1,15 @@
 import { Canvas } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
-import { useMemo } from 'react'
+import { OrbitControls, useTexture } from '@react-three/drei'
+import { Suspense, useEffect, useMemo } from 'react'
+import { SRGBColorSpace } from 'three'
 import { useTranslation } from 'react-i18next'
 import { axialToWorld, createHexBoard, type HexCoordinate } from './hex'
+import { terrainAtCell, terrainIds, terrainAtlasSlot, TERRAIN_ATLAS_COLUMNS, TERRAIN_ATLAS_ROWS, TERRAIN_ATLAS_PATH, type TerrainOverrides } from './terrain'
 
 type Props = {
   selected: HexCoordinate
   onSelect: (value: HexCoordinate) => void
+  terrainOverrides: TerrainOverrides
 }
 
 function HeroToken() {
@@ -40,8 +43,21 @@ function HeroToken() {
   )
 }
 
-function WorldMeshes({ selected, onSelect }: Props) {
+function WorldMeshes({ selected, onSelect, terrainOverrides }: Props) {
   const cells = useMemo(() => createHexBoard(2), [])
+  const atlas = useTexture(`${import.meta.env.BASE_URL}${TERRAIN_ATLAS_PATH}`)
+  const topTextures = useMemo(() => terrainIds.map(id => {
+    const slot = terrainAtlasSlot(id)
+    const texture = atlas.clone()
+    texture.colorSpace = SRGBColorSpace
+    texture.repeat.set(1 / TERRAIN_ATLAS_COLUMNS, 1 / TERRAIN_ATLAS_ROWS)
+    // Three.js texture V coordinates run bottom-to-top; source atlas rows top-to-bottom.
+    texture.offset.set(slot.column / TERRAIN_ATLAS_COLUMNS, (TERRAIN_ATLAS_ROWS - 1 - slot.row) / TERRAIN_ATLAS_ROWS)
+    texture.needsUpdate = true
+    return texture
+  }), [atlas])
+
+  useEffect(() => () => { topTextures.forEach(texture => texture.dispose()) }, [topTextures])
   return (
     <>
       <color attach="background" args={['#171b26']} />
@@ -55,7 +71,8 @@ function WorldMeshes({ selected, onSelect }: Props) {
       {cells.map((cell) => {
         const position = axialToWorld(cell)
         const active = cell.q === selected.q && cell.r === selected.r
-        const light = (cell.q - cell.r + 12) % 2 === 0
+        const terrain = terrainAtCell(cell, terrainOverrides)
+        const atlasIndex = terrainAtlasSlot(terrain).index
         return (
           <mesh
             key={cell.q + ':' + cell.r}
@@ -67,11 +84,9 @@ function WorldMeshes({ selected, onSelect }: Props) {
             onClick={(event) => { event.stopPropagation(); onSelect(cell) }}
           >
             <cylinderGeometry args={[0.98, 0.98, active ? 0.42 : 0.3, 6]} />
-            <meshStandardMaterial
-              color={active ? '#b7a0e9' : light ? '#e9e1d2' : '#41485b'}
-              roughness={0.82}
-              metalness={0.03}
-            />
+            <meshStandardMaterial attach="material-0" color={active ? '#a48bcf' : '#3b4151'} roughness={0.82} />
+            <meshStandardMaterial attach="material-1" map={topTextures[atlasIndex]} color={active ? '#dfcaff' : '#ffffff'} roughness={0.83} />
+            <meshStandardMaterial attach="material-2" color="#252b3a" roughness={1} />
           </mesh>
         )
       })}
@@ -98,9 +113,12 @@ export default function HexWorld(props: Props) {
         camera={{ position: [6, 9, 11], fov: 44, near: 0.1, far: 100 }}
         fallback={<p className="p-6 text-white" role="status">{t('webglFallback')}</p>}
       >
-        <WorldMeshes {...props} />
+        <Suspense fallback={null}>
+          <WorldMeshes {...props} />
+        </Suspense>
       </Canvas>
     </div>
   )
 }
+
 
