@@ -152,3 +152,47 @@ test('guest refresh can rejoin the same room without minting another identity', 
   await expect(page.getByTestId('lobby-revision')).toContainText('1')
   await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
 })
+
+test('one guest cannot create a fifth active room, while another guest remains independent', async ({ browser }) => {
+  const creatorContext = await browser.newContext()
+  const independentContext = await browser.newContext()
+  try {
+    const creator = await creatorContext.newPage()
+    await creator.goto('/')
+    await creator.getByTestId('lobby-sign-in').click()
+    await expect(creator.getByTestId('lobby-player')).toContainText('guest-')
+
+    // Use real browser cookies and same-origin requests; the UI deliberately
+    // shows only one active room at a time.
+    const results = await creator.evaluate(async () => {
+      const statuses: number[] = []
+      const rooms: string[] = []
+      for (let i = 0; i < 5; i++) {
+        const response = await fetch('/api/lobbies', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json', 'X-Shirokuro-Request': '1' },
+          body: JSON.stringify({ teamIds: ['white', 'black'], teamId: 'white' }),
+        })
+        statuses.push(response.status)
+        if (response.status === 201) {
+          const payload = await response.json() as { lobbyId: string }
+          rooms.push(payload.lobbyId)
+        }
+      }
+      return { statuses, rooms }
+    })
+    expect(results.statuses).toEqual([201, 201, 201, 201, 429])
+    expect(new Set(results.rooms).size).toBe(4)
+
+    const independent = await independentContext.newPage()
+    await independent.goto('/')
+    await independent.getByTestId('lobby-sign-in').click()
+    await expect(independent.getByTestId('lobby-player')).toContainText('guest-')
+    await independent.getByTestId('lobby-create').click()
+    await expect(independent.getByTestId('lobby-message')).toContainText('Lobby creata')
+  } finally {
+    await creatorContext.close()
+    await independentContext.close()
+  }
+})

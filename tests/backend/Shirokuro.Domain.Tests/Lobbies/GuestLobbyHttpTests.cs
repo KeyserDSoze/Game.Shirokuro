@@ -376,5 +376,36 @@ public sealed class GuestLobbyHttpTests
         using var roster = await owner.GetAsync("/api/lobbies/" + room + "/roster");
         Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
     }
-}
 
+    [Fact]
+    public async Task GuestCreateRoomQuotaReturns429WithoutAffectingOtherGuests()
+    {
+        using var server = Server();
+        using var firstVisitor = Client(server);
+        var (_, firstCookie) = await SignIn(firstVisitor);
+        using var creator = Client(server, firstCookie);
+
+        var rooms = new List<string>();
+        for (var i = 0; i < 4; i++)
+            rooms.Add((await Create(creator)).Room);
+
+        using (var request = Write(HttpMethod.Post, "/api/lobbies",
+            new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+        using (var rejected = await creator.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+        }
+        foreach (var room in rooms)
+        {
+            using var roster = await creator.GetAsync("/api/lobbies/" + room + "/roster");
+            Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
+        }
+
+        using var anotherVisitor = Client(server);
+        var (_, anotherCookie) = await SignIn(anotherVisitor);
+        using var independent = Client(server, anotherCookie);
+        var newRoom = await Create(independent);
+        Assert.DoesNotContain(newRoom.Room, rooms);
+    }
+}

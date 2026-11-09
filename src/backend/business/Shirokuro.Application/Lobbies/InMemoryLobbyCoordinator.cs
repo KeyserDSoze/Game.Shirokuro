@@ -10,7 +10,7 @@ public sealed class InMemoryLobbyCoordinator
 {
     public static readonly TimeSpan DefaultInactivityTimeout = TimeSpan.FromMinutes(30);
 
-    private sealed record RoomEntry(LobbyState State, DateTimeOffset LastActivityUtc);
+    private sealed record RoomEntry(LobbyState State, DateTimeOffset LastActivityUtc, string? CreatorId);
 
     private readonly object _gate = new();
     private readonly Dictionary<string, RoomEntry> _lobbies = new(StringComparer.Ordinal);
@@ -47,22 +47,28 @@ public sealed class InMemoryLobbyCoordinator
     /// </summary>
     public LobbyState CreateWithOwner(
         string lobbyId, IEnumerable<string> configuredTeams, string trustedOwnerId,
-        string initialTeamId, int maxRooms)
+        string initialTeamId, int maxRooms, int maxRoomsPerCreator = int.MaxValue)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedOwnerId);
         var definition = new LobbyDefinition(lobbyId, configuredTeams, OriginalHeroRoster.Ids);
         if (maxRooms < 1)
             throw new ArgumentOutOfRangeException(nameof(maxRooms));
+        if (maxRoomsPerCreator < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxRoomsPerCreator));
 
         lock (_gate)
         {
             PruneExpiredCore();
-            if (_lobbies.Count >= maxRooms)
+            if (_lobbies.Count >= maxRooms ||
+                _lobbies.Values.Count(entry =>
+                    string.Equals(entry.CreatorId, trustedOwnerId, StringComparison.Ordinal)) >=
+                    maxRoomsPerCreator)
                 throw new LobbyCapacityException();
             if (_lobbies.ContainsKey(definition.LobbyId))
                 throw new InvalidOperationException("Lobby ID already exists.");
 
             var joined = LobbyState.Create(definition).Join(trustedOwnerId, initialTeamId, 0);
-            Store(joined);
+            Store(joined, trustedOwnerId);
             return joined;
         }
     }
@@ -216,8 +222,15 @@ public sealed class InMemoryLobbyCoordinator
         return entry.State;
     }
 
-    private void Store(LobbyState state)
-        => _lobbies[state.Definition.LobbyId] = new RoomEntry(state, _clock.GetUtcNow());
+    private void Store(LobbyState state, string? newCreatorId = null)
+    {
+        var id = state.Definition.LobbyId;
+        // Preserve the original creator even when that player leaves but
+        // other members keep the room active. Only expiry/prune releases quota.
+        var creatorId = newCreatorId ??
+            (_lobbies.TryGetValue(id, out var previous) ? previous.CreatorId : null);
+        _lobbies[id] = new RoomEntry(state, _clock.GetUtcNow(), creatorId);
+    }
 
     private bool IsExpired(RoomEntry entry)
         => _clock.GetUtcNow() - entry.LastActivityUtc >= _inactivityTimeout;

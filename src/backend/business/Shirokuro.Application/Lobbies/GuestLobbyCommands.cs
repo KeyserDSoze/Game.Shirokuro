@@ -12,6 +12,7 @@ public sealed class GuestLobbyCommands(
     LobbyRosterReader reader)
 {
     public const int MaxRooms = 256;
+    public const int MaxRoomsPerCreator = 4;
     public const int MaxParticipants = 16;
     public const int MinTeams = 2;
     public const int MaxTeams = 4;
@@ -27,7 +28,8 @@ public sealed class GuestLobbyCommands(
         // Invite codes are 128-bit opaque bearer references. Never accept one
         // supplied by the creator; no enumeration or guessable sequential IDs.
         var roomId = "room-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
-        coordinator.CreateWithOwner(roomId, teamIds!, trustedPlayerId, initialTeam, MaxRooms);
+        coordinator.CreateWithOwner(roomId, teamIds!, trustedPlayerId, initialTeam,
+            MaxRooms, maxRoomsPerCreator: MaxRoomsPerCreator);
         return reader.ForMember(roomId, trustedPlayerId);
     }
 

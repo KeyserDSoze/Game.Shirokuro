@@ -167,5 +167,74 @@ public sealed class GuestLobbyCommandsTests
         commands.Leave(room.LobbyId, "bob", expectedRevision: 3);
         Assert.Throws<KeyNotFoundException>(() => _coordinator.Get(room.LobbyId));
     }
-}
 
+    [Fact]
+    public void GuestCannotOccupyMoreThanFourCreatedRoomsButAnotherGuestCan()
+    {
+        var commands = CreateCommands();
+        var ids = Enumerable.Range(0, GuestLobbyCommands.MaxRoomsPerCreator)
+            .Select(_ => commands.Create("guest-a", ["white", "black"], "white").LobbyId)
+            .ToArray();
+
+        Assert.Equal(4, ids.Distinct(StringComparer.Ordinal).Count());
+        Assert.Throws<LobbyCapacityException>(() =>
+            commands.Create("guest-a", ["white", "black"], "white"));
+        Assert.Equal(4, _coordinator.StoredRoomCount);
+        Assert.All(ids, id => Assert.Equal(1, _coordinator.Get(id).Revision));
+
+        var independent = commands.Create("guest-b", ["white", "black"], "black");
+        Assert.Equal(1, independent.Revision);
+        Assert.Equal(5, _coordinator.StoredRoomCount);
+    }
+
+    [Fact]
+    public void CreatorQuotaIsRetainedIfOtherMembersRemainAndReleasedOnFinalLeave()
+    {
+        var commands = CreateCommands();
+        var rooms = Enumerable.Range(0, GuestLobbyCommands.MaxRoomsPerCreator)
+            .Select(_ => commands.Create("alice", ["white", "black"], "white"))
+            .ToArray();
+        var withFriend = commands.Join(rooms[0].LobbyId, "bob", "black", rooms[0].Revision);
+        commands.Leave(rooms[0].LobbyId, "alice", withFriend.Revision);
+
+        Assert.Throws<LobbyCapacityException>(() =>
+            commands.Create("alice", ["white", "black"], "white"));
+        Assert.Single(_coordinator.Get(rooms[0].LobbyId).Participants);
+        commands.Leave(rooms[0].LobbyId, "bob", expectedRevision: 3);
+
+        Assert.Equal(1, commands.Create("alice", ["white", "black"], "white").Revision);
+        Assert.Equal(4, _coordinator.StoredRoomCount);
+    }
+
+    [Fact]
+    public async Task CreatorQuotaCannotBeBypassedBySimultaneousRequests()
+    {
+        var commands = CreateCommands();
+        var outcomes = await Task.WhenAll(Enumerable.Range(0, 32).Select(_ => Task.Run(() =>
+        {
+            try
+            {
+                commands.Create("same-guest", ["white", "black"], "white");
+                return true;
+            }
+            catch (LobbyCapacityException)
+            {
+                return false;
+            }
+        })));
+        Assert.Equal(GuestLobbyCommands.MaxRoomsPerCreator, outcomes.Count(x => x));
+        Assert.Equal(GuestLobbyCommands.MaxRoomsPerCreator, _coordinator.StoredRoomCount);
+    }
+
+    [Fact]
+    public void InvalidCreatorQuotaIsRejectedBeforeCreatingRoom()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _coordinator.CreateWithOwner("room", ["white", "black"], "alice",
+                "white", maxRooms: 10, maxRoomsPerCreator: 0));
+        Assert.Throws<ArgumentException>(() =>
+            _coordinator.CreateWithOwner("room", ["white", "black"], " ",
+                "white", maxRooms: 10, maxRoomsPerCreator: 4));
+        Assert.Equal(0, _coordinator.StoredRoomCount);
+    }
+}

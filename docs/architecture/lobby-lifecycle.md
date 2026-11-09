@@ -44,7 +44,28 @@ any new PvP mechanics and are not sufficient for public production hosting.
   five minutes; registration also prunes expired entries opportunistically.
   StoredSessionCount is diagnostic-only, never a web endpoint.
 
+## Per-guest creator quota (#24)
+
+- Each authenticated guest identity may originate at most **four** active
+  process-local invitation rooms, in addition to the existing **256-room**
+  global ceiling. These are technical anti-abuse limits, not match rules.
+- The creator ID comes only from the server-authenticated cookie. Room
+  creation checks both limits and inserts the room atomically under the
+  coordinator lock. Rejection is a generic HTTP **429**, with no invite ID
+  or private roster data disclosed.
+- Creator attribution survives team/hero changes and the creator leaving
+  while other members remain; the room still consumes the creator's quota
+  until it becomes empty or its 30-minute inactivity TTL expires. A fresh
+  identity has an independent quota.
+- This does **not** prevent an attacker from issuing several guest identities
+  and does not provide distributed rate limits or durable per-account
+  quotas; those operations remain in #21.
+
 ## Testing
+
+Per-creator quota tests cover the cap and independence, concurrent creation,
+retention after creator departure, automatic expiry reclaim, TestServer HTTP
+429 and multi-browser Playwright rejection/independence.
 
 The server-side fake-clock xUnit cases exercise exact TTL boundaries,
 authorized renewal, rejected-write/nonmember behavior, lock-safe races,
@@ -59,7 +80,7 @@ Both registries are **in-memory and per-process**. Restart discards rooms
 and session registration (previous guest cookies fail safely); multi-node
 deployments cannot work without shared storage and consistent revocation.
 Still missing: persistent/distributed atomic room state, Data Protection
-key storage/rotation, global rate limiting, durable accounts, recovery,
+key storage/rotation, global rate limiting, durable accounts, cross-identity abuse prevention, recovery,
 cross-instance reconnect and operational metrics/privacy policy.
 Do not deploy publicly as a distributed or production-ready multiplayer
 service until these are designed, built and tested.

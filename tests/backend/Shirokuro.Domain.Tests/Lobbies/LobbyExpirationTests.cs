@@ -203,5 +203,24 @@ public sealed class LobbyExpirationTests
         Assert.Contains(hostedServices, service => service is LobbyExpiryWorker);
         Assert.Same(TimeProvider.System, server.Services.GetRequiredService<TimeProvider>());
     }
-}
 
+    [Fact]
+    public void ExpiredCreatorRoomsReleasePerGuestQuotaBeforeNextCreate()
+    {
+        var (coordinator, clock) = Setup();
+        var commands = new GuestLobbyCommands(
+            coordinator, new LobbyRosterReader(coordinator));
+        var oldIds = Enumerable.Range(0, GuestLobbyCommands.MaxRoomsPerCreator)
+            .Select(_ => commands.Create("alice", ["white", "black"], "white").LobbyId)
+            .ToArray();
+        Assert.Throws<LobbyCapacityException>(() =>
+            commands.Create("alice", ["white", "black"], "white"));
+
+        clock.Advance(TimeSpan.FromMinutes(30));
+        var fresh = commands.Create("alice", ["white", "black"], "white");
+
+        Assert.Equal(1, fresh.Revision);
+        Assert.Equal(1, coordinator.StoredRoomCount);
+        Assert.All(oldIds, id => Assert.Throws<KeyNotFoundException>(() => coordinator.Get(id)));
+    }
+}
