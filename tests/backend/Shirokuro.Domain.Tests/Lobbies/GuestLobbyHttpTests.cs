@@ -304,8 +304,7 @@ public sealed class GuestLobbyHttpTests
         using (var response = await owner.SendAsync(req))
             Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        // The cookie is cleared in the browser, not forcibly revoked server-side.
-        // Request without old cookie must be anonymous; do not assert revocation.
+        // The server revokes the old cookie as well as clearing it client-side.
         using var newAnonymous = Client(server);
         using var deniedRoster = await newAnonymous.GetAsync("/api/lobbies/" + room + "/roster");
         Assert.Equal(HttpStatusCode.Unauthorized, deniedRoster.StatusCode);
@@ -320,17 +319,26 @@ public sealed class GuestLobbyHttpTests
         var (_, cookie) = await SignIn(visitor);
         using var guest = Client(server, cookie);
 
+        // The per-creator room quota is four; exercise the independent
+        // per-IP limiter with distinct authenticated creators instead.
+        using var secondVisitor = Client(server);
+        var (_, secondCookie) = await SignIn(secondVisitor);
+        using var secondGuest = Client(server, secondCookie);
+
         for (var index = 0; index < 8; index++)
         {
             using var request = Write(HttpMethod.Post, "/api/lobbies",
                 new { teamIds = new[] { "white", "black" }, teamId = "white" });
-            using var response = await guest.SendAsync(request);
+            using var response = await (index < 4 ? guest : secondGuest).SendAsync(request);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
 
+        using var thirdVisitor = Client(server);
+        var (_, thirdCookie) = await SignIn(thirdVisitor);
+        using var thirdGuest = Client(server, thirdCookie);
         using var ninth = Write(HttpMethod.Post, "/api/lobbies",
             new { teamIds = new[] { "white", "black" }, teamId = "white" });
-        using var limited = await guest.SendAsync(ninth);
+        using var limited = await thirdGuest.SendAsync(ninth);
         Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
     }
 
