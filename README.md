@@ -164,3 +164,22 @@ Il limite per singola entry è stato portato a 32 MiB; rimangono i limiti
 cumulativi, sul numero delle entry, sulle immagini e il blocco di
 path traversal o duplicati.
 
+## Trasporto roster autenticato (issue #18)
+
+Il backend .NET 10 espone **solo letture pre-partita**:
+`GET /api/lobbies/{lobbyId}/roster` e il metodo SignalR
+`GetRoster(lobbyId)` su `/hubs/lobbies`. Entrambi richiedono una
+sessione cookie ASP.NET Core valida con identità `NameIdentifier` unica,
+e la presenza effettiva dell'utente nella lobby. Le richieste anonime
+ricevono 401; quelle di membri di altre stanze non rivelano il roster
+(404 indistinguibile da una stanza inesistente). Nessuna API accetta
+`playerId` fornito dal client o espone posizioni/percorsi segreti.
+
+**Non è ancora possibile effettuare login o creare/joinare lobby da
+browser**: non esiste un identity provider autorizzato né un endpoint che
+rilascia cookie, quindi il trasporto rifiuta normalmente gli accessi
+fino alla configurazione futura. Non ci sono push/subscribe o partite
+online. Sono inclusi test HTTP e SignalR con sessioni firmate in-process
+e documentazione di sicurezza in
+`docs/architecture/authenticated-lobby-readonly.md`.
+
