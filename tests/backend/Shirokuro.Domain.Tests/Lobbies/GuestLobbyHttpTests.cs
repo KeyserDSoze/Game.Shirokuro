@@ -96,6 +96,7 @@ public sealed class GuestLobbyHttpTests
         using (var roster = await owner.GetAsync("/api/lobbies/" + roomId + "/roster"))
         {
             Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
+            Assert.Equal("no-store", roster.Headers.CacheControl?.ToString());
             var json = await roster.Content.ReadAsStringAsync();
             using var payload = JsonDocument.Parse(json);
             var players = payload.RootElement.GetProperty("participants");
@@ -233,6 +234,49 @@ public sealed class GuestLobbyHttpTests
         using var newAnonymous = Client(server);
         using var deniedRoster = await newAnonymous.GetAsync("/api/lobbies/" + room + "/roster");
         Assert.Equal(HttpStatusCode.Unauthorized, deniedRoster.StatusCode);
+    }
+
+
+    [Fact]
+    public async Task GuestRoomCreationIsLimitedToEightPerMinutePerIp()
+    {
+        using var server = Server();
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var guest = Client(server, cookie);
+
+        for (var index = 0; index < 8; index++)
+        {
+            using var request = Write(HttpMethod.Post, "/api/lobbies",
+                new { teamIds = new[] { "white", "black" }, teamId = "white" });
+            using var response = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        using var ninth = Write(HttpMethod.Post, "/api/lobbies",
+            new { teamIds = new[] { "white", "black" }, teamId = "white" });
+        using var limited = await guest.SendAsync(ninth);
+        Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
+    }
+
+    [Fact]
+    public async Task OpaqueInviteAndMemberRosterAreNeverPubliclyCacheable()
+    {
+        using var server = Server();
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var owner = Client(server, cookie);
+
+        using var create = Write(HttpMethod.Post, "/api/lobbies",
+            new { teamIds = new[] { "white", "black" }, teamId = "white" });
+        using var created = await owner.SendAsync(create);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        Assert.Equal("no-store", created.Headers.CacheControl?.ToString());
+        using var payload = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        var code = payload.RootElement.GetProperty("lobbyId").GetString();
+        using var roster = await owner.GetAsync("/api/lobbies/" + code + "/roster");
+        Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
+        Assert.Equal("no-store", roster.Headers.CacheControl?.ToString());
     }
 
     [Fact]

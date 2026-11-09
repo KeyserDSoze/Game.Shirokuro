@@ -147,8 +147,9 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
 // Read-only authenticated roster. Never accept a playerId from the request.
 // A missing lobby and a non-member both return 404 to avoid room enumeration.
 app.MapGet("/api/lobbies/{lobbyId}/roster",
-    (string lobbyId, ClaimsPrincipal user, LobbyRosterReader reader) =>
+    (string lobbyId, ClaimsPrincipal user, HttpContext context, LobbyRosterReader reader) =>
     {
+        context.Response.Headers.CacheControl = "no-store";
         var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(user);
         if (trustedPlayerId is null)
         {

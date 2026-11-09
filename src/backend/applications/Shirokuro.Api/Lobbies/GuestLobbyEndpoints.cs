@@ -80,6 +80,7 @@ public static class GuestLobbyEndpoints
     private static bool TryGuest(
         HttpContext context, IHostEnvironment environment, out string? playerId)
     {
+        context.Response.Headers.CacheControl = "no-store";
         playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
         return WebMutationGuard.Allows(context, environment) &&
                playerId is not null && GuestSessions.IsGuest(context.User);
