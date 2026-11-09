@@ -4,6 +4,7 @@ import { useTheme } from 'next-themes'
 import { Compass, EyeOff, Globe2, Hexagon, Moon, Sun, Swords } from 'lucide-react'
 import HexWorld from '@/game/HexWorld'
 import HeroSelector from '@/features/heroes/HeroSelector'
+import HeroReferenceCards from '@/features/heroes/HeroReferenceCards'
 import { heroRoster } from '@/features/heroes/catalog'
 import TerrainEditor from '@/features/terrain/TerrainEditor'
 import MapDocumentEditor from '@/features/terrain/MapDocumentEditor'
@@ -99,6 +100,9 @@ export default function App() {
             <div data-testid="world-hero" aria-live="polite" className="pointer-events-none absolute right-4 top-4 z-10 max-w-[55%] rounded-lg border border-white/15 bg-[#171b26]/80 px-3 py-2 text-right text-xs font-medium text-white/90 backdrop-blur-sm">{t('heroPreview', { name: selectedHero.name })}</div>
             <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-10 rounded-lg border border-white/10 bg-[#171b26]/75 px-3 py-2 text-center text-xs text-white/75 backdrop-blur-sm">{t('controls')}</div>
           </div>
+          <div className="mt-5">
+            <HeroReferenceCards heroId={selectedHero.id} />
+          </div>
         </section>
 
         <aside className="flex flex-col gap-5">
@@ -149,6 +153,7 @@ export default function App() {
     </div>
   )
 }
+
 
 
 

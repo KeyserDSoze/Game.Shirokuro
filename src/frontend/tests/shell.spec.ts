@@ -199,3 +199,40 @@ test('map document editor is translated and usable on mobile without mutating ne
   expect(mutations).toEqual([])
 })
 
+test('serves the original 28-sheet AVIF and matches both sides for the selected hero', async ({ page }) => {
+  const response = await page.request.get('/art/hero-ability-cards-original.avif')
+  expect(response.ok()).toBeTruthy()
+  expect(response.headers()['content-type']).toContain('image/avif')
+  expect((await response.body()).length).toBeLessThan(30_000)
+
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Schede originali di Adsiz' })).toBeVisible()
+  const front = page.getByTestId('hero-card-front')
+  const back = page.getByTestId('hero-card-back')
+  await expect(front).toHaveAttribute('data-hero-id', 'adsiz')
+  await expect(back).toHaveAttribute('data-hero-id', 'adsiz')
+  await expect(front).toHaveCSS('background-image', /hero-ability-cards-original\.avif/)
+  await expect(back).toHaveCSS('background-position', '-640px -375px')
+
+  await page.getByRole('button', { name: 'Seleziona Kira' }).click()
+  await expect(page.getByRole('heading', { name: 'Schede originali di Kira' })).toBeVisible()
+  await expect(front).toHaveCSS('background-position', '-320px -125px')
+  await expect(back).toHaveCSS('background-position', '-960px -500px')
+  await expect(page.getByTestId('hero-cards-warning')).toContainText('non sono leggibili')
+})
+
+test('original reference sheets follow the hero choice on mobile, in English and dark mode', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await page.getByRole('button', { name: 'Select Vlko Dlak' }).click()
+  await expect(page.getByRole('heading', { name: 'Original sheets for Vlko Dlak' })).toBeVisible()
+  await expect(page.getByRole('img', { name: 'Original Front reference sheet for Vlko Dlak' })).toBeVisible()
+  await expect(page.getByRole('img', { name: 'Original Reverse reference sheet for Vlko Dlak' })).toBeVisible()
+  await expect(page.getByTestId('hero-card-front')).toHaveCSS('background-position', '-320px -375px')
+  await expect(page.getByTestId('hero-card-back')).toHaveCSS('background-position', '-960px -750px')
+  await expect(page.getByTestId('hero-cards-warning')).toContainText('not legible')
+  await expect(page.getByTestId('world-hero')).toContainText('Vlko Dlak')
+})
+

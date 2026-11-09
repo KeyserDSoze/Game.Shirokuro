@@ -19,6 +19,11 @@ void i18n.use(initReactI18next).init({
       heroInitialLevel: 'Livello iniziale: 1 / 2',
       heroUpgradeLocked: 'Potenziamento sbloccato dopo una eliminazione confermata',
       heroSelectionLocal: 'Scelta di anteprima: nessuna partita attiva.',
+      heroCardsTitle: 'Schede originali di {{name}}',
+      heroCardsDescription: 'Tavole grafiche originali: fronte e retro per il personaggio selezionato.',
+      heroCardFaces: { front: 'Fronte', back: 'Retro' },
+      heroCardAlt: 'Scheda grafica {{face}} originale di {{name}}',
+      heroCardsWarning: 'Miniature di riferimento: i testi nelle immagini non sono leggibili o validati come regole. Serve una trascrizione accessibile prima del gioco.',
       modeObjective: 'Ruba il tesoro avversario e riportalo alla tua base sopravvivendo (regole complete da definire).',
       heroHint: 'Modello 3D provvisorio. Le abilità saranno definite dalle regole.',
       selection: 'Esagono selezionato',
@@ -68,6 +73,11 @@ void i18n.use(initReactI18next).init({
       heroInitialLevel: 'Starting level: 1 / 2',
       heroUpgradeLocked: 'Upgrade unlocks after a confirmed elimination',
       heroSelectionLocal: 'Preview choice only: no active match.',
+      heroCardsTitle: 'Original sheets for {{name}}',
+      heroCardsDescription: 'Original reference artwork: front and reverse sheets for the selected hero.',
+      heroCardFaces: { front: 'Front', back: 'Reverse' },
+      heroCardAlt: 'Original {{face}} reference sheet for {{name}}',
+      heroCardsWarning: 'Reference thumbnails: image text is not legible or approved as game rules. An accessible transcription is needed before gameplay.',
       modeObjective: 'Steal the opposing treasure and return it to your base alive (full rules still to be defined).',
       heroHint: 'Placeholder 3D model. Abilities will be defined by the rules.',
       selection: 'Selected hexagon',
@@ -108,6 +118,7 @@ void i18n.use(initReactI18next).init({
 })
 
 export default i18n
+
 
 
 

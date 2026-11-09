@@ -78,4 +78,21 @@ Three.js, mantenendo i lati tridimensionali. L'assegnazione alle celle
 è *solo dimostrativa*, modificabile localmente, senza regole di terreno
 o visibilità approvate. Il generatore è `scripts/build_terrain_atlas.py`;
 l'issue #4 segue l'importazione completa e l'autorizzazione all'uso pubblico.
+ 
+## Schede abilità originali — anteprima 2D (issue #14)
+
+Le 28 immagini `screens2/` sono adesso presenti nel frontend come **un
+atlas AVIF di riferimento** in `src/frontend/public/art/hero-ability-cards-original.avif`.
+La galleria mostra fronte e retro dell'eroe selezionato, seguendo l'ordine
+di `src/shared/heroes.json`: 14 front (indici 0–13) e 14 retro
+(indici 14–27). Lo sprite è 4 colonne × 7 righe, celle 320×125 pixel,
+dimensione totale 1280×875, circa 18,6KB. Generatore:
+`scripts/build_hero_card_atlas.py /percorso/allo/shirokurozip.zip`.
+
+**Attenzione:** la scala ridotta serve a identificare la grafica, **non** a
+leggere le istruzioni. I testi nelle immagini non sono ancora digitalizzati
+in modo accessibile, verificati con l'autore, né trasformati in regole di
+combattimento/movimento. Mancano anche le carte movimento complete
+(`carte movimento3/`), i ritratti dettagliati, licenze/permessi di
+pubblicazione: continuano a essere tracciati in #3/#4/#5.
 

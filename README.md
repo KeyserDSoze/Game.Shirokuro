@@ -120,4 +120,20 @@ non definisce una mappa ufficiale, le basi, il tesoro o un salvataggio partita.
 
 È testato da Vitest e Playwright; in futuro una mappa usata per gameplay
 richiederà nuove regole approvate e validazione server-side.
+ 
+## Schede eroe originali (issue #14)
+
+Sotto la mappa 3D si trova la galleria con i due lati delle schede originali
+`screens2/` per l'eroe selezionato. L'asset compatto
+`src/frontend/public/art/hero-ability-cards-original.avif`
+contiene tutte le 28 immagini (14 fronti, 14 retro), senza scaricare
+i grandi PNG sul client. Il catalogo è derivato dallo ZIP fornito dall'autore:
+
+    python scripts/build_hero_card_atlas.py /percorso/allo/shirokurozip.zip
+
+La versione integrata nel browser è un'anteprima di riferimento, **non
+un regolamento**: il testo originale in miniatura può risultare illeggibile
+e sarà necessario digitalizzarlo/validarlo con l'autore prima di creare
+le abilità eseguibili (#3/#5). Le carte movimento, gli asset a maggiore
+risoluzione e la provenienza/licenza per il rilascio restano in #4.
 
