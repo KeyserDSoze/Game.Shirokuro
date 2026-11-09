@@ -53,8 +53,8 @@ public sealed class MatchObservationProjectorTests
         Assert.Equal("bob", revealed.PlayerId);
         Assert.Equal("black", revealed.TeamId);
         Assert.Null(revealed.Position);
-        Assert.False(typeof(OtherHeroObservation).GetProperties().Any(
-            property => property.Name == nameof(OwnHeroObservation.PlannedDestination)));
+        Assert.DoesNotContain(typeof(OtherHeroObservation).GetProperties(),
+            property => property.Name == nameof(OwnHeroObservation.PlannedDestination));
     }
 
     [Fact]
