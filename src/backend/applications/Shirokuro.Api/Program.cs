@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Shirokuro.Api.Hubs;
+using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Application.Preview;
@@ -12,6 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<BoardPreviewService>();
 builder.Services.AddSingleton<InMemoryLobbyCoordinator>();
 builder.Services.AddSingleton<LobbyRosterReader>();
+builder.Services.AddSingleton<GuestLobbyCommands>();
 
 // The cookie may contain a server-generated, non-verified guest ID.
 // No trusted account login or client-selected player ID is supported.
@@ -40,6 +42,16 @@ builder.Services.AddSignalR();
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("guest-room-creation", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 8,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
     options.AddPolicy("guest-session-issuance", context =>
         RateLimitPartition.GetFixedWindowLimiter(
             context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
@@ -156,6 +168,9 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
         }
     }).RequireAuthorization();
 
+// Server-owned guest room mutations, with CSRF and revision controls.
+app.MapGuestLobbyEndpoints();
+
 // The connection is authenticated; each Hub method also checks membership.
 app.MapHub<LobbyRosterHub>("/hubs/lobbies").RequireAuthorization();
 
@@ -179,5 +194,6 @@ app.Run();
 public partial class Program
 {
 }
+
 
 
