@@ -1,6 +1,9 @@
 import { expect, test } from '@playwright/test'
 
 test('two independent guest browsers create a room, join by invite and select heroes safely', async ({ browser }) => {
+  // End-to-end scenario exercises many real UI/API roundtrips plus R3F across
+  // two browser contexts. Give only this long test a realistic CI budget.
+  test.setTimeout(90_000)
   const firstContext = await browser.newContext()
   const secondContext = await browser.newContext()
   try {
