@@ -96,3 +96,25 @@ combattimento/movimento. Mancano anche le carte movimento complete
 (`carte movimento3/`), i ritratti dettagliati, licenze/permessi di
 pubblicazione: continuano a essere tracciati in #3/#4/#5.
 
+## Carte movimento originali (issue #16 e bug #17)
+
+Nell'archivio reale `carte movimento3/` contiene **13 gruppi di dieci
+immagini numerate 1..10**; tutti i 14 eroi restano nel roster, ma la
+cartella di Gordunhao non contiene carte. Le altre 13 cartelle coincidono
+coi nomi canonici, inclusi `Jia Oshi`, `La Morte`, `Magjistar`,
+`Sangar Tedra`, `Vlko Dlak`.
+
+L'atlas frontend `movement-cards-original.avif` contiene 130 miniature
+di riferimento in ordine row-major: le righe seguono
+`src/shared/heroes.json` **escludendo esclusivamente Gordunhao**,
+le colonne sono le carte 1..10. Formato AVIF 560×1196 px, celle
+56×92 px, ~14,6 KB. È un inventario visivo, **non** un mazzo di gioco
+né una descrizione di mosse consentite. Le icone e il significato delle
+carte richiedono il regolamento originale.
+
+Nota #17: il ZIP fornito contiene 358 entry (incluse cartelle e dati
+di archivio), ~335,7 MB decompressi e un asset accessorio di 23,9MB.
+La soglia per singola entry della pipeline è 32 MiB (prima 16); i
+controlli del formato e dell'input rimangono attivi. Il ZIP completo
+resta fuori dalla repository.
+

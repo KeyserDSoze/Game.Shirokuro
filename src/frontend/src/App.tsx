@@ -5,6 +5,7 @@ import { Compass, EyeOff, Globe2, Hexagon, Moon, Sun, Swords } from 'lucide-reac
 import HexWorld from '@/game/HexWorld'
 import HeroSelector from '@/features/heroes/HeroSelector'
 import HeroReferenceCards from '@/features/heroes/HeroReferenceCards'
+import MovementCardGallery from '@/features/heroes/MovementCardGallery'
 import { heroRoster } from '@/features/heroes/catalog'
 import TerrainEditor from '@/features/terrain/TerrainEditor'
 import MapDocumentEditor from '@/features/terrain/MapDocumentEditor'
@@ -103,6 +104,9 @@ export default function App() {
           <div className="mt-5">
             <HeroReferenceCards heroId={selectedHero.id} />
           </div>
+          <div className="mt-5">
+            <MovementCardGallery heroId={selectedHero.id} />
+          </div>
         </section>
 
         <aside className="flex flex-col gap-5">
@@ -153,6 +157,7 @@ export default function App() {
     </div>
   )
 }
+
 
 
 

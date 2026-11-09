@@ -24,6 +24,13 @@ void i18n.use(initReactI18next).init({
       heroCardFaces: { front: 'Fronte', back: 'Retro' },
       heroCardAlt: 'Scheda grafica {{face}} originale di {{name}}',
       heroCardsWarning: 'Miniature di riferimento: i testi nelle immagini non sono leggibili o validati come regole. Serve una trascrizione accessibile prima del gioco.',
+      movementCardsTitle: 'Carte movimento originali di {{name}}',
+      movementCardsDescription: 'Le dieci immagini originali numerate da 1 a 10, senza effetti di gioco.',
+      movementCardsGroup: 'Carte movimento originali di {{name}}',
+      movementCardAlt: 'Miniatura della carta movimento originale {{number}} di {{name}}',
+      movementCardNumber: '{{number}}',
+      movementCardsMissing: 'Nel materiale fornito non risultano carte movimento per {{name}}. È un asset mancante, non una regola di gioco.',
+      movementCardsWarning: 'Solo riferimenti grafici: i simboli non sono ancora interpretati come mosse, carte pescate o abilità.',
       modeObjective: 'Ruba il tesoro avversario e riportalo alla tua base sopravvivendo (regole complete da definire).',
       heroHint: 'Modello 3D provvisorio. Le abilità saranno definite dalle regole.',
       selection: 'Esagono selezionato',
@@ -78,6 +85,13 @@ void i18n.use(initReactI18next).init({
       heroCardFaces: { front: 'Front', back: 'Reverse' },
       heroCardAlt: 'Original {{face}} reference sheet for {{name}}',
       heroCardsWarning: 'Reference thumbnails: image text is not legible or approved as game rules. An accessible transcription is needed before gameplay.',
+      movementCardsTitle: 'Original movement cards for {{name}}',
+      movementCardsDescription: 'The ten numbered original images (1–10), with no gameplay effects.',
+      movementCardsGroup: 'Original movement cards for {{name}}',
+      movementCardAlt: 'Thumbnail of original movement card {{number}} for {{name}}',
+      movementCardNumber: '{{number}}',
+      movementCardsMissing: 'The supplied source contains no movement cards for {{name}}. This is missing artwork, not a game rule.',
+      movementCardsWarning: 'Artwork references only: the symbols are not interpreted as moves, drawn cards or abilities.',
       modeObjective: 'Steal the opposing treasure and return it to your base alive (full rules still to be defined).',
       heroHint: 'Placeholder 3D model. Abilities will be defined by the rules.',
       selection: 'Selected hexagon',
@@ -118,6 +132,7 @@ void i18n.use(initReactI18next).init({
 })
 
 export default i18n
+
 
 
 

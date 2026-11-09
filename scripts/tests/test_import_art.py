@@ -83,6 +83,27 @@ class ArtImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Duplicate ZIP entry"):
             importer.import_art(archive, self.temp / "web", self.temp / "manifest.json")
 
+
+    def test_large_unused_archive_member_is_allowed_within_32_mib_limit(self):
+        archive = self.make_zip()
+        # The supplied ZIP contains a valid unused entry larger than 16 MiB.
+        # Store as compressed zeroes for a small, fast CI fixture.
+        with zipfile.ZipFile(archive, "a", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("unused-large-reference.bin", bytes(17 * 1024 * 1024))
+        with zipfile.ZipFile(archive) as z:
+            indexed = importer.validate_archive(z)
+        self.assertEqual(17 * 1024 * 1024, indexed["unused-large-reference.bin"].file_size)
+
+    def test_large_entries_above_the_configured_limit_are_still_rejected(self):
+        archive = self.make_zip()
+        with zipfile.ZipFile(archive, "a") as z:
+            z.writestr("oversized-unused.bin", bytes(2049))
+        from unittest.mock import patch
+        with patch.object(importer, "MAX_ENTRY_BYTES", 2048):
+            with zipfile.ZipFile(archive) as z:
+                with self.assertRaisesRegex(ValueError, "exceeds size policy"):
+                    importer.validate_archive(z)
+
     def test_zero_byte_source_is_rejected(self):
         archive = self.make_zip(skipped="hero base/Kira.png")
         with zipfile.ZipFile(archive, "a") as z:
@@ -93,4 +114,5 @@ class ArtImportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

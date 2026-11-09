@@ -137,3 +137,30 @@ e sarà necessario digitalizzarlo/validarlo con l'autore prima di creare
 le abilità eseguibili (#3/#5). Le carte movimento, gli asset a maggiore
 risoluzione e la provenienza/licenza per il rilascio restano in #4.
 
+## Galleria carte movimento (issue #16)
+
+Le 130 immagini originali di `carte movimento3/` sono ora mostrate
+come miniature numerate per ciascuno dei **13 eroi** con un set nell'archivio.
+La galleria segue il personaggio selezionato e mostra esplicitamente
+l'assenza delle carte di **Gordunhao**: non significa che non possa
+muoversi nel gioco, ma che il materiale originale non le contiene.
+
+Il file versionato `src/frontend/public/art/movement-cards-original.avif`
+è un atlas di riferimento 10 colonne × 13 righe con 130 immagini (560×1196
+pixel, ~15KB), generato in ordine numerico e per eroe dalla lista canonica:
+
+    python scripts/build_movement_card_atlas.py /percorso/allo/shirokurozip.zip
+
+**Solo illustrazioni:** non si esegue una pesca, non si invia un movimento
+al backend e nessuna iconografia viene trasformata in regola PvP senza
+approvazione (#3/#5). Gli asset a piena risoluzione e le autorizzazioni
+per il rilascio restano in #4.
+
+## Verifica archivio originale (bug #17)
+
+L'archivio del progetto include un file ausiliario di circa 23,9MB:
+il validatore ne controlla il nome e i metadati, ma non lo importa.
+Il limite per singola entry è stato portato a 32 MiB; rimangono i limiti
+cumulativi, sul numero delle entry, sulle immagini e il blocco di
+path traversal o duplicati.
+

@@ -19,7 +19,9 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 REPOSITORY = Path(__file__).resolve().parents[1]
 HERO_SOURCE_OVERRIDES = {"gordunhao": "Gorduhano", "magjistar": "Magjister"}
 TILES = ("black", "white", "city", "sand", "water", "wild")
-MAX_ENTRY_BYTES = 16 * 1024 * 1024
+# The supplied original ZIP contains a legitimate ~23.9MB ancillary asset.
+# This bound applies to metadata for every entry, including unused ones.
+MAX_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 2000
 Image.MAX_IMAGE_PIXELS = 20_000_000
@@ -151,4 +153,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

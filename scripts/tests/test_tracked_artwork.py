@@ -52,6 +52,25 @@ class TrackedArtworkTests(unittest.TestCase):
                     rgb.crop((x, y, x + 320, y + 125)).tobytes()).digest())
             self.assertEqual(28, len(fingerprints))
 
+
+    def test_original_movement_cards_atlas_has_130_distinct_cells(self):
+        import hashlib
+
+        path = ART / "movement-cards-original.avif"
+        self.assertTrue(path.is_file(), f"Missing committed movement card atlas: {path}")
+        self.assertLess(path.stat().st_size, 30_000)
+        with Image.open(path) as artwork:
+            self.assertEqual("AVIF", artwork.format)
+            self.assertEqual((560, 1196), artwork.size)
+            rgb = artwork.convert("RGB")
+            fingerprints = set()
+            for index in range(130):
+                x = (index % 10) * 56
+                y = (index // 10) * 92
+                fingerprints.add(hashlib.sha256(
+                    rgb.crop((x, y, x + 56, y + 92)).tobytes()).digest())
+            self.assertEqual(130, len(fingerprints))
+
     def test_original_hero_reference_has_all_fourteen_cells(self):
         self.check_reference_atlas(
             "heroes-original-atlas.webp", (448, 148), 64, 74, 7, 14)
@@ -63,5 +82,6 @@ class TrackedArtworkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

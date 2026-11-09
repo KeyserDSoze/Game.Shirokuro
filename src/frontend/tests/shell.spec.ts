@@ -236,3 +236,54 @@ test('original reference sheets follow the hero choice on mobile, in English and
   await expect(page.getByTestId('world-hero')).toContainText('Vlko Dlak')
 })
 
+test('serves all original movement-card thumbnails and follows the selected hero', async ({ page }) => {
+  const asset = await page.request.get('/art/movement-cards-original.avif')
+  expect(asset.ok()).toBeTruthy()
+  expect(asset.headers()['content-type']).toContain('image/avif')
+  expect((await asset.body()).length).toBeLessThan(30_000)
+
+  await page.goto('/')
+  const gallery = page.getByTestId('movement-card-gallery')
+  await expect(page.getByRole('heading', { name: 'Carte movimento originali di Adsiz' })).toBeVisible()
+  await expect(gallery.getByRole('img')).toHaveCount(10)
+  await expect(page.getByTestId('movement-card-1')).toHaveAttribute('data-hero-id', 'adsiz')
+  await expect(page.getByTestId('movement-card-10')).toHaveCSS('background-position', '-504px 0px')
+
+  await page.getByRole('button', { name: 'Seleziona Kira' }).click()
+  await expect(page.getByRole('heading', { name: 'Carte movimento originali di Kira' })).toBeVisible()
+  await expect(gallery.getByRole('img')).toHaveCount(10)
+  await expect(page.getByTestId('movement-card-1')).toHaveCSS('background-position', '0px -368px')
+  await expect(page.getByTestId('movement-card-10')).toHaveCSS('background-position', '-504px -368px')
+  await expect(page.getByTestId('movement-cards-warning')).toContainText('Solo riferimenti grafici')
+})
+
+test('Gordunhao source has no movement artwork: never invent replacement cards', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Seleziona Gordunhao' }).click()
+  await expect(page.getByTestId('movement-cards-missing')).toContainText('non risultano carte movimento')
+  await expect(page.getByTestId('movement-cards-missing')).toContainText('Gordunhao')
+  await expect(page.getByTestId('movement-card-gallery')).toHaveCount(0)
+  await expect(page.getByTestId('movement-card-1')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Seleziona Howler' }).click()
+  await expect(page.getByTestId('movement-card-gallery').getByRole('img')).toHaveCount(10)
+  await expect(page.getByTestId('movement-card-1')).toHaveCSS('background-position', '0px -184px')
+})
+
+test('original movement cards render on English mobile dark mode without network mutations', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const mutations: string[] = []
+  page.on('request', request => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method())) mutations.push(request.url())
+  })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await page.getByRole('button', { name: 'Select Vlko Dlak' }).click()
+  await expect(page.getByRole('heading', { name: 'Original movement cards for Vlko Dlak' })).toBeVisible()
+  await expect(page.getByRole('img', { name: 'Thumbnail of original movement card 1 for Vlko Dlak' })).toBeVisible()
+  await expect(page.getByTestId('movement-card-gallery').getByRole('img')).toHaveCount(10)
+  await expect(page.getByTestId('movement-card-10')).toHaveCSS('background-position', '-504px -1104px')
+  await expect(page.getByTestId('movement-cards-warning')).toContainText('Artwork references only')
+  expect(mutations).toEqual([])
+})
+
