@@ -76,6 +76,26 @@ any new PvP mechanics and are not sufficient for public production hosting.
 - Expired guest sessions without an explicit logout are still handled by the
   existing lobby TTL; multi-instance cleanup requires shared stores (#21).
 
+## Natural guest-session expiration (#27)
+
+- A guest's **absolute 8-hour session expiry** denies HTTP requests and
+  new SignalR connections; on the server's five-minute session sweep the
+  expired identity is also removed from every active pre-match lobby.
+  This complements immediate logout cleanup (#25), with no browser action.
+- The registry queues the trusted player ID when an expired ticket is
+  pruned, **even when opportunistic registration or other pruning detects
+  it first**. Only the worker drains these notifications. Duplicate expiry
+  events are deduplicated, explicit session revocation is not treated as
+  natural expiration, and identities with another still-active ticket are
+  skipped.
+- The worker reuses the lock-safe coordinator's administrative removal:
+  empty rooms disappear, shared rosters advance revision, others retain
+  access, creator attribution and last-activity timestamps are preserved.
+  In normal operation this happens on the next five-minute sweep; existing
+  rooms still independently enforce their own 30-minute inactivity TTL.
+- This remains **per process**. A crash/restart discards both registries
+  and rooms; cross-node revocation and atomic persistence remain #21.
+
 ## Testing
 
 Per-creator quota tests cover the cap and independence, concurrent creation,
@@ -92,6 +112,12 @@ Logout cleanup adds coordinator/xUnit race, multi-room, idempotency, revision,
 creator-quota and fake-clock tests; TestServer verifies revoked-cookie denial,
 pruning of solo rooms and the surviving guest's authorized roster. Playwright
 checks two guest browsers plus a copied ticket after logout.
+
+Fake-clock #27 tests cover exact session expiry, independently live guest,
+opportunistic pruning, deduplication, delayed replacement session, natural
+expiry vs explicit logout, parallel sweeps, room revisions and TTL. TestServer
+integration verifies HTTP 401 for the expired cookie, surviving roster
+authorization, solo-room deletion and absence of invite revival.
 
 ## Remaining work in parent issue #21
 

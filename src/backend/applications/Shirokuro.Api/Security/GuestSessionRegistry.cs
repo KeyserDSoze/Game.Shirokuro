@@ -15,6 +15,11 @@ public sealed class GuestSessionRegistry(TimeProvider clock)
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _active = new(StringComparer.Ordinal);
 
+    // Both the periodic worker and opportunistic registration pruning may
+    // discover expiry. Retain only the trusted player ID until the worker can
+    // clean stale room membership; never expose IDs through HTTP or logs.
+    private readonly HashSet<string> _pendingExpiredPlayerIds = new(StringComparer.Ordinal);
+
     /// <summary>Registers only cryptographically random, server-issued tokens.</summary>
     public string Register(string trustedPlayerId, DateTimeOffset expiresUtc)
     {
@@ -94,15 +99,39 @@ public sealed class GuestSessionRegistry(TimeProvider clock)
             return PruneExpiredCore();
     }
 
+    /// <summary>
+    /// Server-only, one-shot notification of identities whose sessions expired.
+    /// Pruning during Register or PruneExpired also queues those identities.
+    /// If another live session for the same trusted player exists, keep their
+    /// membership: session expiry never revokes a still-active identity.
+    /// </summary>
+    public IReadOnlyList<string> DrainExpiredPlayerIds()
+    {
+        lock (_gate)
+        {
+            PruneExpiredCore();
+            var activeIds = _active.Values
+                .Select(entry => entry.PlayerId)
+                .ToHashSet(StringComparer.Ordinal);
+            var expiredPlayers = _pendingExpiredPlayerIds
+                .Where(playerId => !activeIds.Contains(playerId))
+                .ToArray();
+            _pendingExpiredPlayerIds.Clear();
+            return expiredPlayers;
+        }
+    }
+
     private int PruneExpiredCore()
     {
         var now = clock.GetUtcNow();
         var expired = _active
             .Where(pair => pair.Value.ExpiresUtc <= now)
-            .Select(pair => pair.Key)
             .ToArray();
-        foreach (var id in expired)
-            _active.Remove(id);
+        foreach (var (sessionId, entry) in expired)
+        {
+            _active.Remove(sessionId);
+            _pendingExpiredPlayerIds.Add(entry.PlayerId);
+        }
         return expired.Length;
     }
 }

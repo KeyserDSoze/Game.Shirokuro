@@ -115,5 +115,72 @@ public sealed class GuestSessionRegistryTests
         Assert.Throws<ArgumentException>(() =>
             GuestSessions.CreatePrincipal(player, "not-a-session"));
     }
-}
 
+[Fact]
+    public void ExpiredPlayerIdsSurviveOpportunisticPruningUntilWorkerDrainsThem()
+    {
+        var clock = new ManualClock();
+        var registry = new GuestSessionRegistry(clock);
+        var expiredId = "guest-" + new string('a', 32);
+        var activeId = "guest-" + new string('b', 32);
+        var oldToken = registry.Register(expiredId, clock.GetUtcNow().AddMinutes(5));
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        registry.Register(activeId, clock.GetUtcNow().AddHours(1));
+        Assert.False(registry.IsActive(GuestSessions.CreatePrincipal(expiredId, oldToken)));
+        Assert.Equal(1, registry.StoredSessionCount);
+        Assert.Equal([expiredId], registry.DrainExpiredPlayerIds());
+        Assert.Empty(registry.DrainExpiredPlayerIds());
+    }
+
+    [Fact]
+    public void ActiveReplacementSessionPreventsDelayedExpiryCleanupOfSamePlayer()
+    {
+        var clock = new ManualClock();
+        var registry = new GuestSessionRegistry(clock);
+        var id = "guest-" + new string('a', 32);
+        var expiredToken = registry.Register(id, clock.GetUtcNow().AddMinutes(5));
+        clock.Advance(TimeSpan.FromMinutes(5));
+
+        // The old expiry was discovered opportunistically by Register, but
+        // the server has since registered a currently active ticket.
+        var freshToken = registry.Register(id, clock.GetUtcNow().AddMinutes(30));
+        Assert.False(registry.IsActive(GuestSessions.CreatePrincipal(id, expiredToken)));
+        Assert.True(registry.IsActive(GuestSessions.CreatePrincipal(id, freshToken)));
+        Assert.Empty(registry.DrainExpiredPlayerIds());
+
+        clock.Advance(TimeSpan.FromMinutes(30));
+        Assert.Equal([id], registry.DrainExpiredPlayerIds());
+        Assert.Empty(registry.DrainExpiredPlayerIds());
+    }
+
+    [Fact]
+    public void RevocationIsNotMistakenForNaturalSessionExpiry()
+    {
+        var clock = new ManualClock();
+        var registry = new GuestSessionRegistry(clock);
+        var id = "guest-" + new string('a', 32);
+        var token = registry.Register(id, clock.GetUtcNow().AddMinutes(5));
+        Assert.True(registry.Revoke(GuestSessions.CreatePrincipal(id, token)));
+        clock.Advance(TimeSpan.FromMinutes(5));
+        Assert.Empty(registry.DrainExpiredPlayerIds());
+    }
+
+    [Fact]
+    public async Task ConcurrentExpiryDiscoveryAndDrainNeverDuplicatesOrLosesAnIdentity()
+    {
+        var clock = new ManualClock();
+        var registry = new GuestSessionRegistry(clock);
+        var ids = Enumerable.Range(0, 64).Select(i => "guest-" + i.ToString("x32")).ToArray();
+        foreach (var id in ids)
+            registry.Register(id, clock.GetUtcNow().AddMinutes(5));
+        clock.Advance(TimeSpan.FromMinutes(5));
+
+        var results = await Task.WhenAll(Enumerable.Range(0, 32).Select(_ =>
+            Task.Run(() => registry.DrainExpiredPlayerIds().ToArray())));
+        Assert.Equal(64, results.Sum(result => result.Length));
+        Assert.Equal(ids.Order(StringComparer.Ordinal),
+            results.SelectMany(result => result).Order(StringComparer.Ordinal));
+        Assert.Empty(registry.DrainExpiredPlayerIds());
+    }
+}

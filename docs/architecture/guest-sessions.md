@@ -34,7 +34,12 @@ legacy, revoked, expired or unregistered guest cookies are rejected. Guest
 logout revokes the registry entry **before** clearing the browser cookie,
 so a copied ticket cannot authenticate again. SignalR `GetRoster` also
 checks the active registry on every hub invocation (a WebSocket may have
-connected before logout). Registry entries are pruned every five minutes.
+connected before logout). Registry entries are pruned every five minutes. With #27, each natural
+expiry also queues a trusted player ID for the session worker, which
+removes that player from active pre-match rosters without changing room TTL
+or authorization of other members. IDs pruned opportunistically at guest
+registration are retained for the next sweep; explicit logout (#25) still
+removes membership immediately, not through the expiry queue.
 
 These guarantees are **per process**. A restart loses the registry and
 invalidates previous guests (safe but not seamless). The store and
