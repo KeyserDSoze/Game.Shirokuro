@@ -1,13 +1,13 @@
 using System.Net;
-using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Security;
 using Xunit;
@@ -16,22 +16,6 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 
 public sealed class TrustedProxyForwardingTests
 {
-    // TestServer doesn't provide a real TCP peer. This filter inserts a
-    // deterministic transport-level address before the application pipeline.
-    private sealed class RemotePeerFilter(IPAddress address) : IStartupFilter
-    {
-        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) =>
-            app =>
-            {
-                app.Use(nextMiddleware => context =>
-                {
-                    context.Connection.RemoteIpAddress = address;
-                    return nextMiddleware(context);
-                });
-                next(app);
-            };
-    }
-
     private static IConfiguration Config(params string[] entries) =>
         new ConfigurationBuilder().AddInMemoryCollection(
             entries.Select((value, index) =>
@@ -93,8 +77,7 @@ public sealed class TrustedProxyForwardingTests
             TrustedProxyForwarding.Configure(new ServiceCollection(), Config(tooMany)));
     }
 
-    private static WebApplicationFactory<Program> Server(string peerAddress,
-        params string[] knownProxies) =>
+    private static WebApplicationFactory<Program> Server(params string[] knownProxies) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Development");
@@ -102,64 +85,80 @@ public sealed class TrustedProxyForwardingTests
                 configuration.AddInMemoryCollection(knownProxies.Select((value, index) =>
                     new KeyValuePair<string, string?>(
                         "Security:KnownProxies:" + index, value))));
-            builder.ConfigureTestServices(services =>
-                services.AddSingleton<IStartupFilter>(
-                    new RemotePeerFilter(IPAddress.Parse(peerAddress))));
         });
 
-    private static HttpClient Client(WebApplicationFactory<Program> server,
-        string? cookie = null)
+    /// <summary>
+    /// The TestServer transport-level peer address must be assigned before
+    /// app middleware executes. Unlike a StartupFilter, SendAsync injects it
+    /// into the request's connection feature, exactly as a real TCP peer.
+    /// </summary>
+    private static Task<HttpContext> Send(
+        WebApplicationFactory<Program> server,
+        string peer,
+        HttpMethod method,
+        string path,
+        string forwardedFor,
+        string forwardedProto = "http",
+        string? cookie = null,
+        object? body = null,
+        bool spoofHost = false)
     {
-        var client = server.CreateClient(new WebApplicationFactoryClientOptions
+        var bytes = body is null ? null : JsonSerializer.SerializeToUtf8Bytes(body);
+        return server.Server.SendAsync(context =>
         {
-            AllowAutoRedirect = false,
-            HandleCookies = false
+            context.Connection.RemoteIpAddress = IPAddress.Parse(peer);
+            context.Request.Method = method.Method;
+            context.Request.Path = path;
+            context.Request.Scheme = "http";
+            context.Request.Host = new HostString("localhost");
+            context.Request.Headers["Origin"] = "http://localhost";
+            context.Request.Headers["X-Shirokuro-Request"] = "1";
+            context.Request.Headers["X-Forwarded-For"] = forwardedFor;
+            context.Request.Headers["X-Forwarded-Proto"] = forwardedProto;
+            if (spoofHost)
+                context.Request.Headers["X-Forwarded-Host"] = "evil.example";
+            if (cookie is not null)
+                context.Request.Headers["Cookie"] = cookie;
+            if (bytes is not null)
+            {
+                context.Request.ContentType = "application/json";
+                context.Request.ContentLength = bytes.Length;
+                context.Request.Body = new MemoryStream(bytes);
+            }
         });
-        if (cookie is not null)
-            client.DefaultRequestHeaders.TryAddWithoutValidation("Cookie", cookie);
-        return client;
     }
 
-    private static HttpRequestMessage Write(HttpMethod method, string path,
-        string forwardedFor, string forwardedProto = "http",
-        object? body = null, bool spoofHost = false)
+    private static async Task<(string Cookie, HttpContext Context)> Issue(
+        WebApplicationFactory<Program> server,
+        string peer,
+        string clientIp,
+        string proto = "http",
+        bool spoofHost = false)
     {
-        var request = new HttpRequestMessage(method, path);
-        request.Headers.TryAddWithoutValidation("Origin", "http://localhost");
-        request.Headers.TryAddWithoutValidation("X-Shirokuro-Request", "1");
-        request.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedFor);
-        request.Headers.TryAddWithoutValidation("X-Forwarded-Proto", forwardedProto);
-        if (spoofHost)
-            request.Headers.TryAddWithoutValidation("X-Forwarded-Host", "evil.example");
-        if (body is not null)
-            request.Content = JsonContent.Create(body);
-        return request;
-    }
-
-    private static async Task<(string Cookie, HttpStatusCode Status)> Issue(
-        HttpClient client, string clientIp, string proto = "http", bool spoofHost = false)
-    {
-        using var request = Write(HttpMethod.Post, "/api/sessions/guest",
-            clientIp, proto, spoofHost: spoofHost);
-        using var response = await client.SendAsync(request);
-        var cookie = response.Headers.TryGetValues("Set-Cookie", out var values)
-            ? Assert.Single(values).Split(';')[0] : "";
-        return (cookie, response.StatusCode);
+        var context = await Send(server, peer, HttpMethod.Post,
+            "/api/sessions/guest", clientIp, proto, spoofHost: spoofHost);
+        var cookie = context.Response.Headers.TryGetValue("Set-Cookie", out var values)
+            ? values.ToString().Split(';')[0] : "";
+        return (cookie, context);
     }
 
     [Fact]
     public async Task TrustedProxyUsesClientAddressForGuestIssuanceThrottle()
     {
-        using var server = Server("192.0.2.10", "192.0.2.10");
-        using var client = Client(server);
+        using var server = Server("192.0.2.10");
         for (var i = 0; i < 12; i++)
-            Assert.Equal(HttpStatusCode.OK,
-                (await Issue(client, "198.51.100.20", spoofHost: true)).Status);
-        Assert.Equal(HttpStatusCode.TooManyRequests,
-            (await Issue(client, "198.51.100.20")).Status);
-        // Same physical proxy, different client IP: independent throttle.
-        Assert.Equal(HttpStatusCode.OK,
-            (await Issue(client, "198.51.100.21")).Status);
+        {
+            var issued = await Issue(server, "192.0.2.10", "198.51.100.20",
+                spoofHost: true);
+            Assert.Equal(200, issued.Context.Response.StatusCode);
+            Assert.Equal(IPAddress.Parse("198.51.100.20"),
+                issued.Context.Connection.RemoteIpAddress);
+            Assert.Equal("localhost", issued.Context.Request.Host.Host);
+        }
+        Assert.Equal(429, (await Issue(server, "192.0.2.10",
+            "198.51.100.20")).Context.Response.StatusCode);
+        Assert.Equal(200, (await Issue(server, "192.0.2.10",
+            "198.51.100.21")).Context.Response.StatusCode);
     }
 
     [Theory]
@@ -169,79 +168,79 @@ public sealed class TrustedProxyForwardingTests
         bool explicitlyConfigureAnotherProxy)
     {
         using var server = explicitlyConfigureAnotherProxy
-            ? Server("192.0.2.11", "192.0.2.10")
-            : Server("127.0.0.1");
-        using var client = Client(server);
+            ? Server("192.0.2.10") : Server();
+        var peer = explicitlyConfigureAnotherProxy ? "192.0.2.11" : "127.0.0.1";
         for (var i = 0; i < 12; i++)
-            Assert.Equal(HttpStatusCode.OK,
-                (await Issue(client, "198.51.100." + (i + 1))).Status);
-
-        Assert.Equal(HttpStatusCode.TooManyRequests,
-            (await Issue(client, "203.0.113.1")).Status);
+        {
+            var issued = await Issue(server, peer, "198.51.100." + (i + 1));
+            Assert.Equal(200, issued.Context.Response.StatusCode);
+            Assert.Equal(IPAddress.Parse(peer),
+                issued.Context.Connection.RemoteIpAddress);
+        }
+        Assert.Equal(429, (await Issue(server, peer,
+            "203.0.113.1")).Context.Response.StatusCode);
     }
 
     [Fact]
     public async Task OnlyRightmostHopIsConsumedFromAForwardedChain()
     {
-        using var server = Server("192.0.2.10", "192.0.2.10");
-        using var client = Client(server);
+        using var server = Server("192.0.2.10");
         for (var i = 0; i < 12; i++)
-            Assert.Equal(HttpStatusCode.OK,
-                (await Issue(client, "198.51.100.1, 203.0.113.10",
-                    "http, http")).Status);
-
-        Assert.Equal(HttpStatusCode.TooManyRequests,
-            (await Issue(client, "198.51.100.2, 203.0.113.10",
-                "http, http")).Status);
-        Assert.Equal(HttpStatusCode.OK,
-            (await Issue(client, "198.51.100.1, 203.0.113.11",
-                "http, http")).Status);
+        {
+            var result = await Issue(server, "192.0.2.10",
+                "198.51.100.1, 203.0.113.10", "http, http");
+            Assert.Equal(200, result.Context.Response.StatusCode);
+            Assert.Equal(IPAddress.Parse("203.0.113.10"),
+                result.Context.Connection.RemoteIpAddress);
+        }
+        Assert.Equal(429, (await Issue(server, "192.0.2.10",
+            "198.51.100.2, 203.0.113.10", "http, http")).Context.Response.StatusCode);
+        Assert.Equal(200, (await Issue(server, "192.0.2.10",
+            "198.51.100.1, 203.0.113.11", "http, http")).Context.Response.StatusCode);
     }
 
     [Fact]
     public async Task MismatchedForwardedHeadersCannotChangeTheClientPartition()
     {
-        using var server = Server("192.0.2.10", "192.0.2.10");
-        using var client = Client(server);
+        using var server = Server("192.0.2.10");
         for (var i = 0; i < 12; i++)
-            Assert.Equal(HttpStatusCode.OK,
-                (await Issue(client, "203.0.113." + (i + 1) + ", 192.0.2.200",
-                    "http")).Status);
-        Assert.Equal(HttpStatusCode.TooManyRequests,
-            (await Issue(client, "198.51.100.100, 192.0.2.200",
-                "http")).Status);
+        {
+            var result = await Issue(server, "192.0.2.10",
+                "203.0.113." + (i + 1) + ", 192.0.2.200", "http");
+            Assert.Equal(200, result.Context.Response.StatusCode);
+            Assert.Equal(IPAddress.Parse("192.0.2.10"),
+                result.Context.Connection.RemoteIpAddress);
+        }
+        Assert.Equal(429, (await Issue(server, "192.0.2.10",
+            "198.51.100.100, 192.0.2.200", "http")).Context.Response.StatusCode);
     }
 
     [Fact]
     public async Task TrustedProxyAlsoKeepsRoomCreationQuotaPerClient()
     {
-        using var server = Server("192.0.2.10", "192.0.2.10");
-        using var visitor = Client(server);
-        var first = await Issue(visitor, "203.0.113.10");
-        var second = await Issue(visitor, "203.0.113.10");
-        var third = await Issue(visitor, "203.0.113.11");
-        Assert.Equal(HttpStatusCode.OK, first.Status);
-        Assert.Equal(HttpStatusCode.OK, second.Status);
-        Assert.Equal(HttpStatusCode.OK, third.Status);
+        using var server = Server("192.0.2.10");
+        var one = await Issue(server, "192.0.2.10", "203.0.113.10");
+        var two = await Issue(server, "192.0.2.10", "203.0.113.10");
+        var three = await Issue(server, "192.0.2.10", "203.0.113.11");
+        Assert.Equal(200, one.Context.Response.StatusCode);
+        Assert.Equal(200, two.Context.Response.StatusCode);
+        Assert.Equal(200, three.Context.Response.StatusCode);
+        Assert.NotEmpty(one.Cookie);
+        Assert.NotEmpty(two.Cookie);
+        Assert.NotEmpty(three.Cookie);
 
-        using var playerOne = Client(server, first.Cookie);
-        using var playerTwo = Client(server, second.Cookie);
-        using var playerThree = Client(server, third.Cookie);
-
-        async Task<HttpStatusCode> Create(HttpClient player, string ip)
+        async Task<int> Create(string cookie, string clientIp)
         {
-            using var request = Write(HttpMethod.Post, "/api/lobbies", ip, body:
-                new { teamIds = new[] { "white", "black" }, teamId = "white" });
-            using var response = await player.SendAsync(request);
-            return response.StatusCode;
+            var response = await Send(server, "192.0.2.10", HttpMethod.Post,
+                "/api/lobbies", clientIp, cookie: cookie,
+                body: new { teamIds = new[] { "white", "black" }, teamId = "white" });
+            return response.Response.StatusCode;
         }
 
         for (var i = 0; i < 8; i++)
-            Assert.Equal(HttpStatusCode.Created,
-                await Create(i < 4 ? playerOne : playerTwo, "203.0.113.10"));
-        Assert.Equal(HttpStatusCode.TooManyRequests,
-            await Create(playerThree, "203.0.113.10"));
-        Assert.Equal(HttpStatusCode.Created,
-            await Create(playerThree, "203.0.113.11"));
+            Assert.Equal(201,
+                await Create(i < 4 ? one.Cookie : two.Cookie, "203.0.113.10"));
+        Assert.Equal(429, await Create(three.Cookie, "203.0.113.10"));
+        Assert.Equal(201, await Create(three.Cookie, "203.0.113.11"));
     }
 }
