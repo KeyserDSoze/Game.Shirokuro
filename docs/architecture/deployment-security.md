@@ -1,4 +1,4 @@
-# Deployment security: explicit Origin trust — #28
+# Deployment security: Origin, Host and reverse-proxy trust — #28, #29, #30
 
 This is an **intermediate hardening step**, not a production-ready
 multi-node deployment. Shirokuro currently holds its room/session registries
@@ -29,9 +29,26 @@ entries (HTTP, wildcard, path, query, etc.) are ignored. Do not use `*`,
 allow arbitrary Origin reflection, copy `Origin` from `Host`, or trust
 `X-Forwarded-Host` / `X-Forwarded-Proto` from incoming user requests.
 
-The allowlist provides CSRF authorization, **not a Host-header firewall**.
-Deployments must separately configure ASP.NET Core `AllowedHosts`,
-TLS/HTTPS termination, and a reverse proxy that sanitizes external headers.
+The Origin allowlist provides CSRF authorization; **issue #30** adds an
+independent, fail-closed **Host allowlist** in non-Development environments.
+A missing, empty, wildcard (`*`), malformed or duplicated `AllowedHosts`
+configuration causes startup failure. The semicolon-separated entries are
+exact canonical hostnames, optionally including a specific port, e.g.
+`AllowedHosts=game.example.com;api.example.com:8443`. Subdomain
+wildcards and unconfigured ports are not authorized.
+
+Every request (including health, read-only APIs, SignalR negotiate, and
+guest/lobby writes) must have **one** syntactically valid Host that exactly
+matches an allowlisted host and port; otherwise the API responds `400`,
+before auth, rate limiting and endpoint logic. `X-Forwarded-Host` is never
+used to bypass this check. Host policy is separate from Origin: configure
+both `AllowedHosts` and `Security:AllowedOrigins`, consistently with the
+actual proxy routing. In Development the Host allowlist restriction is
+disabled to preserve Vite/localhost; cookie writes still require the
+loopback/Vite Origin checks of #28.
+
+TLS/HTTPS termination and ingress network restrictions are still a deployment
+responsibility; this middleware does **not** automatically provision TLS.
 
 ## Trusted reverse proxy (issue #29)
 
@@ -61,9 +78,12 @@ must **remove and replace** user-supplied `X-Forwarded-*` headers at the
 ingress; otherwise clients may spoof their address even behind that proxy.
 Restrict direct network access to the service where possible.
 
-The proxy setting does not validate incoming `Host` headers or constitute
-a complete public deployment. Configure and test `AllowedHosts`, trusted
-edge TLS termination/HTTPS and the external host separately under #21.
+The Host guard (#30) validates the **backend-facing Host** without reading
+`X-Forwarded-Host`: configure the trusted edge proxy to replace Host with
+an explicitly allowlisted value. The proxy must also terminate HTTPS
+properly, strip client-controlled forwarding headers and restrict direct
+access. These operational guarantees cannot be proven just by ASP.NET tests
+and remain deployment work under #21.
 A separate frontend origin also requires an explicit CORS policy review:
 this feature does **not** enable cross-origin production credentialed CORS.
 
@@ -81,6 +101,6 @@ cookies/roster after rejected writes; malformed and spoofed origins;
 host and forwarded-header spoof attempts; and the local Vite flow.
 The Playwright local-browser workflows remain unchanged.
 
-This does not solve shared Data Protection keys, full ingress/Host filtering,
+This does not solve shared Data Protection keys, edge TLS/network validation,
 distributed rate limiting, session persistence or durable player accounts:
 all remain open in #21.

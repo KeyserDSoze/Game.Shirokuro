@@ -19,9 +19,11 @@ public sealed class WebMutationGuardTests
             builder.UseEnvironment(environment);
             builder.ConfigureAppConfiguration((_, configuration) =>
             {
-                configuration.AddInMemoryCollection(allowedOrigins
-                    .Select((origin, index) => new KeyValuePair<string, string?>(
-                        "Security:AllowedOrigins:" + index, origin)));
+                configuration.AddInMemoryCollection(
+                    new[] { new KeyValuePair<string, string?>(
+                        "AllowedHosts", "localhost;game.example") }.Concat(allowedOrigins
+                        .Select((origin, index) => new KeyValuePair<string, string?>(
+                            "Security:AllowedOrigins:" + index, origin))));
             });
         });
 
@@ -87,7 +89,7 @@ public sealed class WebMutationGuardTests
             "https://evil.example", host: "evil.example"))
         using (var denied = await visitor.SendAsync(forged))
         {
-            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
             Assert.False(denied.Headers.Contains("Set-Cookie"));
         }
     }
@@ -114,7 +116,7 @@ public sealed class WebMutationGuardTests
                 "/api/lobbies/" + room + "/hero", "https://evil.example",
                 new { heroId = "kira", expectedRevision = 1 }, host: "evil.example"))
             using (var blocked = await member.SendAsync(forged))
-                Assert.Equal(HttpStatusCode.Forbidden, blocked.StatusCode);
+                Assert.Equal(HttpStatusCode.BadRequest, blocked.StatusCode);
 
             using (var roster = await member.GetAsync("/api/lobbies/" + room + "/roster"))
             {
@@ -206,7 +208,7 @@ public sealed class WebMutationGuardTests
         request.Headers.TryAddWithoutValidation("X-Forwarded-Host", "game.example");
         request.Headers.TryAddWithoutValidation("X-Forwarded-Proto", "https");
         using var response = await visitor.SendAsync(request);
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
     [Fact]

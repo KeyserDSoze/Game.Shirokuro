@@ -47,6 +47,12 @@ or authorization of other members. IDs pruned opportunistically at guest
 registration are retained for the next sweep; explicit logout (#25) still
 removes membership immediately, not through the expiry queue.
 
+In #30, non-Development requests also require a canonical, explicit
+`AllowedHosts` entry for every API, health and SignalR request. An unlisted
+or malformed Host is rejected (HTTP 400) before any authentication or
+lobby mutation. Configure `AllowedHosts` separately from the Origin
+allowlist; neither trusts `X-Forwarded-Host`.
+
 The optional reverse-proxy configuration (#29) accepts `X-Forwarded-For`
 and `X-Forwarded-Proto` **only** from explicitly trusted proxy IPs, with
 single-hop forwarding. This preserves per-client issuance throttles behind

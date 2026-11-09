@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.Extensions.Options;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.RateLimiting;
@@ -13,6 +14,7 @@ using Shirokuro.Application.Preview;
 var builder = WebApplication.CreateBuilder(args);
 // Ingress forwarding stays disabled unless exact trusted proxy IPs are configured.
 TrustedProxyForwarding.Configure(builder.Services, builder.Configuration);
+builder.Services.AddIngressHostPolicy();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<GuestSessionRegistry>();
@@ -104,6 +106,20 @@ var app = builder.Build();
 // Must precede CORS, authentication and the per-IP rate limiter.
 // Without trusted proxies, ForwardedHeaders.None consumes nothing.
 app.UseForwardedHeaders();
+
+// Host validation precedes CORS, authentication, SignalR and all endpoints.
+// This explicitly rejects unlisted/malformed hosts even for read-only routes.
+app.Use(async (context, next) =>
+{
+    var policy = context.RequestServices
+        .GetRequiredService<IOptions<IngressHostPolicyOptions>>().Value.Policy;
+    if (!policy.Allows(context.Request))
+    {
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        return;
+    }
+    await next(context);
+});
 
 if (app.Environment.IsDevelopment())
 {
