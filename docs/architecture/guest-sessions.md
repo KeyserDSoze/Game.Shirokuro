@@ -22,10 +22,16 @@ The session kind claim is inside the signed ticket.
 ## Browser and abuse boundaries
 
 The custom request header makes browser cross-origin writes require a CORS
-preflight; only the API's own origin or the two explicit local Vite dev origins
-are allowed by the Origin check. During Development, only the two local Vite
-origins allow CORS credentials (never `*`). Guest issuance is limited to
-12 POSTs per minute per remote IP with no queue, **per server instance**.
+preflight. As of #28, **non-Development** requests are denied unless their
+canonical HTTPS `Origin` is explicitly configured in
+`Security:AllowedOrigins`; `Host` and spoofed forwarded headers cannot grant
+CSRF trust. No configured origin means all guest/lobby mutations return 403,
+while health/read-only routes continue working. In Development, only a local
+loopback API same-origin or the explicit `localhost:5173` /
+`127.0.0.1:5173` Vite origins are accepted. During Development, only
+the two Vite origins allow CORS credentials (never `*`). Guest issuance
+is limited to 12 POSTs per minute per remote IP with no queue, **per
+server instance**. See [deployment-security.md](deployment-security.md).
 
 Follow-up #23 now records a **separate 128-bit random session ID** in the
 signed cookie and in a server-side registry alongside the guest's player ID
