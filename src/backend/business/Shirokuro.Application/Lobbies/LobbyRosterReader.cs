@@ -9,13 +9,9 @@ public sealed class LobbyRosterReader(InMemoryLobbyCoordinator coordinator)
     public LobbyRosterView ForMember(string lobbyId, string trustedPlayerId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
-        var state = coordinator.Get(lobbyId);
-
-        if (!state.Participants.Any(participant =>
-            StringComparer.Ordinal.Equals(participant.PlayerId, trustedPlayerId)))
-        {
-            throw new UnauthorizedAccessException("Player is not a member of this lobby.");
-        }
+        // Atomic member-scoped read and inactivity refresh.
+        // Unknown and non-member rooms stay indistinguishable on the wire.
+        var state = coordinator.GetForMember(lobbyId, trustedPlayerId);
 
         return new LobbyRosterView(
             state.Definition.LobbyId,
@@ -28,4 +24,5 @@ public sealed class LobbyRosterReader(InMemoryLobbyCoordinator coordinator)
                     participant.HeroId)).ToArray()));
     }
 }
+
 

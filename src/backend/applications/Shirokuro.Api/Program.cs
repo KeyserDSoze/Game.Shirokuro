@@ -10,6 +10,8 @@ using Shirokuro.Application.Lobbies;
 using Shirokuro.Application.Preview;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<BoardPreviewService>();
 builder.Services.AddSingleton<InMemoryLobbyCoordinator>();
 builder.Services.AddSingleton<LobbyRosterReader>();
@@ -195,6 +197,7 @@ app.Run();
 public partial class Program
 {
 }
+
 
 
 
