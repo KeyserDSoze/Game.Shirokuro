@@ -12,6 +12,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Hubs;
+using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Xunit;
 
