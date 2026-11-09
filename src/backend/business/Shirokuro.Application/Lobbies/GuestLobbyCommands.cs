@@ -44,33 +44,22 @@ public sealed class GuestLobbyCommands(
     public LobbyRosterView ChooseHero(
         string roomId, string trustedPlayerId, string? heroId, long expectedRevision)
     {
-        RequireMember(roomId, trustedPlayerId);
-        if (heroId is null)
-            throw new ArgumentException("Hero is required.");
-        coordinator.ChooseHero(roomId, trustedPlayerId, heroId, expectedRevision);
+        // Authorization and validation are atomic; rejected writes must
+        // not refresh room TTL or expose its revision to nonmembers.
+        coordinator.ChooseHero(roomId, trustedPlayerId, heroId!, expectedRevision);
         return reader.ForMember(roomId, trustedPlayerId);
     }
 
     public LobbyRosterView ChangeTeam(
         string roomId, string trustedPlayerId, string? teamId, long expectedRevision)
     {
-        RequireMember(roomId, trustedPlayerId);
-        if (teamId is null)
-            throw new ArgumentException("Team is required.");
-        coordinator.ChangeTeam(roomId, trustedPlayerId, teamId, expectedRevision);
+        coordinator.ChangeTeam(roomId, trustedPlayerId, teamId!, expectedRevision);
         return reader.ForMember(roomId, trustedPlayerId);
     }
 
     public void Leave(string roomId, string trustedPlayerId, long expectedRevision)
     {
-        RequireMember(roomId, trustedPlayerId);
         coordinator.LeaveAndPrune(roomId, trustedPlayerId, expectedRevision);
-    }
-
-    private void RequireMember(string roomId, string playerId)
-    {
-        // Member/absent failures intentionally indistinguishable on the wire.
-        reader.ForMember(roomId, playerId);
     }
 
     private static void ValidateTeams(IReadOnlyList<string>? teams)

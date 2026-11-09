@@ -94,6 +94,7 @@ public sealed class InMemoryLobbyCoordinator
         lock (_gate)
         {
             var previous = Find(lobbyId);
+            EnsureMember(previous, trustedPlayerId);
             var next = previous.Leave(trustedPlayerId, expectedRevision);
             if (next.Participants.Count == 0)
                 _lobbies.Remove(lobbyId);
@@ -123,10 +124,7 @@ public sealed class InMemoryLobbyCoordinator
         lock (_gate)
         {
             var state = Find(lobbyId);
-            if (!state.Participants.Any(p =>
-                string.Equals(p.PlayerId, trustedPlayerId, StringComparison.Ordinal)))
-                throw new UnauthorizedAccessException("Player is not a lobby participant.");
-
+            EnsureMember(state, trustedPlayerId);
             Store(state); // Same immutable revision; only activity timestamp changes.
             return state;
         }
@@ -136,13 +134,16 @@ public sealed class InMemoryLobbyCoordinator
         => Mutate(lobbyId, state => state.Join(trustedPlayerId, teamId, expectedRevision));
 
     public LobbyState ChangeTeam(string lobbyId, string trustedPlayerId, string teamId, long expectedRevision)
-        => Mutate(lobbyId, state => state.ChangeTeam(trustedPlayerId, teamId, expectedRevision));
+        => MutateForMember(lobbyId, trustedPlayerId,
+            state => state.ChangeTeam(trustedPlayerId, teamId, expectedRevision));
 
     public LobbyState ChooseHero(string lobbyId, string trustedPlayerId, string heroId, long expectedRevision)
-        => Mutate(lobbyId, state => state.ChooseHero(trustedPlayerId, heroId, expectedRevision));
+        => MutateForMember(lobbyId, trustedPlayerId,
+            state => state.ChooseHero(trustedPlayerId, heroId, expectedRevision));
 
     public LobbyState Leave(string lobbyId, string trustedPlayerId, long expectedRevision)
-        => Mutate(lobbyId, state => state.Leave(trustedPlayerId, expectedRevision));
+        => MutateForMember(lobbyId, trustedPlayerId,
+            state => state.Leave(trustedPlayerId, expectedRevision));
 
     /// <summary>
     /// Called by the background worker, and also during room creation for
@@ -163,6 +164,31 @@ public sealed class InMemoryLobbyCoordinator
             Store(next);
             return next;
         }
+    }
+
+    /// <summary>
+    /// Authorize, validate and mutate under the same lock. A failed or
+    /// unauthorized write cannot refresh inactivity or enumerate rooms.
+    /// </summary>
+    private LobbyState MutateForMember(
+        string lobbyId, string trustedPlayerId, Func<LobbyState, LobbyState> update)
+    {
+        lock (_gate)
+        {
+            var state = Find(lobbyId);
+            EnsureMember(state, trustedPlayerId);
+            var next = update(state);
+            Store(next);
+            return next;
+        }
+    }
+
+    private static void EnsureMember(LobbyState state, string trustedPlayerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
+        if (!state.Participants.Any(p =>
+            string.Equals(p.PlayerId, trustedPlayerId, StringComparison.Ordinal)))
+            throw new UnauthorizedAccessException("Player is not a lobby participant.");
     }
 
     private LobbyState Find(string lobbyId)
