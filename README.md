@@ -244,8 +244,35 @@ la configurazione Vite inoltra `/api` e `/hubs` a
 `http://127.0.0.1:5186` (avvia l'API con `--urls http://127.0.0.1:5186`).
 
 I test Playwright avviano **due browser guest distinti** e l'API .NET 10
-con un server dedicato. La CI testa xUnit e i tre casi Playwright della
-lobby. La sessione è **pseudonima e non persistente** e le stanze vivono
-solo nella memoria del processo; scadenza automatica, revoca sessioni,
-distribuzione e recupero sono tracciati in #21. Dettagli:
+con un server dedicato. La CI verifica xUnit, Vitest, Playwright e Python.
+La sessione è **pseudonima**, lo stato delle stanze è ancora solo in
+memoria; le misure anti-abuso distribuite, la persistenza dei dati e
+delle chiavi, la revoca multi-node e il recupero dopo crash restano
+in #21. Dettagli:
 `docs/architecture/guest-invitation-lobby.md`.
+
+## Ciclo di vita e revoca degli ospiti (#22 e #23)
+
+Le lobby in memoria ora scadono dopo **30 minuti senza attività valida**
+(soglia tecnica, non tempo ufficiale della partita). Una lettura del
+roster da parte di un membro o una modifica accettata rinnova il timer;
+tentativi di estranei e operazioni respinte **non** lo rinnovano.
+L'accesso a un invito scaduto risponde come stanza inesistente (404).
+Un servizio del backend elimina periodicamente le stanze inattive ogni
+minuto e la capienza viene recuperata anche senza attendere lo sweep.
+
+Ogni nuova sessione ospite firmata contiene un ID sessione casuale
+**registrato sul server**. Il logout elimina l'autorizzazione nel registro
+*prima* di cancellare il cookie: una copia del cookie rubata o riutilizzata
+dopo l'uscita riceve **401**, anche su SignalR; un hub già aperto
+ricontrolla l'autorizzazione a ogni invocazione. Le sessioni scadute
+vengono pulite periodicamente ogni cinque minuti. I test xUnit utilizzano
+orologi virtuali per le scadenze e Playwright controlla un cookie
+copiato su un secondo contesto browser.
+
+**Limite importante:** la revoca e le stanze sono **solo nella memoria
+dell'istanza corrente**. Se il server si riavvia, gli ospiti dovranno
+ottenere una nuova sessione e le lobby non verranno recuperate. Non è
+ancora un'architettura pubblica multi-server: store distribuito,
+Data Protection condivisa, anti-abuso e identità permanenti restano
+in #21. Approfondimenti: `docs/architecture/lobby-lifecycle.md`.

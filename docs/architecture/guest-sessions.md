@@ -27,14 +27,25 @@ are allowed by the Origin check. During Development, only the two local Vite
 origins allow CORS credentials (never `*`). Guest issuance is limited to
 12 POSTs per minute per remote IP with no queue, **per server instance**.
 
-Use HTTPS and configure persistent/shared Data Protection keys before
-production; proxies must reliably set scheme/host. Real distributed
-anti-abuse protection, account recovery and revocation are not yet built.
-`SignOutAsync` clears the browser cookie, but a stolen copied ticket
-is **not revoked** until expiry.
+Follow-up #23 now records a **separate 128-bit random session ID** in the
+signed cookie and in a server-side registry alongside the guest's player ID
+and expiry. `OnValidatePrincipal` checks this registry on every HTTP request;
+legacy, revoked, expired or unregistered guest cookies are rejected. Guest
+logout revokes the registry entry **before** clearing the browser cookie,
+so a copied ticket cannot authenticate again. SignalR `GetRoster` also
+checks the active registry on every hub invocation (a WebSocket may have
+connected before logout). Registry entries are pruned every five minutes.
+
+These guarantees are **per process**. A restart loses the registry and
+invalidates previous guests (safe but not seamless). The store and
+Data Protection keys are not yet shared across instances; cross-node
+revocation, durable identity, recovery, anti-abuse and verified accounts
+remain in #21. Use HTTPS and persistent/shared Data Protection before
+production; proxies must reliably set scheme and host.
 
 Session issuance by itself does not grant admission. #20 now exposes
 invitation-based room creation/join, and the #18 HTTP roster and SignalR
 reads still require server-side membership and expose no secret PvP
-positions/routes. Durable identity and revocation require #21; actual
-match networking and visibility still depend on #3/#5/#9.
+positions/routes. Per-process logout revocation is now delivered by #23;
+durable identity and distributed revocation require #21. Actual match
+networking and visibility still depend on #3/#5/#9.

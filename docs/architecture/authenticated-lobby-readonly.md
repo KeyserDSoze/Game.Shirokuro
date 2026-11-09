@@ -51,7 +51,10 @@ It does not include coordinates, planned destinations, fog-of-war or hidden
 cards. This roster is **not** the match observation projection.
 
 The future PvP realtime transport, visibility policy, reconnect logic and
-anti-cheat network tests remain in #9 and depend on #3/#5. #19 has issued
+anti-cheat network tests remain in #9 and depend on #3/#5. The roster
+reader now renews inactivity only for verified lobby members (#22);
+SignalR rechecks session revocation on every call, even on old sockets
+(#23). #19 has issued
 pseudonymous guest tickets and #20 provides room admission and updates,
 but neither is production-grade account identity or match networking.
 

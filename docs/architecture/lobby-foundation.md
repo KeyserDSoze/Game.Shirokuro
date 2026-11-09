@@ -31,7 +31,9 @@ persistence or approved game rules. See
   share a single hero allow-list.
 - `InMemoryLobbyCoordinator` stores lobby snapshots **inside the server**
   and applies actions atomically under a lock; writes on a stale revision
-  fail. This storage is intentionally process-local and non-durable.
+  fail. Follow-up #22 adds 30-minute idle TTL and a background minute
+  sweep; failed or nonmember requests do not renew it. This storage is
+  intentionally process-local and non-durable.
 
 ## Authentication and PvP security requirements
 
@@ -43,7 +45,8 @@ Guest HTTP write endpoints added in #20 now derive identity exclusively
 from signed sessions, authorize membership for self-only changes and use
 optimistic revision checks. The remaining **real match** implementation
 (#9 and dependent issues) must:
-1. Provide durable identity and revocation, not just guest cookies (#21).
+1. Provide durable identity and *distributed* revocation, beyond the
+   process-local guest revocation now in #23 (#21).
 2. Persist/coordinate room state and connection recovery across instances (#21).
 3. Add authorization for realtime room events at every send.
 4. Never mix pre-match roster DTOs with `MatchStateSnapshot` secrets.

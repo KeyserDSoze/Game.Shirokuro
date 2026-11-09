@@ -82,11 +82,12 @@ Vitest checks team parsing, opaque invite handling and exact client JSON.
 
 ## Not production-ready
 
-All rooms are process-local and non-durable. Expired/abandoned rooms can
-occupy a slot until process restart; only the last member leaving
-removes the room. Cookie logout clears the browser cookie but does not
-invalidate stolen copies. Limits are per-process, IP-only and insufficient
-for distributed deployments; Data Protection keys require persistence.
-These issues are tracked in #21. Match notifications, reconnect logic and
+All rooms are process-local and non-durable. Follow-up #22 now expires
+rooms after 30 minutes without authorized activity, synchronously rejects
+expired invites and sweeps abandoned rooms every minute. #23 adds
+per-process guest-cookie revocation on logout, even for copied cookies
+and SignalR connections already established. Limits and registries are
+still **per process** and insufficient for distributed deployments;
+Data Protection keys and room storage require persistence and sharing.
+Remaining infrastructure work is tracked in #21. Match notifications, reconnect logic and
 PvP observations remain #9 and cannot proceed without #3/#5.
-

@@ -20,7 +20,7 @@ Before gameplay implementation, specify visibility policy and per-player observa
 
 ## Not yet implemented
 
-Modes, hero traits, movement rules, fog of war, PvP/PvE, persistence, durable account sign-in, lobby session revocation/expiry (#21), live multiplayer events, real match networking and matchmaking. These are governed by later issues once game design is provided.
+Modes, hero traits, movement rules, fog of war, PvP/PvE, persistence, durable account sign-in, shared room persistence and cross-node session revocation (#21), live multiplayer events, real match networking and matchmaking. These are governed by later issues once game design is provided.
 
 ## Why React Three Fiber?
 
