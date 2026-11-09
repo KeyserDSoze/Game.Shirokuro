@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using Microsoft.AspNetCore.HttpOverrides;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.RateLimiting;
@@ -10,6 +11,9 @@ using Shirokuro.Application.Lobbies;
 using Shirokuro.Application.Preview;
 
 var builder = WebApplication.CreateBuilder(args);
+// Ingress forwarding is disabled unless exact trusted proxy IPs are configured.
+var trustedProxyForwardingEnabled = TrustedProxyForwarding.Configure(
+    builder.Services, builder.Configuration);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<GuestSessionRegistry>();
@@ -98,6 +102,10 @@ if (builder.Environment.IsDevelopment())
 }
 
 var app = builder.Build();
+// Must precede CORS, authentication and the per-IP rate limiter.
+if (trustedProxyForwardingEnabled)
+    app.UseForwardedHeaders();
+
 if (app.Environment.IsDevelopment())
 {
     app.UseCors("local-dev");

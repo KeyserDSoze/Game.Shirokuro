@@ -31,11 +31,39 @@ allow arbitrary Origin reflection, copy `Origin` from `Host`, or trust
 
 The allowlist provides CSRF authorization, **not a Host-header firewall**.
 Deployments must separately configure ASP.NET Core `AllowedHosts`,
-TLS/HTTPS termination, and a proxy that forwards the correct external
-scheme/host. The current app does **not** enable trusted forwarded-header
-processing, and forwarded headers from arbitrary clients must never be
-enabled globally; configure explicit known proxies/networks and test
-forwarded-host/scheme rejection before public exposure (remaining #21).
+TLS/HTTPS termination, and a reverse proxy that sanitizes external headers.
+
+## Trusted reverse proxy (issue #29)
+
+Forwarded-header processing is **disabled unless explicitly configured**.
+For a known **single proxy hop**, set exact transport peer IP addresses in:
+
+```sh
+Security__KnownProxies__0=192.0.2.10
+# Security__KnownProxies__1=2001:db8::10
+```
+
+The above are documentation-only addresses: use the **actual IP of your
+reverse proxy**, not client IPs. Configure `Security:KnownProxies` as an array
+of unique, canonical IPv4/IPv6 addresses. CIDR/networks, wildcards, empty
+entries, duplicated addresses and unspecified/broadcast addresses are
+not allowed and cause a **startup failure**, not a trust expansion.
+
+With this setting, ASP.NET Core's standard `ForwardedHeadersMiddleware`
+runs **before** authentication, CORS and the per-IP throttles. It accepts
+**only** `X-Forwarded-For` and `X-Forwarded-Proto` from a peer matching
+the configured proxy IP. `ForwardLimit=1` (single rightmost hop), and
+symmetric counts of forwarded values are mandatory. It **never**
+processes `X-Forwarded-Host`, so no client or proxy can rewrite the
+application Host through that header. An unknown peer or missing config
+cannot change the IP partition used by the throttles. A trusted proxy
+must **remove and replace** user-supplied `X-Forwarded-*` headers at the
+ingress; otherwise clients may spoof their address even behind that proxy.
+Restrict direct network access to the service where possible.
+
+The proxy setting does not validate incoming `Host` headers or constitute
+a complete public deployment. Configure and test `AllowedHosts`, trusted
+edge TLS termination/HTTPS and the external host separately under #21.
 A separate frontend origin also requires an explicit CORS policy review:
 this feature does **not** enable cross-origin production credentialed CORS.
 
@@ -53,6 +81,6 @@ cookies/roster after rejected writes; malformed and spoofed origins;
 host and forwarded-header spoof attempts; and the local Vite flow.
 The Playwright local-browser workflows remain unchanged.
 
-This does not solve shared Data Protection keys, proxy forwarding policy,
+This does not solve shared Data Protection keys, full ingress/Host filtering,
 distributed rate limiting, session persistence or durable player accounts:
 all remain open in #21.

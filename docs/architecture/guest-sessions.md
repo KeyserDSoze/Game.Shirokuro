@@ -47,6 +47,13 @@ or authorization of other members. IDs pruned opportunistically at guest
 registration are retained for the next sweep; explicit logout (#25) still
 removes membership immediately, not through the expiry queue.
 
+The optional reverse-proxy configuration (#29) accepts `X-Forwarded-For`
+and `X-Forwarded-Proto` **only** from explicitly trusted proxy IPs, with
+single-hop forwarding. This preserves per-client issuance throttles behind
+a real reverse proxy without allowing untrusted clients to spoof their
+IP. `X-Forwarded-Host` is never accepted. See
+[deployment-security.md](deployment-security.md).
+
 These guarantees are **per process**. A restart loses the registry and
 invalidates previous guests (safe but not seamless). The store and
 Data Protection keys are not yet shared across instances; cross-node
