@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useTheme } from 'next-themes'
-import { Compass, EyeOff, Globe2, Hexagon, Moon, Shield, Sun, Swords } from 'lucide-react'
+import { Compass, EyeOff, Globe2, Hexagon, Moon, Sun, Swords } from 'lucide-react'
 import HexWorld from '@/game/HexWorld'
+import HeroSelector from '@/features/heroes/HeroSelector'
+import { heroRoster } from '@/features/heroes/catalog'
 import type { HexCoordinate } from '@/game/hex'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -31,6 +33,8 @@ function ThemeButton() {
 export default function App() {
   const { t, i18n } = useTranslation()
   const [selected, setSelected] = useState<HexCoordinate>({ q: 0, r: 0 })
+  const [selectedHeroId, setSelectedHeroId] = useState(heroRoster[0].id)
+  const selectedHero = heroRoster.find((hero) => hero.id === selectedHeroId) ?? heroRoster[0]
 
   useEffect(() => { document.documentElement.lang = i18n.language }, [i18n.language])
 
@@ -65,7 +69,7 @@ export default function App() {
             <CardHeader>
               <div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-secondary"><Swords className="size-5" /></div>
               <CardTitle>{t('mode')}</CardTitle>
-              <CardDescription>{t('modePending')}</CardDescription>
+              <CardDescription>{t('modeObjective')}</CardDescription>
             </CardHeader>
             <CardContent>
               <div className="flex items-center justify-between rounded-lg border bg-secondary/60 px-3 py-3 text-sm font-medium">
@@ -73,19 +77,7 @@ export default function App() {
               </div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader>
-              <div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-secondary"><Shield className="size-5" /></div>
-              <CardTitle>{t('hero')}</CardTitle>
-              <CardDescription>{t('heroHint')}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center gap-3 rounded-lg border bg-secondary/50 p-3">
-                <div className="flex size-12 items-center justify-center rounded-lg bg-gradient-to-br from-[#e9e1d2] to-[#ada0dd] text-2xl text-[#232536]" aria-hidden="true">◉</div>
-                <span className="font-medium">{t('heroName')}</span>
-              </div>
-            </CardContent>
-          </Card>
+          <HeroSelector selectedId={selectedHeroId} onSelect={setSelectedHeroId} />
         </aside>
 
         <section className="min-w-0">
@@ -98,6 +90,7 @@ export default function App() {
           <div className="relative h-[min(65vh,660px)] min-h-[420px] overflow-hidden rounded-2xl border border-[#414254] bg-[#171b26] shadow-2xl shadow-black/10" data-testid="world-stage">
             <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-lg border border-white/15 bg-[#171b26]/80 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-white/80 backdrop-blur-sm">{t('preview')}</div>
             <HexWorld selected={selected} onSelect={setSelected} />
+            <div data-testid="world-hero" aria-live="polite" className="pointer-events-none absolute right-4 top-4 z-10 max-w-[55%] rounded-lg border border-white/15 bg-[#171b26]/80 px-3 py-2 text-right text-xs font-medium text-white/90 backdrop-blur-sm">{t('heroPreview', { name: selectedHero.name })}</div>
             <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-10 rounded-lg border border-white/10 bg-[#171b26]/75 px-3 py-2 text-center text-xs text-white/75 backdrop-blur-sm">{t('controls')}</div>
           </div>
         </section>
@@ -142,4 +135,5 @@ export default function App() {
     </div>
   )
 }
+
 

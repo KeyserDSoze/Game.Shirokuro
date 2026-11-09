@@ -13,6 +13,13 @@ void i18n.use(initReactI18next).init({
       modePending: 'Le regole delle modalità arriveranno con il game design.',
       hero: 'Il tuo eroe',
       heroName: 'Viandante',
+      heroRoster: 'Eroi disponibili',
+      chooseHero: 'Seleziona {{name}}',
+      heroPreview: 'Pedina provvisoria: {{name}}',
+      heroInitialLevel: 'Livello iniziale: 1 / 2',
+      heroUpgradeLocked: 'Potenziamento sbloccato dopo una eliminazione confermata',
+      heroSelectionLocal: 'Scelta di anteprima: nessuna partita attiva.',
+      modeObjective: 'Ruba il tesoro avversario e riportalo alla tua base sopravvivendo (regole complete da definire).',
       heroHint: 'Modello 3D provvisorio. Le abilità saranno definite dalle regole.',
       selection: 'Esagono selezionato',
       selectionHint: 'Coordinate assiali · soltanto un esempio visivo.',
@@ -36,6 +43,13 @@ void i18n.use(initReactI18next).init({
       modePending: 'Game mode rules will arrive with the game design.',
       hero: 'Your hero',
       heroName: 'Wanderer',
+      heroRoster: 'Available heroes',
+      chooseHero: 'Select {{name}}',
+      heroPreview: 'Placeholder token: {{name}}',
+      heroInitialLevel: 'Starting level: 1 / 2',
+      heroUpgradeLocked: 'Upgrade unlocks after a confirmed elimination',
+      heroSelectionLocal: 'Preview choice only: no active match.',
+      modeObjective: 'Steal the opposing treasure and return it to your base alive (full rules still to be defined).',
       heroHint: 'Placeholder 3D model. Abilities will be defined by the rules.',
       selection: 'Selected hexagon',
       selectionHint: 'Axial coordinates · visual example only.',
@@ -56,4 +70,5 @@ void i18n.use(initReactI18next).init({
 })
 
 export default i18n
+
 

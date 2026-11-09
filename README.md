@@ -36,7 +36,7 @@ Frontend (separate terminal):
     npm ci
     npm run dev
 
-The frontend currently renders a **local preview board** without calling the API. The API provides GET /api/health and GET /api/preview/board?radius=2 as scaffolding. No match, player, fog-of-war or movement state exists yet.
+The frontend currently renders a **local preview board** and offers a 14-hero selector (local-only; no hero abilities or authoritative match state) without calling the API. The API provides GET /api/health and GET /api/preview/board?radius=2 as scaffolding. No match, player, fog-of-war or movement state exists yet.
 
 Frontend checks from src/frontend:
 
@@ -46,4 +46,5 @@ Frontend checks from src/frontend:
     npm run test:e2e
 
 See docs/architecture/overview.md and AGENTS.md. All feature work starts from a GitHub Issue. Foundation: #1.
+
 
