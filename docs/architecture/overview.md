@@ -14,6 +14,8 @@ Inspired by the folder hierarchy of Vuxo, not by its individual game mechanics.
 
 ## Security constraint for hidden movement
 
+First step in #8: `MatchStateSnapshot` (Domain) holds authoritative hero positions and private planned destinations; `MatchObservationProjector` (Application) requires an authenticated observer ID from a **future server-side authentication boundary** and trusted per-player visibility grants. Without an explicit grant, other heroes are omitted. Granting visibility of a hero never transmits that hero's planned destination. This is currently an isolated, tested projection model, **not a public API or implemented authorization**.
+
 Before gameplay implementation, specify visibility policy and per-player observations. Client may submit intents such as a route selection, but should receive *only* authorized observations, never a globally synchronized full state to hide later with CSS or rendering. Avoid logging opponent hidden routes in user-facing responses. Server validates turn ownership, permitted moves and information disclosure.
 
 ## Not yet implemented
@@ -23,4 +25,5 @@ Modes, hero traits, movement rules, fog of war, PvP/PvE, persistence, auth, netw
 ## Why React Three Fiber?
 
 Phaser is a strong 2D renderer, but this project calls for true 3D hexagonal cells and stylized 3D hero figures. React Three Fiber composes Three.js declaratively with React without coupling Three state to the application UI. Heavy effects, performance budgets and asset loading are deferred until art and game rules are known.
+
 
