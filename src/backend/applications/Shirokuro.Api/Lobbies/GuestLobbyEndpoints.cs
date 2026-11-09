@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
@@ -63,7 +64,7 @@ public static class GuestLobbyEndpoints
                 commands.ChangeTeam(roomId, actor!, request.TeamId, request.ExpectedRevision)));
         });
 
-        route.MapDelete("/{roomId}/membership", (string roomId, LeaveRoomRequest request,
+        route.MapDelete("/{roomId}/membership", (string roomId, [FromBody] LeaveRoomRequest request,
             HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
         {
             if (!TryGuest(context, environment, out var actor))

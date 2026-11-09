@@ -61,7 +61,7 @@ public sealed class InMemoryLobbyCoordinator
         {
             var state = Find(lobbyId);
             if (expectedRevision.HasValue && state.Revision != expectedRevision.Value)
-                throw new LobbyRevisionConflictException(expectedRevision, state.Revision);
+                throw new LobbyRevisionConflictException(expectedRevision.Value, state.Revision);
 
             if (state.Participants.Count >= maxParticipants &&
                 !state.Participants.Any(p => p.PlayerId == trustedPlayerId))
