@@ -76,7 +76,7 @@ public sealed class GuestSessionExpirationCleanupTests
     }
 
     [Fact]
-    public void ConcurrentWorkerSweepsAreIdempotentAndLockSafe()
+    public async Task ConcurrentWorkerSweepsAreIdempotentAndLockSafe()
     {
         var clock = new ManualClock();
         var registry = new GuestSessionRegistry(clock);
@@ -89,7 +89,7 @@ public sealed class GuestSessionExpirationCleanupTests
         clock.Advance(TimeSpan.FromMinutes(1));
 
         var tasks = Enumerable.Range(0, 64).Select(_ => Task.Run(worker.SweepOnce));
-        var removed = Task.WhenAll(tasks).GetAwaiter().GetResult().Sum();
+        var removed = (await Task.WhenAll(tasks)).Sum();
         Assert.Equal(1, removed);
         Assert.Equal(3, coordinator.Get("shared").Revision);
         Assert.Equal("bob", Assert.Single(coordinator.Get("shared").Participants).PlayerId);
