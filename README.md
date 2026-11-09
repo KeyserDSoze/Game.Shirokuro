@@ -48,3 +48,13 @@ Frontend checks from src/frontend:
 See docs/architecture/overview.md and AGENTS.md. All feature work starts from a GitHub Issue. Foundation: #1.
 
 
+
+## Importare gli asset originali (issue #4)
+
+Il file ZIP originale è volutamente escluso dal repository: le immagini grezze non vanno caricate direttamente nel frontend. Per generare i **14 ritratti degli eroi** e le **6 texture dei terreni** ottimizzati:
+
+    python -m pip install -r scripts/requirements-art.txt
+    python scripts/import_art.py /percorso/allo/shirokurozip.zip
+
+Lo script legge esclusivamente i 20 file PNG consentiti, valida percorsi e dimensioni dello ZIP, li converte in WebP e produce `src/frontend/public/art/{heroes,tiles}/` insieme a `src/frontend/src/generated/art-manifest.json`. Il selettore visualizza i veri ritratti quando sono presenti nel manifest; altrimenti mostra un fallback privo di richieste HTTP mancanti. I file generati possono essere verificati e committati separatamente; le abilità dei personaggi restano da definire.
+

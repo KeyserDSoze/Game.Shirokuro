@@ -14,3 +14,7 @@
 .idea/
 *.user
 
+
+# Original graphics archives must never enter source control
+*.zip
+
