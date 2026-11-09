@@ -149,6 +149,16 @@ public sealed class InMemoryLobbyCoordinator
     /// Called by the background worker, and also during room creation for
     /// immediate capacity reclamation. Never returns expired room identifiers.
     /// </summary>
+    /// <summary>Server-only diagnostic; no room identifiers or roster exposed.</summary>
+    public int StoredRoomCount
+    {
+        get
+        {
+            lock (_gate)
+                return _lobbies.Count;
+        }
+    }
+
     public int PruneExpired()
     {
         lock (_gate)

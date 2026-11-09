@@ -78,6 +78,16 @@ public sealed class GuestSessionRegistry(TimeProvider clock)
         }
     }
 
+    /// <summary>Server-only diagnostic count, never a public API value.</summary>
+    public int StoredSessionCount
+    {
+        get
+        {
+            lock (_gate)
+                return _active.Count;
+        }
+    }
+
     public int PruneExpired()
     {
         lock (_gate)
