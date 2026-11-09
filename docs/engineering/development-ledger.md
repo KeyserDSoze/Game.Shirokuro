@@ -14,5 +14,4 @@ GitHub Issues remain the source of detailed truth. This file is a compact index.
 | [#10](https://github.com/KeyserDSoze/Game.Shirokuro/issues/10) | 0.0.1 | Done | Immutable .NET lobby, configurable teams & hero picks | CI #42663330140 green: 66 xUnit, 20 Vitest, 5 Playwright, 7 Python. No unauthenticated endpoints. |
 | [#11](https://github.com/KeyserDSoze/Game.Shirokuro/issues/11) | 0.0.1 | Done | Original 14 hero images as low-bandwidth atlas in hero selector | CI #42664975811 green: 66 xUnit, 28 Vitest, 7 Playwright, 10 Python; 4.7KB atlas tracked on main. |
 | [#12](https://github.com/KeyserDSoze/Game.Shirokuro/issues/12) | 0.0.1 | Done | Original terrain atlas textured 3D hexes + accessible local painter | CI #42673119924 green: 66 xUnit, 42 Vitest, 10 Playwright, 14 Python; textured 3D hexes, IT/EN and local paint/reset. |
-| [#13](https://github.com/KeyserDSoze/Game.Shirokuro/issues/13) | 0.0.1 | In progress | Strict, versioned JSON interchange for local terrain preview | Roundtrip and malicious payload tests in Vitest and Playwright; verify CI on main before closure. |
-
+| [#13](https://github.com/KeyserDSoze/Game.Shirokuro/issues/13) | 0.0.1 | Done | Strict, versioned JSON interchange for local terrain preview | CI #42674872071 green: 66 xUnit, 56 Vitest, 13 Playwright, 16 Python and all builds; atomic import, no network/persistence. |
