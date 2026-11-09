@@ -64,8 +64,8 @@ any new PvP mechanics and are not sufficient for public production hosting.
 ## Testing
 
 Per-creator quota tests cover the cap and independence, concurrent creation,
-retention after creator departure, automatic expiry reclaim, TestServer HTTP
-429 and multi-browser Playwright rejection/independence.
+retention after creator departure, automatic expiry reclaim, TestServer HTTP 429 and browser Playwright handling of rejected creation
+(with a mocked response to avoid exhausting the suite-wide per-IP limiter).
 
 The server-side fake-clock xUnit cases exercise exact TTL boundaries,
 authorized renewal, rejected-write/nonmember behavior, lock-safe races,
