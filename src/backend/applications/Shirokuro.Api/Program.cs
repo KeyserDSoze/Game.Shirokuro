@@ -36,5 +36,6 @@ app.MapGet("/api/preview/board", (int? radius, BoardPreviewService board) =>
 
 app.Run();
 
-public partial class Program;
-
+public partial class Program
+{
+}
