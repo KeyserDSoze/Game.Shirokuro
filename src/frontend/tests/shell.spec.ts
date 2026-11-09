@@ -5,7 +5,7 @@ test('shows the technical game shell without claiming an active match', async ({
   await expect(page.getByRole('heading', { name: /shirokuro/i })).toBeVisible()
   await expect(page.getByTestId('world-stage')).toBeVisible()
   await expect(page.getByTestId('selected-hex')).toContainText('Q')
-  await expect(page.getByText('nessuna partita attiva', { exact: false })).toBeVisible()
+  await expect(page.getByText('nessuna partita attiva', { exact: false }).first()).toBeVisible()
 })
 
 test('switches between light and dark themes', async ({ page }) => {
