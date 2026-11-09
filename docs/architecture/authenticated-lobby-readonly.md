@@ -30,10 +30,12 @@ Protection. The cookie is HttpOnly, Secure and SameSite=Strict, expires after
 8 hours and has no sliding renewal. API/hub challenges return 401/403
 instead of HTML login redirects.
 
-**There is deliberately no login or cookie-issuing endpoint.** Without a
-trusted future identity provider all protected operations reject requests.
-Tests construct their own valid signed in-process authentication tickets,
-not forged playerId headers or a development bypass. Any future sign-in
+**Follow-up #19 provides server-issued ephemeral guest sessions**, not verified
+accounts: visitors can obtain a signed, random pseudonymous cookie through
+`POST /api/sessions/guest` with anti-CSRF checks, read their own identity,
+and sign out. This does not grant access to any existing lobby until the
+server explicitly adds a member. Integration tests still use signed test
+tickets to exercise ambiguous identity and membership edge cases. Any future sign-in
 provider needs its own threat model (CSRF, account lifecycle, revocation,
 production key persistence, deployment topology and HTTPS). Cookies alone
 do not constitute a complete auth product.
@@ -58,4 +60,5 @@ xUnit includes direct coordinator/reader tests, validated principal
 identity tests, and WebApplicationFactory/TestServer HTTP/SignalR negotiate
 integration tests for authenticated/anonymous clients, spoofing, room
 nonmembers, missing or duplicate claims and wire-format redaction.
+
 

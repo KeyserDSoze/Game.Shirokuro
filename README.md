@@ -183,3 +183,25 @@ online. Sono inclusi test HTTP e SignalR con sessioni firmate in-process
 e documentazione di sicurezza in
 `docs/architecture/authenticated-lobby-readonly.md`.
 
+## Sessione ospite temporanea (#19)
+
+Il backend dispone ora di un accesso ospite **senza password**:
+`POST /api/sessions/guest` assegna un ID imprevedibile generato sul server;
+`GET /api/sessions/me` legge la propria sessione e
+`DELETE /api/sessions/guest` cancella il cookie nel browser. Il cookie è
+firmato/protetto, HttpOnly, Secure e SameSite=Strict, con durata di otto
+ore e senza rinnovo automatico. È un ID temporaneo, **non** un account
+verificato o permanente.
+
+Ogni POST/DELETE richiede gli header `Origin` (API stessa oppure i due
+frontend Vite esplicitamente autorizzati in Development) e
+`X-Shirokuro-Request: 1`. Il limite base è di 12 richieste di emissione
+al minuto per IP. Nessun playerId è accettato dalla richiesta. Il logout
+cancella il cookie del browser ma non revoca un ticket già copiato: prima
+di distribuire il gioco servono revoca, HTTPS, chiavi Data Protection
+persistenti/condivise e difese anti-abuso distribuite.
+
+Il guest non entra automaticamente in una lobby: la #18 continua a verificare
+la membership. Vedi `docs/architecture/guest-sessions.md`. Le API di
+creazione/ingresso nelle lobby e il vero multiplayer non sono ancora presenti.
+
