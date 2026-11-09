@@ -76,4 +76,17 @@ sovrascriversi. Il roster originale di 14 eroi viene importato da
 SignalR, persistenza e regole ufficiali di avvio partita. Nessun endpoint
 consente di impersonare un giocatore. Dettagli:
 `docs/architecture/lobby-foundation.md`.
+ 
+## Immagini originali degli eroi nella preview (issue #11)
+
+Il selettore degli eroi usa ora l'**atlas WebP derivato dai 14 PNG originali**,
+con disposizione 7×2 nello stesso ordine di `src/shared/heroes.json`.
+Il file `src/frontend/public/art/heroes-original-atlas.webp` contiene tutte
+le miniature (448×148 px, circa 4,7 KB), senza importare i PNG da 312 MB.
+Per rigenerarlo da `shirokurozip.zip`:
+
+    python scripts/build_hero_atlas.py /percorso/allo/shirokurozip.zip
+
+La mappa R3F contiene ancora una pedina 3D provvisoria. I ritratti dettagliati,
+le carte e le texture originali della mappa saranno trattati in #4.
 

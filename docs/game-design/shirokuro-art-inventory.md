@@ -54,4 +54,17 @@ Le tavole `screens2/` non sono puramente decorative: contengono testi di abilit�
 ## Passo successivo
 
 [#4](https://github.com/KeyserDSoze/Game.Shirokuro/issues/4) guida l'importazione web, gli asset derivati e i test del catalogo. Il file di riferimento `src/shared/heroes.json` registra solo gli ID e i nomi, senza statistiche/abilità inventate.
+ 
+## Prima integrazione web (issue #11)
+
+È stato derivato **un singolo atlas WebP** di 14 miniature dagli originali
+`hero base/`. Layout deterministico: 7 colonne × 2 righe, cella sorgente
+64×74, 448×148 px, ordine canonico di `src/shared/heroes.json`.
+L'atlas è una **miniatura di riferimento** del materiale fornito dall'autore,
+non un modello 3D e non una sostituzione degli originali. Il generatore
+`scripts/build_hero_atlas.py` riproduce il processo e rifiuta PNG mancanti,
+non leggibili o ZIP non sicuri; i relativi test CI usano fixture sintetiche.
+
+L'issue #4 resta aperta per le immagini dettagliate, i terreni, le carte,
+gli aspetti di attribuzione/licenza dell'arte e la verifica del rilascio.
 
