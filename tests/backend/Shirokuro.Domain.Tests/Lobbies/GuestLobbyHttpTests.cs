@@ -386,6 +386,40 @@ public sealed class GuestLobbyHttpTests
     }
 
     [Fact]
+    public async Task RejectedCrossOriginLogoutKeepsSessionAndAllRoomMembershipsIntact()
+    {
+        using var server = Server();
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var guest = Client(server, cookie);
+        var (room, revision) = await Create(guest);
+
+        using (var forgedLogout = Write(HttpMethod.Delete, "/api/sessions/guest",
+            withBody: false, origin: "https://evil.example"))
+        using (var forbidden = await guest.SendAsync(forgedLogout))
+            Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
+
+        // An invalid Origin must neither revoke the signed ticket nor
+        // remove memberships or increase the room's revision.
+        using (var stillSignedIn = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, stillSignedIn.StatusCode);
+        using (var roster = await guest.GetAsync("/api/lobbies/" + room + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
+            using var payload = JsonDocument.Parse(await roster.Content.ReadAsStringAsync());
+            Assert.Equal(revision, payload.RootElement.GetProperty("revision").GetInt64());
+            Assert.Single(payload.RootElement.GetProperty("participants").EnumerateArray());
+        }
+
+        using (var realLogout = Write(HttpMethod.Delete, "/api/sessions/guest", withBody: false))
+        using (var signedOut = await guest.SendAsync(realLogout))
+            Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
+
+        using var denied = await guest.GetAsync("/api/lobbies/" + room + "/roster");
+        Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+    }
+
+    [Fact]
     public async Task GuestCreateRoomQuotaReturns429WithoutAffectingOtherGuests()
     {
         using var server = Server();
