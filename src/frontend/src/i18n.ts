@@ -31,6 +31,16 @@ void i18n.use(initReactI18next).init({
       terrainApply: 'Applica terreno',
       terrainReset: 'Ripristina anteprima',
       terrainLocalNotice: 'Modifiche soltanto locali: nessuna partita attiva, nessuna regola di movimento.',
+      mapDocumentTitle: 'Salva e carica la mappa',
+      mapDocumentHint: 'Esporta un JSON per condividere la disposizione locale dei 19 terreni.',
+      mapDocumentExport: 'Genera JSON',
+      mapDocumentImport: 'Importa JSON',
+      mapDocumentLabel: 'Documento JSON della mappa',
+      mapDocumentPlaceholder: 'Genera un JSON oppure incollane uno qui.',
+      mapDocumentExported: 'JSON pronto: puoi copiarlo e condividerlo.',
+      mapDocumentImported: 'Mappa di anteprima importata correttamente.',
+      mapDocumentInvalid: 'JSON non valido o incompatibile: la mappa non è stata modificata.',
+      mapDocumentPrivacy: 'Solo anteprima grafica locale; nessun salvataggio o invio al server.',
       terrainNames: { black: 'Nero', white: 'Bianco', city: 'Città', sand: 'Sabbia', water: 'Acqua', wild: 'Natura' },
       status: 'Stato del progetto',
       statusHint: 'Scena locale, nessuna partita attiva e nessun movimento inviato.',
@@ -70,6 +80,16 @@ void i18n.use(initReactI18next).init({
       terrainApply: 'Apply terrain',
       terrainReset: 'Reset preview',
       terrainLocalNotice: 'Local preview only: no active match and no movement rules.',
+      mapDocumentTitle: 'Save and load the map',
+      mapDocumentHint: 'Export JSON to share the local layout of 19 terrain hexes.',
+      mapDocumentExport: 'Generate JSON',
+      mapDocumentImport: 'Import JSON',
+      mapDocumentLabel: 'Map JSON document',
+      mapDocumentPlaceholder: 'Generate JSON or paste one here.',
+      mapDocumentExported: 'JSON ready: copy it to share the layout.',
+      mapDocumentImported: 'Preview map imported successfully.',
+      mapDocumentInvalid: 'Invalid or incompatible JSON: the map has not changed.',
+      mapDocumentPrivacy: 'Local visual preview only; nothing saved or sent to a server.',
       terrainNames: { black: 'Black', white: 'White', city: 'City', sand: 'Sand', water: 'Water', wild: 'Wild' },
       status: 'Project status',
       statusHint: 'Local scene, no active match and no movement submitted.',
@@ -88,6 +108,7 @@ void i18n.use(initReactI18next).init({
 })
 
 export default i18n
+
 
 
 

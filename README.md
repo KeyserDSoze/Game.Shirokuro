@@ -106,3 +106,18 @@ regole di movimento, né dati inviati al backend. La qualità dei materiali e le
 carte restano tracciate dall'issue #4. Gli atlas originali versionati vengono
 validati anche dalla CI Python (dimensioni, formato WebP, peso e presenza di
 tutte le celle); la UI e le selezioni sono testate con Playwright/Vitest.
+
+## Esportazione/importazione della mappa locale (issue #13)
+
+Il pannello **Salva e carica la mappa** genera un JSON copiabile con
+`schemaVersion: 1`, `radius: 2` e le 19 celle `{q, r, terrain}`.
+I documenti importati vengono controllati interamente prima di modificare
+la scena: coordinate e terreni validi, nessuna cella duplicata/mancante,
+nessuna proprietà aggiuntiva (ad esempio dati segreti di partita), e limiti
+di dimensione. Il JSON può essere incollato da un altro utente per replicare
+l'anteprima senza backend. Il formato è **solo per la progettazione grafica**,
+non definisce una mappa ufficiale, le basi, il tesoro o un salvataggio partita.
+
+È testato da Vitest e Playwright; in futuro una mappa usata per gameplay
+richiederà nuove regole approvate e validazione server-side.
+

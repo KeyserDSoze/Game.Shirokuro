@@ -6,6 +6,7 @@ import HexWorld from '@/game/HexWorld'
 import HeroSelector from '@/features/heroes/HeroSelector'
 import { heroRoster } from '@/features/heroes/catalog'
 import TerrainEditor from '@/features/terrain/TerrainEditor'
+import MapDocumentEditor from '@/features/terrain/MapDocumentEditor'
 import { paintTerrainCell, terrainAtCell, type TerrainId, type TerrainOverrides } from '@/game/terrain'
 import type { HexCoordinate } from '@/game/hex'
 import { Button } from '@/components/ui/button'
@@ -127,6 +128,7 @@ export default function App() {
             onPaint={() => setTerrainOverrides(previous => paintTerrainCell(previous, selected, terrainBrush))}
             onReset={() => setTerrainOverrides({})}
           />
+          <MapDocumentEditor overrides={terrainOverrides} onImport={setTerrainOverrides} />
           <Card>
             <CardHeader>
               <div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-secondary"><EyeOff className="size-5" /></div>
@@ -147,6 +149,7 @@ export default function App() {
     </div>
   )
 }
+
 
 
 

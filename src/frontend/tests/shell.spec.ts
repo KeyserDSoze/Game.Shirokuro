@@ -135,3 +135,67 @@ test('terrain editor works on mobile in English and dark mode', async ({ page })
   await expect(page.getByTestId('world-stage')).toBeVisible()
 })
 
+test('exports edited 19-cell map, resets then imports it exactly', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Scegli Acqua' }).click()
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+
+  await page.getByTestId('map-export').click()
+  const json = await page.getByTestId('map-document').inputValue()
+  const document = JSON.parse(json) as { schemaVersion: number; radius: number; cells: Array<{ q: number; r: number; terrain: string }> }
+  expect(document.schemaVersion).toBe(1)
+  expect(document.radius).toBe(2)
+  expect(document.cells).toHaveLength(19)
+  expect(document.cells.find(cell => cell.q === 0 && cell.r === 0)?.terrain).toBe('water')
+  await expect(page.getByTestId('map-document-status')).toContainText('JSON pronto')
+
+  await page.getByTestId('terrain-reset').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+  await expect(page.getByTestId('map-document-status')).toContainText('importata correttamente')
+})
+
+test('rejects malformed, secret-bearing and duplicate-cell payloads without changing the map', async ({ page }) => {
+  await page.goto('/')
+  await page.getByTestId('map-export').click()
+  const valid = JSON.parse(await page.getByTestId('map-document').inputValue()) as {
+    schemaVersion: number; radius: number; cells: Array<{ q: number; r: number; terrain: string }>
+  }
+
+  await page.getByTestId('map-document').fill('{broken')
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('map-document-status')).toContainText('non valido')
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+
+  const withSecret = { ...valid, playerPositions: [{ playerId: 'bob', q: 0, r: 0 }] }
+  await page.getByTestId('map-document').fill(JSON.stringify(withSecret))
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('map-document-status')).toContainText('non valido')
+
+  const duplicate = { ...valid, cells: [...valid.cells] }
+  duplicate.cells[1] = { ...duplicate.cells[0] }
+  await page.getByTestId('map-document').fill(JSON.stringify(duplicate))
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('map-document-status')).toContainText('non valido')
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+})
+
+test('map document editor is translated and usable on mobile without mutating network requests', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const mutations: string[] = []
+  page.on('request', request => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method())) mutations.push(request.url())
+  })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await expect(page.getByRole('heading', { name: 'Save and load the map' })).toBeVisible()
+  await page.getByRole('button', { name: 'Generate JSON' }).click()
+  await expect(page.getByTestId('map-document-status')).toContainText('JSON ready')
+  await page.getByRole('button', { name: 'Import JSON' }).click()
+  await expect(page.getByTestId('map-document-status')).toContainText('imported successfully')
+  expect(mutations).toEqual([])
+})
+
