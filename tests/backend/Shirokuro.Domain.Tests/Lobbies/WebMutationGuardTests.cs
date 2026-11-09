@@ -21,7 +21,7 @@ public sealed class WebMutationGuardTests
             {
                 configuration.AddInMemoryCollection(
                     new[] { new KeyValuePair<string, string?>(
-                        "AllowedHosts", "localhost;game.example") }.Concat(allowedOrigins
+                        "AllowedHosts", environment == "Development" ? "*" : "localhost;game.example") }.Concat(allowedOrigins
                         .Select((origin, index) => new KeyValuePair<string, string?>(
                             "Security:AllowedOrigins:" + index, origin))));
             });
