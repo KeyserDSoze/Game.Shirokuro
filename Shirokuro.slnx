@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="src/backend/domains/Shirokuro.Domain/Shirokuro.Domain.csproj" />
+  <Project Path="src/backend/business/Shirokuro.Application/Shirokuro.Application.csproj" />
+  <Project Path="src/backend/infrastructure/Shirokuro.Infrastructure/Shirokuro.Infrastructure.csproj" />
+  <Project Path="src/backend/applications/Shirokuro.Api/Shirokuro.Api.csproj" />
+  <Project Path="tests/backend/Shirokuro.Domain.Tests/Shirokuro.Domain.Tests.csproj" />
+</Solution>

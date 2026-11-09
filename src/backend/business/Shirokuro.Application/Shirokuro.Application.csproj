@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Shirokuro.Application</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../domains/Shirokuro.Domain/Shirokuro.Domain.csproj" />
+  </ItemGroup>
+</Project>

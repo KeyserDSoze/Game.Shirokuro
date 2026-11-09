@@ -1,0 +1,59 @@
+import i18n from 'i18next'
+import { initReactI18next } from 'react-i18next'
+
+void i18n.use(initReactI18next).init({
+  resources: {
+    it: { translation: {
+      tagline: 'La strategia ha due facce.',
+      preview: 'Anteprima tecnica',
+      board: 'Il campo di gioco',
+      boardHint: 'Scegli un esagono per esplorare la scena.',
+      mode: 'Modalità di gioco',
+      pvp: 'PvP · Priorità',
+      modePending: 'Le regole delle modalità arriveranno con il game design.',
+      hero: 'Il tuo eroe',
+      heroName: 'Viandante',
+      heroHint: 'Modello 3D provvisorio. Le abilità saranno definite dalle regole.',
+      selection: 'Esagono selezionato',
+      selectionHint: 'Coordinate assiali · soltanto un esempio visivo.',
+      status: 'Stato del progetto',
+      statusHint: 'Scena locale, nessuna partita attiva e nessun movimento inviato.',
+      hidden: 'Movimenti nascosti',
+      hiddenHint: 'Nel gioco finale le informazioni segrete saranno protette sul server.',
+      controls: 'Trascina per ruotare · scorri per zoomare',
+      themeToggle: 'Cambia tema',
+      languageToggle: 'Switch to English',
+      footer: 'Shirokuro · Foundation 0.0.1',
+      webglFallback: 'Anteprima 3D non disponibile in questo browser.',
+    }},
+    en: { translation: {
+      tagline: 'Strategy has two faces.',
+      preview: 'Technical preview',
+      board: 'The game board',
+      boardHint: 'Pick a hexagon to explore the scene.',
+      mode: 'Game modes',
+      pvp: 'PvP · Priority',
+      modePending: 'Game mode rules will arrive with the game design.',
+      hero: 'Your hero',
+      heroName: 'Wanderer',
+      heroHint: 'Placeholder 3D model. Abilities will be defined by the rules.',
+      selection: 'Selected hexagon',
+      selectionHint: 'Axial coordinates · visual example only.',
+      status: 'Project status',
+      statusHint: 'Local scene, no active match and no movement submitted.',
+      hidden: 'Hidden movement',
+      hiddenHint: 'In the final game, secret information will be protected server-side.',
+      controls: 'Drag to orbit · scroll to zoom',
+      themeToggle: 'Toggle theme',
+      languageToggle: 'Passa all’italiano',
+      footer: 'Shirokuro · Foundation 0.0.1',
+      webglFallback: '3D preview is unavailable in this browser.',
+    }},
+  },
+  lng: 'it',
+  fallbackLng: 'en',
+  interpolation: { escapeValue: false },
+})
+
+export default i18n
+
