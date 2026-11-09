@@ -1,3 +1,4 @@
+using Xunit;
 using Shirokuro.Application.Preview;
 using Shirokuro.Domain.Geometry;
 
