@@ -103,5 +103,6 @@ Il pannello **Terreni originali** permette di assegnare temporaneamente una
 texture all'esagono selezionato e ripristinare la distribuzione dimostrativa.
 Tutte le modifiche restano nel browser e **non** costituiscono mappa ufficiale,
 regole di movimento, né dati inviati al backend. La qualità dei materiali e le
-carte restano tracciate dall'issue #4.
-
+carte restano tracciate dall'issue #4. Gli atlas originali versionati vengono
+validati anche dalla CI Python (dimensioni, formato WebP, peso e presenza di
+tutte le celle); la UI e le selezioni sono testate con Playwright/Vitest.
