@@ -177,6 +177,13 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
     if (!registry.Revoke(context.User))
         return Results.Forbid();
+
+    // The guest can no longer authenticate. Remove their stale pre-match
+    // memberships, preserving the other players' roster and room TTL.
+    var playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User)!;
+    context.RequestServices.GetRequiredService<InMemoryLobbyCoordinator>()
+        .RemovePlayerFromAllRooms(playerId);
+
     await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
     return Results.NoContent();
 }).RequireAuthorization();

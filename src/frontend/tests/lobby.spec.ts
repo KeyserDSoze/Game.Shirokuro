@@ -104,6 +104,7 @@ test('malformed invitation is rejected locally and does not trigger a join reque
 test('a copied signed guest cookie stops accessing a lobby as soon as its owner signs out', async ({ browser }) => {
   const ownerContext = await browser.newContext()
   const stolenContext = await browser.newContext()
+  const secondGuestContext = await browser.newContext()
   try {
     const owner = await ownerContext.newPage()
     await owner.goto('/')
@@ -111,6 +112,14 @@ test('a copied signed guest cookie stops accessing a lobby as soon as its owner 
     await expect(owner.getByTestId('lobby-player')).toContainText('guest-')
     await owner.getByTestId('lobby-create').click()
     const room = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
+    const ownerId = (await owner.getByTestId('lobby-player').textContent())!.trim()
+    const second = await secondGuestContext.newPage()
+    await second.goto('/')
+    await second.getByTestId('lobby-sign-in').click()
+    await second.getByTestId('lobby-invite-input').fill(room)
+    await second.getByTestId('lobby-join').click()
+    await expect(second.getByTestId('lobby-revision')).toContainText('2')
+    await expect(second.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
 
     const originalCookies = await ownerContext.cookies()
     expect(originalCookies.some(cookie => cookie.name === 'Shirokuro.Session')).toBe(true)
@@ -131,9 +140,17 @@ test('a copied signed guest cookie stops accessing a lobby as soon as its owner 
       baseUrl + '/hubs/lobbies/negotiate?negotiateVersion=1',
     )
     expect(signalr.status()).toBe(401)
+
+    // The remaining authenticated member sees the revised server roster
+    // without the signed-out guest, rather than a stale client-side view.
+    await second.getByTestId('lobby-refresh').click()
+    await expect(second.getByTestId('lobby-revision')).toContainText('3')
+    await expect(second.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+    await expect(second.getByTestId('lobby-roster')).not.toContainText(ownerId)
   } finally {
     await ownerContext.close()
     await stolenContext.close()
+    await secondGuestContext.close()
   }
 })
 

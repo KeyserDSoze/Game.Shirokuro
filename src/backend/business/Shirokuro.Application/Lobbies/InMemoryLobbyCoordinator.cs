@@ -111,6 +111,36 @@ public sealed class InMemoryLobbyCoordinator
     }
 
     /// <summary>
+    /// Server-owned cleanup following an authenticated guest-session revocation.
+    /// Removes the guest from every active pre-match room under the same lock
+    /// used for revision-controlled writes. Administrative removal must not
+    /// renew any room's inactivity timeout.
+    /// </summary>
+    public int RemovePlayerFromAllRooms(string trustedPlayerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
+        lock (_gate)
+        {
+            PruneExpiredCore();
+            var memberships = _lobbies
+                .Where(pair => pair.Value.State.Participants.Any(p =>
+                    string.Equals(p.PlayerId, trustedPlayerId, StringComparison.Ordinal)))
+                .Select(pair => pair.Key)
+                .ToArray();
+            foreach (var lobbyId in memberships)
+            {
+                var entry = _lobbies[lobbyId];
+                var next = entry.State.Leave(trustedPlayerId, entry.State.Revision);
+                if (next.Participants.Count == 0)
+                    _lobbies.Remove(lobbyId);
+                else
+                    _lobbies[lobbyId] = entry with { State = next };
+            }
+            return memberships.Length;
+        }
+    }
+
+    /// <summary>
     /// A pure lookup does NOT extend TTL; server logic and failed/anonymous
     /// reads must never keep rooms alive by accidentally calling Get.
     /// </summary>

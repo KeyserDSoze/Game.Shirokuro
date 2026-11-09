@@ -61,6 +61,21 @@ any new PvP mechanics and are not sufficient for public production hosting.
   and does not provide distributed rate limits or durable per-account
   quotas; those operations remain in #21.
 
+## Logout membership cleanup (#25)
+
+- After a guest's signed ticket is successfully revoked, the server removes
+  that trusted identity from **every active pre-match roster** under the
+  coordinator lock. No client-supplied actor, lobby list or invite codes are
+  used. This is a lobby-only lifecycle operation; no match rules are inferred.
+- Each surviving room increments its roster revision **once** and retains its
+  remaining participants, creator attribution and last-activity timestamp.
+  Empty rooms are removed immediately; duplicate cleanup is harmless.
+- Administrative cleanup does **not** renew the 30-minute inactivity TTL.
+  Unauthorized/logout requests failing the cookie or CSRF checks cannot
+  trigger removal. No room IDs or membership details are returned to logout.
+- Expired guest sessions without an explicit logout are still handled by the
+  existing lobby TTL; multi-instance cleanup requires shared stores (#21).
+
 ## Testing
 
 Per-creator quota tests cover the cap and independence, concurrent creation,
@@ -73,6 +88,10 @@ capacity reclaim, 404 over HTTP after expiration and worker tick execution.
 Session tests cover a copied protected cookie used after logout, two
 independent users, forged/legacy cookies, expiry, concurrency, an
 already-connected hub and two-browser Playwright replay/refresh.
+Logout cleanup adds coordinator/xUnit race, multi-room, idempotency, revision,
+creator-quota and fake-clock tests; TestServer verifies revoked-cookie denial,
+pruning of solo rooms and the surviving guest's authorized roster. Playwright
+checks two guest browsers plus a copied ticket after logout.
 
 ## Remaining work in parent issue #21
 

@@ -416,4 +416,53 @@ public sealed class GuestLobbyHttpTests
         var newRoom = await Create(independent);
         Assert.DoesNotContain(newRoom.Room, rooms);
     }
+
+    [Fact]
+    public async Task LogoutRevokesCookieAndAtomicallyClearsOnlyGuestMemberships()
+    {
+        using var server = Server();
+        using var firstVisitor = Client(server);
+        using var secondVisitor = Client(server);
+        var (aliceId, aliceCookie) = await SignIn(firstVisitor);
+        var (bobId, bobCookie) = await SignIn(secondVisitor);
+        using var alice = Client(server, aliceCookie);
+        using var bob = Client(server, bobCookie);
+
+        var (sharedRoom, revision) = await Create(alice);
+        var (soloRoom, _) = await Create(alice);
+        using (var join = Write(HttpMethod.Post, "/api/lobbies/" + sharedRoom + "/join",
+            new { teamId = "black", expectedRevision = revision }))
+        using (var joined = await bob.SendAsync(join))
+            Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
+
+        using (var logout = Write(HttpMethod.Delete, "/api/sessions/guest", withBody: false))
+        using (var signedOut = await alice.SendAsync(logout))
+            Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
+
+        using (var stolen = await alice.GetAsync("/api/lobbies/" + sharedRoom + "/roster"))
+            Assert.Equal(HttpStatusCode.Unauthorized, stolen.StatusCode);
+
+        using (var remaining = await bob.GetAsync("/api/lobbies/" + sharedRoom + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.OK, remaining.StatusCode);
+            var json = await remaining.Content.ReadAsStringAsync();
+            using var document = JsonDocument.Parse(json);
+            Assert.Equal(3, document.RootElement.GetProperty("revision").GetInt64());
+            var member = Assert.Single(document.RootElement.GetProperty("participants").EnumerateArray());
+            Assert.Equal(bobId, member.GetProperty("playerId").GetString());
+            Assert.DoesNotContain(aliceId, json, StringComparison.Ordinal);
+        }
+
+        // An old invite to a room without remaining members is gone.
+        using (var joinSolo = Write(HttpMethod.Post, "/api/lobbies/" + soloRoom + "/join",
+            new { teamId = "black" }))
+        using (var result = await bob.SendAsync(joinSolo))
+            Assert.Equal(HttpStatusCode.NotFound, result.StatusCode);
+
+        // The other guest is still authorized to use the surviving room.
+        using (var pick = Write(HttpMethod.Patch, "/api/lobbies/" + sharedRoom + "/hero",
+            new { heroId = "kira", expectedRevision = 3 }))
+        using (var response = await bob.SendAsync(pick))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
 }

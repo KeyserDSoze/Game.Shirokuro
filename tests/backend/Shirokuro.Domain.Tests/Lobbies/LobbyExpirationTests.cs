@@ -223,4 +223,28 @@ public sealed class LobbyExpirationTests
         Assert.Equal(1, coordinator.StoredRoomCount);
         Assert.All(oldIds, id => Assert.Throws<KeyNotFoundException>(() => coordinator.Get(id)));
     }
+
+    [Fact]
+    public void LogoutCleanupDoesNotExtendSurvivingRoomsInactivityDeadline()
+    {
+        var (coordinator, clock) = Setup();
+        coordinator.CreateWithOwner("room", ["white", "black"], "alice", "white", 10);
+        coordinator.JoinBounded("room", "bob", "black", 1, 16);
+        clock.Advance(TimeSpan.FromMinutes(29));
+        Assert.Equal(1, coordinator.RemovePlayerFromAllRooms("alice"));
+        Assert.Equal(3, coordinator.Get("room").Revision);
+        clock.Advance(TimeSpan.FromMinutes(1));
+        Assert.Throws<KeyNotFoundException>(() => coordinator.Get("room"));
+    }
+
+    [Fact]
+    public void ExpiredMembershipsCannotBeRevivedByLogoutCleanup()
+    {
+        var (coordinator, clock) = Setup();
+        coordinator.CreateWithOwner("abandoned", ["white", "black"], "alice", "white", 10);
+        clock.Advance(TimeSpan.FromMinutes(30));
+        Assert.Equal(0, coordinator.RemovePlayerFromAllRooms("alice"));
+        Assert.Equal(0, coordinator.StoredRoomCount);
+        Assert.Throws<KeyNotFoundException>(() => coordinator.Get("abandoned"));
+    }
 }

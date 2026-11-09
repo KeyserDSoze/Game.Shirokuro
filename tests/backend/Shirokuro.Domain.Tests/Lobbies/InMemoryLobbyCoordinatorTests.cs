@@ -100,5 +100,77 @@ public sealed class InMemoryLobbyCoordinatorTests
         Assert.Empty(coordinator.Get("b").Participants);
         Assert.Equal(0, coordinator.Get("b").Revision);
     }
-}
 
+    [Fact]
+    public void RevokedGuestCleanupRemovesAllMembershipsAndPrunesOnlyEmptyRooms()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.CreateWithOwner("solo", ["white", "black"], "alice", "white", 10);
+        coordinator.CreateWithOwner("shared", ["white", "black"], "alice", "white", 10);
+        coordinator.JoinBounded("shared", "bob", "black", 1, 16);
+        coordinator.CreateWithOwner("independent", ["white", "black"], "bob", "black", 10);
+
+        var oldSnapshot = coordinator.Get("shared");
+        Assert.Equal(2, coordinator.RemovePlayerFromAllRooms("alice"));
+        Assert.Throws<KeyNotFoundException>(() => coordinator.Get("solo"));
+
+        var after = coordinator.Get("shared");
+        Assert.Equal(3, after.Revision);
+        Assert.Equal("bob", Assert.Single(after.Participants).PlayerId);
+        Assert.Equal(2, oldSnapshot.Participants.Count); // immutable snapshots
+        Assert.Equal(1, coordinator.Get("independent").Revision);
+        Assert.Equal(2, coordinator.StoredRoomCount);
+        Assert.Equal(0, coordinator.RemovePlayerFromAllRooms("alice"));
+        Assert.Equal(3, coordinator.Get("shared").Revision);
+        Assert.Throws<ArgumentException>(() => coordinator.RemovePlayerFromAllRooms(" "));
+    }
+
+    [Fact]
+    public void CleanupKeepsOriginalCreatorQuotaWhileOtherMembersRemain()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.CreateWithOwner("shared", ["white", "black"], "alice",
+            "white", maxRooms: 10, maxRoomsPerCreator: 1);
+        coordinator.JoinBounded("shared", "bob", "black", 1, 16);
+        Assert.Equal(1, coordinator.RemovePlayerFromAllRooms("alice"));
+
+        Assert.Throws<LobbyCapacityException>(() => coordinator.CreateWithOwner(
+            "new", ["white", "black"], "alice", "white",
+            maxRooms: 10, maxRoomsPerCreator: 1));
+        coordinator.LeaveAndPrune("shared", "bob", 3);
+        Assert.Equal(1, coordinator.CreateWithOwner(
+            "new", ["white", "black"], "alice", "white",
+            maxRooms: 10, maxRoomsPerCreator: 1).Revision);
+    }
+
+    [Fact]
+    public async Task ConcurrentRosterWritesAndAdministrativeCleanupNeverLoseRemoval()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.CreateWithOwner("shared", ["white", "black"], "alice", "white", 10);
+        coordinator.JoinBounded("shared", "bob", "black", 1, 16);
+
+        var jobs = Enumerable.Range(0, 64).Select(i => Task.Run(() =>
+        {
+            if (i % 4 == 0)
+            {
+                coordinator.RemovePlayerFromAllRooms("alice");
+                return;
+            }
+
+            try
+            {
+                var currentRevision = coordinator.Get("shared").Revision;
+                coordinator.ChooseHero("shared", "alice", "kira", currentRevision);
+            }
+            catch (Exception ex) when (ex is LobbyRevisionConflictException or
+                                         UnauthorizedAccessException)
+            {
+                // An already signed-out member cannot mutate after cleanup.
+            }
+        }));
+        await Task.WhenAll(jobs);
+        Assert.Equal("bob", Assert.Single(coordinator.Get("shared").Participants).PlayerId);
+        Assert.Equal(0, coordinator.RemovePlayerFromAllRooms("alice"));
+    }
+}
