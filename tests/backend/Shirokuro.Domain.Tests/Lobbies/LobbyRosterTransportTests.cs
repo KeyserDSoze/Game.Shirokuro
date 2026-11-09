@@ -1,6 +1,8 @@
 using System.Net;
 using System.Security.Claims;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Hosting;
@@ -189,14 +191,71 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
-    public void HubGetRosterDoesNotLeakNonMemberInformation()
+    public void SignalRMethodReauthorizesMemberAndRejectsSpoofedContextUserIdentifier()
     {
         var coordinator = new InMemoryLobbyCoordinator();
-        coordinator.Create("secret", ["white", "black"]);
-        coordinator.Join("secret", "alice", "white", 0);
+        coordinator.Create("room", ["white", "black"]);
+        coordinator.Join("room", "alice", "white", 0);
+        coordinator.Join("room", "bob", "black", 1);
         var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator));
-        // Direct unit call with no validated SignalR context should fail closed.
-        Assert.ThrowsAny<Exception>(() => hub.GetRoster("secret"));
+
+        // The caller's authenticated principal, not a transport-supplied or
+        // caller-controlled identifier, is the authoritative identity.
+        hub.Context = new FakeHubContext(Principal("alice"), "spoofed-bob");
+        var roster = hub.GetRoster("room");
+        Assert.Equal("room", roster.LobbyId);
+        Assert.Equal(2, roster.Participants.Count);
+
+        hub.Context = new FakeHubContext(Principal("outsider"), "alice");
+        Assert.Equal("Lobby unavailable.",
+            Assert.Throws<HubException>(() => hub.GetRoster("room")).Message);
+
+        hub.Context = new FakeHubContext(Principal("alice"));
+        Assert.Equal("Lobby unavailable.",
+            Assert.Throws<HubException>(() => hub.GetRoster("unknown")).Message);
+
+        hub.Context = new FakeHubContext(new ClaimsPrincipal(new ClaimsIdentity()));
+        Assert.Equal("Lobby unavailable.",
+            Assert.Throws<HubException>(() => hub.GetRoster("room")).Message);
+
+        hub.Context = new FakeHubContext(Principal("bob"));
+        Assert.Equal("room", hub.GetRoster("room").LobbyId);
+    }
+
+    [Fact]
+    public void SessionCookieSettingsHaveStrictSecurityDefaults()
+    {
+        using var server = CreateServer();
+        // Trigger host initialization before obtaining its configured options.
+        using var client = server.CreateClient();
+        var cookie = server.Services
+            .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+            .Get(CookieAuthenticationDefaults.AuthenticationScheme);
+
+        Assert.Equal("Shirokuro.Session", cookie.Cookie.Name);
+        Assert.True(cookie.Cookie.HttpOnly);
+        Assert.Equal(CookieSecurePolicy.Always, cookie.Cookie.SecurePolicy);
+        Assert.Equal(SameSiteMode.Strict, cookie.Cookie.SameSite);
+        Assert.False(cookie.SlidingExpiration);
+        Assert.Equal(TimeSpan.FromHours(8), cookie.ExpireTimeSpan);
+    }
+
+    private static ClaimsPrincipal Principal(string playerId) =>
+        new(new ClaimsIdentity([
+            new Claim(ClaimTypes.NameIdentifier, playerId)
+        ], CookieAuthenticationDefaults.AuthenticationScheme));
+
+    private sealed class FakeHubContext(
+        ClaimsPrincipal user,
+        string? spoofedUserIdentifier = null) : HubCallerContext
+    {
+        public override string ConnectionId => "test-connection";
+        public override string? UserIdentifier => spoofedUserIdentifier;
+        public override ClaimsPrincipal User => user;
+        public override IDictionary<object, object?> Items { get; } =
+            new Dictionary<object, object?>();
+        public override IFeatureCollection Features { get; } = new FeatureCollection();
+        public override CancellationToken ConnectionAborted => CancellationToken.None;
+        public override void Abort() { }
     }
 }
-
