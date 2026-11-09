@@ -1,11 +1,13 @@
 # Lobby foundation (issue #10)
 
-This is a **server-side pre-match building block**, not a player-connectable
-lobby. Issue #18 has subsequently added a **member-scoped, read-only** HTTP
-roster endpoint and SignalR `GetRoster` hub behind signed-session checks.
-There is still no cookie-issuing identity provider, room admission, matchmaking,
-lobby mutation endpoint or live game rules. See
-`docs/architecture/authenticated-lobby-readonly.md`.
+This began as a server-side pre-match building block in #10. The subsequent
+#18–#20 milestones provide **server-issued guest cookie sessions**, a
+member-scoped HTTP roster and read-only SignalR `GetRoster`, plus creation,
+invitation, admission and self-only team/hero/leave HTTP commands.
+These rooms are browser-connectable now, but **not active PvP matches**.
+There is still no durable identity, matchmaking, live roster push,
+persistence or approved game rules. See
+`docs/architecture/guest-invitation-lobby.md`.
 
 ## Domain
 
@@ -37,15 +39,16 @@ All `trustedPlayerId` method arguments mean **a player identity already
 verified by a server-side authentication boundary**. Never expose such
 methods as unauthenticated HTTP endpoints that accept arbitrary player IDs.
 
-The read-only authenticated roster boundary in #18 is the first transport step.
-The later **writable** lobby and match implementation (#9 and dependent issues) must:
-1. Derive player identity exclusively from a validated session.
-2. Authorize lobby creation, join, leave and all selection updates.
-3. Keep revision checks and handle reconnect/retry scenarios.
-4. Persist room state / coordinate multi-instance access as needed.
-5. Never mix pre-match roster DTOs with `MatchStateSnapshot` secrets.
-6. Use `MatchObservationProjector` when game sessions begin and
-   apply the real visibility policy determined under issue #3.
+Guest HTTP write endpoints added in #20 now derive identity exclusively
+from signed sessions, authorize membership for self-only changes and use
+optimistic revision checks. The remaining **real match** implementation
+(#9 and dependent issues) must:
+1. Provide durable identity and revocation, not just guest cookies (#21).
+2. Persist/coordinate room state and connection recovery across instances (#21).
+3. Add authorization for realtime room events at every send.
+4. Never mix pre-match roster DTOs with `MatchStateSnapshot` secrets.
+5. Use `MatchObservationProjector` when game sessions begin, after
+   the real visibility policy is confirmed under issue #3.
 
 ## Unspecified features
 

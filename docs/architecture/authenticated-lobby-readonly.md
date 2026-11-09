@@ -1,8 +1,9 @@
 # Authenticated lobby roster transport — issue #18
 
-This is the first **fail-closed** pre-match HTTP and SignalR transport
-boundary. It does **not** implement gameplay, room creation, lobby joining,
-account sign-in or the match observation feed.
+This was the first **fail-closed** pre-match HTTP and SignalR transport
+boundary. Follow-up #20 now implements separate guest room creation/join and
+self-only mutation endpoints, while this HTTP roster and SignalR hub remain
+read-only, member-scoped, and **not** a gameplay/match observation feed.
 
 ## Routes
 
@@ -50,9 +51,9 @@ It does not include coordinates, planned destinations, fog-of-war or hidden
 cards. This roster is **not** the match observation projection.
 
 The future PvP realtime transport, visibility policy, reconnect logic and
-anti-cheat network tests remain in #9 and cannot be implemented until
-game-design decisions in #3/#5. No production room administration or
-account identity issuance is implied here.
+anti-cheat network tests remain in #9 and depend on #3/#5. #19 has issued
+pseudonymous guest tickets and #20 provides room admission and updates,
+but neither is production-grade account identity or match networking.
 
 ## Regression coverage
 
@@ -60,5 +61,3 @@ xUnit includes direct coordinator/reader tests, validated principal
 identity tests, and WebApplicationFactory/TestServer HTTP/SignalR negotiate
 integration tests for authenticated/anonymous clients, spoofing, room
 nonmembers, missing or duplicate claims and wire-format redaction.
-
-

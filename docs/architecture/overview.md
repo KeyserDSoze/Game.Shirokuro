@@ -7,7 +7,7 @@ Inspired by the folder hierarchy of Vuxo, not by its individual game mechanics.
 - Domain (.NET 10): axial hex coordinate model and future deterministic, authority-owned rules.
 - Application (.NET 10): preview map generation and future match orchestration.
 - Infrastructure (.NET 10): adapter placeholder for future persistence and transport integrations.
-- API (.NET 10): public health/preview, server-issued **ephemeral guest sessions** (#19) and member-scoped authenticated **read-only** lobby roster over HTTP/SignalR (#18). Room admission, durable identity, realtime game events and match observations are not yet exposed.
+- API (.NET 10): public health/preview, server-issued **ephemeral guest sessions** (#19), member-scoped authenticated roster HTTP/SignalR reads (#18), and invite-only lobby creation/admission and self-only hero/team/leave HTTP writes (#20). Durable identity, realtime game events and match observations are not yet exposed.
 - Frontend (React/TS): pages, themes, localization, shadcn/ui controls.
 - World renderer (R3F/Three.js): client-visible 3D hex scenery and hero placeholders.
 - Pure frontend geometry: axial coordinate calculations; these are **not authority rules**.
@@ -20,7 +20,7 @@ Before gameplay implementation, specify visibility policy and per-player observa
 
 ## Not yet implemented
 
-Modes, hero traits, movement rules, fog of war, PvP/PvE, persistence, durable account sign-in, browser room creation/join (#20), live multiplayer events, real match networking and matchmaking. These are governed by later issues once game design is provided.
+Modes, hero traits, movement rules, fog of war, PvP/PvE, persistence, durable account sign-in, lobby session revocation/expiry (#21), live multiplayer events, real match networking and matchmaking. These are governed by later issues once game design is provided.
 
 ## Why React Three Fiber?
 

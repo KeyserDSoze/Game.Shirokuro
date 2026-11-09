@@ -36,7 +36,7 @@ Frontend (separate terminal):
     npm ci
     npm run dev
 
-The frontend currently renders a **local preview board** and offers a 14-hero selector (local-only; no hero abilities or authoritative match state) without calling the API. The API provides GET /api/health and GET /api/preview/board?radius=2 as scaffolding. No match, player, fog-of-war or movement state exists yet.
+The frontend renders a **local preview board** and an accessible 14-hero selector (local-only; no abilities or authoritative match state). Separately, the **guest lobby panel** now uses the .NET API for server-issued guest sessions, invitation rooms and pre-match roster choices (#19/#20). Public API health/board preview endpoints remain available. No live PvP match, movement rules, fog-of-war or hidden-route networking exists yet.
 
 Frontend checks from src/frontend:
 
@@ -72,10 +72,11 @@ versionato: due modifiche contemporanee sulla stessa revisione non possono
 sovrascriversi. Il roster originale di 14 eroi viene importato da
 `src/shared/heroes.json` come risorsa embedded dal progetto .NET Application.
 
-**Non è ancora una lobby online:** mancano identità/autenticazione, API,
-SignalR, persistenza e regole ufficiali di avvio partita. Nessun endpoint
-consente di impersonare un giocatore. Dettagli:
-`docs/architecture/lobby-foundation.md`.
+**Aggiornamento #19/#20:** gli ospiti ricevono ora sessioni firmate, possono
+creare/entrare in una lobby tramite invito, leggere il roster, cambiare la
+propria squadra e scegliere il proprio eroe. Non è ancora una partita:
+non esistono avvio partita, matchmaking, push realtime, persistenza o regole
+ufficiali. Vedi `docs/architecture/lobby-foundation.md`.
  
 ## Immagini originali degli eroi nella preview (issue #11)
 
@@ -175,12 +176,11 @@ ricevono 401; quelle di membri di altre stanze non rivelano il roster
 (404 indistinguibile da una stanza inesistente). Nessuna API accetta
 `playerId` fornito dal client o espone posizioni/percorsi segreti.
 
-**Non è ancora possibile effettuare login o creare/joinare lobby da
-browser**: non esiste un identity provider autorizzato né un endpoint che
-rilascia cookie, quindi il trasporto rifiuta normalmente gli accessi
-fino alla configurazione futura. Non ci sono push/subscribe o partite
-online. Sono inclusi test HTTP e SignalR con sessioni firmate in-process
-e documentazione di sicurezza in
+Con #19/#20 un browser può ottenere un'identità ospite temporanea, creare
+una lobby privata ed entrare con invito; restano da implementare account
+permanenti, push realtime e partite online. Il roster HTTP è ancora una
+lettura per soli membri e il metodo SignalR `GetRoster` non espone
+informazioni di gioco. Vedi
 `docs/architecture/authenticated-lobby-readonly.md`.
 
 ## Sessione ospite temporanea (#19)
@@ -201,7 +201,51 @@ cancella il cookie del browser ma non revoca un ticket già copiato: prima
 di distribuire il gioco servono revoca, HTTPS, chiavi Data Protection
 persistenti/condivise e difese anti-abuso distribuite.
 
-Il guest non entra automaticamente in una lobby: la #18 continua a verificare
-la membership. Vedi `docs/architecture/guest-sessions.md`. Le API di
-creazione/ingresso nelle lobby e il vero multiplayer non sono ancora presenti.
+Il guest non entra automaticamente in una lobby: deve usare esplicitamente
+un invito o crearne una (#20), poi la #18 verifica la membership. Vedi
+`docs/architecture/guest-sessions.md`. Il multiplayer delle partite
+resta ancora da sviluppare.
 
+## Lobby online pre-partita con invito (#20)
+
+Due browser distinti possono ora scegliere **Entra come ospite**,
+creare una stanza e unirsi condividendo il codice `room-...` mostrato
+nella UI. Il codice è generato dal server con 128 bit casuali e
+funge da **invito opaco**; non viene pubblicato in un elenco di stanze.
+Il partecipante entrante deve conoscere anche il nome della squadra.
+Le squadre configurabili `white,black` sono un esempio, **non la regola
+ufficiale** del futuro PvP.
+
+Il pannello permette di confermare l'eroe locale nella lobby, cambiare la
+propria squadra, aggiornare il roster o uscire. Gli altri membri diventano
+visibili dopo un **Aggiorna roster** manuale: non esistono ancora notifiche
+push, turni o avvio partita. Se una scelta usa una revisione precedente,
+il server rifiuta l'operazione con HTTP 409 e l'interfaccia chiede di
+aggiornare la stanza. Il resto della scena 3D resta una preview locale.
+
+API .NET (cookie guest e `X-Shirokuro-Request: 1` + `Origin` per writes):
+- `POST /api/lobbies`: configura 2–4 team tecnici, crea stanza e iscrive
+  il creatore **atomically**.
+- `POST /api/lobbies/{code}/join`: ingresso tramite invito;
+  `expectedRevision` è facoltativa, la revisione corrente viene
+  controllata sotto lock.
+- `PATCH /api/lobbies/{code}/hero` e `PATCH /api/lobbies/{code}/team`:
+  modifiche del solo utente identificato dal cookie e controllo revisione.
+- `DELETE /api/lobbies/{code}/membership`: abbandona e libera la
+  stanza se è vuota.
+- `GET /api/lobbies/{code}/roster`: sola lettura per membri,
+  `Cache-Control: no-store`.
+Le risposte non includono mai posizioni o destinazioni di movimento.
+Limiti tecnici attuali: **256 lobby in memoria**, **16 membri per lobby**,
+**8 creazioni stanza/minuto per IP**, senza suggerire dimensioni ufficiali
+delle squadre. Esegui `dotnet run --project
+src/backend/applications/Shirokuro.Api` insieme a `npm run dev`:
+la configurazione Vite inoltra `/api` e `/hubs` a
+`http://127.0.0.1:5186` (avvia l'API con `--urls http://127.0.0.1:5186`).
+
+I test Playwright avviano **due browser guest distinti** e l'API .NET 10
+con un server dedicato. La CI testa xUnit e i tre casi Playwright della
+lobby. La sessione è **pseudonima e non persistente** e le stanze vivono
+solo nella memoria del processo; scadenza automatica, revoca sessioni,
+distribuzione e recupero sono tracciati in #21. Dettagli:
+`docs/architecture/guest-invitation-lobby.md`.
