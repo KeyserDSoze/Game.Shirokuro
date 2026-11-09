@@ -170,7 +170,7 @@ public sealed class LobbyStateTests
         teams.Add("gold");
         heroes.Add("krugg");
         Assert.Equal(2, definition.TeamIds.Count);
-        Assert.Equal(1, definition.HeroIds.Count);
+        Assert.Single(definition.HeroIds);
         Assert.False(definition.AllowsTeam("gold"));
         Assert.False(definition.AllowsHero("krugg"));
     }
