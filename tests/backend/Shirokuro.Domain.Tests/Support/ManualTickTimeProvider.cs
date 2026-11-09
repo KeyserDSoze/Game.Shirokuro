@@ -26,6 +26,15 @@ public sealed class ManualTickTimeProvider : TimeProvider
         return timer;
     }
 
+    public int CreatedTimerCount
+    {
+        get
+        {
+            lock (_gate)
+                return _timers.Count;
+        }
+    }
+
     public void Tick()
     {
         ManualTimer[] timers;

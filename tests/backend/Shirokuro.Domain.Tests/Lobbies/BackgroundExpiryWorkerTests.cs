@@ -17,6 +17,8 @@ public sealed class BackgroundExpiryWorkerTests
         using var worker = new LobbyExpiryWorker(coordinator, clock);
 
         await worker.StartAsync(CancellationToken.None);
+        Assert.True(SpinWait.SpinUntil(() => clock.CreatedTimerCount > 0,
+            TimeSpan.FromSeconds(3)), "The background worker never created its timer.");
         Assert.Equal(1, coordinator.StoredRoomCount);
         clock.Advance(TimeSpan.FromMinutes(30));
         Assert.Equal(1, coordinator.StoredRoomCount); // No lookup/sweep yet.
@@ -39,6 +41,8 @@ public sealed class BackgroundExpiryWorkerTests
         using var worker = new GuestSessionExpiryWorker(registry, clock);
 
         await worker.StartAsync(CancellationToken.None);
+        Assert.True(SpinWait.SpinUntil(() => clock.CreatedTimerCount > 0,
+            TimeSpan.FromSeconds(3)), "The background worker never created its timer.");
         Assert.Equal(1, registry.StoredSessionCount);
         clock.Advance(TimeSpan.FromHours(8));
         Assert.False(registry.IsActive(principal));
