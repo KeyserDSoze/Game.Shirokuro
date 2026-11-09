@@ -1,0 +1,103 @@
+import { expect, test } from '@playwright/test'
+
+test('two independent guest browsers create a room, join by invite and select heroes safely', async ({ browser }) => {
+  const firstContext = await browser.newContext()
+  const secondContext = await browser.newContext()
+  try {
+    const first = await firstContext.newPage()
+    const second = await secondContext.newPage()
+    await Promise.all([first.goto('/'), second.goto('/')])
+
+    await first.getByTestId('lobby-sign-in').click()
+    await second.getByTestId('lobby-sign-in').click()
+    await expect(first.getByTestId('lobby-player')).toContainText('guest-')
+    await expect(second.getByTestId('lobby-player')).toContainText('guest-')
+    const firstId = await first.getByTestId('lobby-player').textContent()
+    const secondId = await second.getByTestId('lobby-player').textContent()
+    expect(firstId).not.toBe(secondId)
+
+    await first.getByTestId('lobby-create').click()
+    await expect(first.getByTestId('lobby-message')).toContainText('Lobby creata')
+    const invite = (await first.getByTestId('lobby-room-code').textContent())!.trim()
+    expect(invite).toMatch(/^room-[0-9a-f]{32}$/)
+    await expect(first.getByTestId('lobby-revision')).toContainText('1')
+
+    await second.getByTestId('lobby-invite-input').fill(invite)
+    await second.getByTestId('lobby-join').click()
+    await expect(second.getByTestId('lobby-message')).toContainText('Ingresso nella lobby riuscito')
+    await expect(second.getByTestId('lobby-room-code')).toHaveText(invite)
+    await expect(second.getByTestId('lobby-revision')).toContainText('2')
+    await expect(second.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+
+    // Owner's cached revision is stale after the other player joined.
+    await first.getByRole('button', { name: 'Seleziona Kira' }).click()
+    await first.getByTestId('lobby-pick-hero').click()
+    await expect(first.getByTestId('lobby-message')).toContainText('aggiorna il roster')
+    await first.getByTestId('lobby-refresh').click()
+    await expect(first.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+    await first.getByTestId('lobby-pick-hero').click()
+    await expect(first.getByTestId('lobby-message')).toContainText('Eroe Kira salvato')
+
+    // Second player reads the changed server roster (not a client-side copy).
+    await second.getByTestId('lobby-refresh').click()
+    await expect(second.getByTestId('lobby-roster')).toContainText('Kira')
+    await expect(second.getByTestId('lobby-revision')).toContainText('3')
+
+    await second.getByRole('button', { name: 'Seleziona Shilla' }).click()
+    await second.getByTestId('lobby-pick-hero').click()
+    await expect(second.getByTestId('lobby-message')).toContainText('Eroe Shilla salvato')
+    await first.getByTestId('lobby-refresh').click()
+    await expect(first.getByTestId('lobby-roster')).toContainText('Shilla')
+    await expect(first.getByTestId('lobby-roster')).toContainText('Kira')
+
+    await second.getByTestId('lobby-leave').click()
+    await expect(second.getByTestId('lobby-message')).toContainText('lasciato la lobby')
+    await first.getByTestId('lobby-refresh').click()
+    await expect(first.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+    await first.getByTestId('lobby-leave').click()
+    await expect(first.getByTestId('lobby-create')).toBeVisible()
+  } finally {
+    await firstContext.close()
+    await secondContext.close()
+  }
+})
+
+test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await expect(page.getByRole('heading', { name: 'Guest lobby' })).toBeVisible()
+  await page.getByTestId('lobby-sign-in').focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+
+  await page.getByTestId('lobby-teams').fill('white,black,gold')
+  await page.getByTestId('lobby-creator-team').fill('gold')
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby created')
+  await expect(page.getByTestId('lobby-roster')).toContainText('gold')
+
+  await page.getByTestId('lobby-new-team').selectOption('black')
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-roster')).toContainText('black')
+  await page.getByTestId('lobby-sign-out').click()
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-message')).toContainText('signed out')
+  await expect(page.getByTestId('world-stage')).toBeVisible()
+})
+
+test('malformed invitation is rejected locally and does not trigger a join request', async ({ page }) => {
+  const joined: string[] = []
+  page.on('request', request => {
+    if (request.url().includes('/api/lobbies/') && request.url().endsWith('/join'))
+      joined.push(request.url())
+  })
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-invite-input').fill('../../admin')
+  await page.getByTestId('lobby-join').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('non valida')
+  expect(joined).toEqual([])
+})
+
