@@ -1,4 +1,7 @@
 using System.Security.Claims;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Shirokuro.Api.Hubs;
 using Shirokuro.Api.Security;
@@ -10,8 +13,8 @@ builder.Services.AddSingleton<BoardPreviewService>();
 builder.Services.AddSingleton<InMemoryLobbyCoordinator>();
 builder.Services.AddSingleton<LobbyRosterReader>();
 
-// Deliberately fail closed: no login/session issuance endpoint exists yet.
-// A future identity provider may issue signed cookies, never user-supplied IDs.
+// The cookie may contain a server-generated, non-verified guest ID.
+// No trusted account login or client-selected player ID is supported.
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(options =>
     {
@@ -34,6 +37,21 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     });
 builder.Services.AddAuthorization();
 builder.Services.AddSignalR();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("guest-session-issuance", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 12,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+});
+
 
 
 if (builder.Environment.IsDevelopment())
@@ -42,7 +60,8 @@ if (builder.Environment.IsDevelopment())
         options.AddPolicy("local-dev", policy =>
             policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
                   .AllowAnyHeader()
-                  .AllowAnyMethod()));
+                  .AllowAnyMethod()
+                  .AllowCredentials()));
 }
 
 var app = builder.Build();
@@ -53,8 +72,65 @@ if (app.Environment.IsDevelopment())
 
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }));
+
+// Ephemeral guests: identity comes solely from cryptographically random server bytes.
+app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment environment) =>
+{
+    if (!WebMutationGuard.Allows(context, environment))
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+    context.Response.Headers.CacheControl = "no-store";
+    if (context.Request.ContentLength is > 0 ||
+        context.Request.Headers.ContainsKey("Transfer-Encoding"))
+        return Results.BadRequest(new { code = "session_request_must_be_empty" });
+
+    var existingId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
+    if (context.User.Identities.Any(identity => identity.IsAuthenticated))
+    {
+        if (existingId is null)
+            return Results.Forbid();
+        if (!GuestSessions.IsGuest(context.User))
+            return Results.Conflict(new { code = "existing_session_is_not_guest" });
+
+        // No new cookie and no implicit extension of the existing expiry.
+        return Results.Ok(new { playerId = existingId, kind = "guest" });
+    }
+
+    var playerId = GuestSessions.NewPlayerId();
+    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+        GuestSessions.CreatePrincipal(playerId),
+        new AuthenticationProperties
+        {
+            IsPersistent = false,
+            ExpiresUtc = DateTimeOffset.UtcNow.AddHours(8),
+            AllowRefresh = false
+        });
+    return Results.Ok(new { playerId, kind = "guest" });
+}).RequireRateLimiting("guest-session-issuance");
+
+app.MapGet("/api/sessions/me", (HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    var playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
+    return playerId is null
+        ? Results.Forbid()
+        : Results.Ok(new { playerId, kind = GuestSessions.IsGuest(context.User) ? "guest" : "other" });
+}).RequireAuthorization();
+
+app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironment environment) =>
+{
+    if (!WebMutationGuard.Allows(context, environment) ||
+        !GuestSessions.IsGuest(context.User))
+        return Results.Forbid();
+
+    context.Response.Headers.CacheControl = "no-store";
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.NoContent();
+}).RequireAuthorization();
+
 
 // Read-only authenticated roster. Never accept a playerId from the request.
 // A missing lobby and a non-member both return 404 to avoid room enumeration.
@@ -103,4 +179,5 @@ app.Run();
 public partial class Program
 {
 }
+
 
