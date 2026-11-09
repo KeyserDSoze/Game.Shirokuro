@@ -12,6 +12,8 @@ using Shirokuro.Application.Preview;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddHostedService<LobbyExpiryWorker>();
+builder.Services.AddSingleton<GuestSessionRegistry>();
+builder.Services.AddHostedService<GuestSessionExpiryWorker>();
 builder.Services.AddSingleton<BoardPreviewService>();
 builder.Services.AddSingleton<InMemoryLobbyCoordinator>();
 builder.Services.AddSingleton<LobbyRosterReader>();
@@ -28,6 +30,23 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         options.Cookie.SameSite = SameSiteMode.Strict;
         options.ExpireTimeSpan = TimeSpan.FromHours(8);
         options.SlidingExpiration = false;
+        // Treat guest-like or legacy guest tickets as invalid unless their
+        // signed session token remains present in the server's active registry.
+        options.Events.OnValidatePrincipal = context =>
+        {
+            var principal = context.Principal;
+            var playerId = AuthenticatedPlayerIdentity.FromPrincipal(principal);
+            var claimsGuestKind = principal?.FindAll(GuestSessions.SessionKindClaim).Any() == true;
+            var looksLikeGuestId = playerId?.StartsWith("guest-", StringComparison.Ordinal) == true;
+            if (claimsGuestKind || looksLikeGuestId)
+            {
+                var registry = context.HttpContext.RequestServices
+                    .GetRequiredService<GuestSessionRegistry>();
+                if (!registry.IsActive(principal))
+                    context.RejectPrincipal();
+            }
+            return Task.CompletedTask;
+        };
         options.Events.OnRedirectToLogin = context =>
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -114,14 +133,27 @@ app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment 
     }
 
     var playerId = GuestSessions.NewPlayerId();
-    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
-        GuestSessions.CreatePrincipal(playerId),
-        new AuthenticationProperties
-        {
-            IsPersistent = false,
-            ExpiresUtc = DateTimeOffset.UtcNow.AddHours(8),
-            AllowRefresh = false
-        });
+    var expires = context.RequestServices.GetRequiredService<TimeProvider>()
+        .GetUtcNow().AddHours(8);
+    var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
+    var sessionId = registry.Register(playerId, expires);
+    var principal = GuestSessions.CreatePrincipal(playerId, sessionId);
+    try
+    {
+        await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+            principal,
+            new AuthenticationProperties
+            {
+                IsPersistent = false,
+                ExpiresUtc = expires,
+                AllowRefresh = false
+            });
+    }
+    catch
+    {
+        registry.Revoke(principal);
+        throw;
+    }
     return Results.Ok(new { playerId, kind = "guest" });
 }).RequireRateLimiting("guest-session-issuance");
 
@@ -141,6 +173,10 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
         return Results.Forbid();
 
     context.Response.Headers.CacheControl = "no-store";
+    // Revoke on the server BEFORE the cookie is cleared client-side.
+    var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
+    if (!registry.Revoke(context.User))
+        return Results.Forbid();
     await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
     return Results.NoContent();
 }).RequireAuthorization();
@@ -197,6 +233,7 @@ app.Run();
 public partial class Program
 {
 }
+
 
 
 
