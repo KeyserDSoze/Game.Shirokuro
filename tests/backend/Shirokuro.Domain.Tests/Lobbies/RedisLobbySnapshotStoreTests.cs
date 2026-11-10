@@ -198,8 +198,8 @@ public sealed class RedisLobbySnapshotStoreTests
             Assert.NotNull(await two.ReadAsync(id));
             await Task.Delay(600);
             Assert.Null(await one.ReadAsync(id));
-            Assert.False(await two.CreateAsync(Room(id,
-                DateTimeOffset.UtcNow.AddMinutes(-1))) );
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+                two.CreateAsync(Room(id, DateTimeOffset.UtcNow.AddMinutes(-1))));
             Assert.True(await two.CreateAsync(Room(id, DateTimeOffset.UtcNow)));
             var current = (await one.ReadAsync(id))!;
             Assert.True(await one.DeleteIfCurrentAsync(current));

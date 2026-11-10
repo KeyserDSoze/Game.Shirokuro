@@ -79,6 +79,7 @@ public static class RedisLobbySnapshotCodec
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(snapshot.State);
         if (snapshot.LastActivityUtc.Offset != TimeSpan.Zero ||
+            snapshot.LastActivityUtc < DateTimeOffset.UnixEpoch ||
             snapshot.State.Revision < 0 ||
             snapshot.State.Definition.TeamIds.Count is < 2 or > 4 ||
             snapshot.State.Definition.HeroIds.Count is < 1 or > 128 ||
