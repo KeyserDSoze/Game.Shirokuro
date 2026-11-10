@@ -139,7 +139,7 @@ public static class IngressHostPolicyRegistration
             {
                 if (!env.IsDevelopment())
                     options.AllowedHosts = IngressHostPolicy.Create(configuration, false)
-                        .AllowedHostnamesForFramework;
+                        .AllowedHostnamesForFramework.ToArray();
             });
     }
 }
