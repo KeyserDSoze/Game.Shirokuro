@@ -119,16 +119,6 @@ expiry vs explicit logout, parallel sweeps, room revisions and TTL. TestServer
 integration verifies HTTP 401 for the expired cookie, surviving roster
 authorization, solo-room deletion and absence of invite revival.
 
-## Remaining work in parent issue #21
-
-Both registries are **in-memory and per-process**. Restart discards rooms
-and session registration (previous guest cookies fail safely); multi-node
-deployments cannot work without shared storage and consistent revocation.
-Still missing: persistent/distributed atomic room state, Data Protection
-key storage/rotation, global rate limiting, durable accounts, cross-identity abuse prevention, recovery,
-cross-instance reconnect and operational metrics/privacy policy.
-Do not deploy publicly as a distributed or production-ready multiplayer
-service until these are designed, built and tested.
 ## Redis atomic lobby snapshot foundation (#34)
 
 The API project includes `RedisLobbySnapshotCodec` and
@@ -161,3 +151,21 @@ use `InMemoryLobbyCoordinator`. This primitive is not a completed
 multi-node lobby architecture. Integrating all mutations and read
 authorization atomically, as well as global room/creator caps and cleanup,
 is still required in #21. No request may expose a raw Redis snapshot.
+
+## Remaining work in parent issue #21
+
+The **HTTP lobby coordinator, roster, technical quotas and cleanup are
+still in-memory, per-process**. An API restart discards those active rooms
+and membership, even though the new #34 Redis primitive is available.
+Production session **authentication and revocation** use shared TLS Redis
+(#33), and the cookie key ring can be persisted and encrypted with X.509
+(#32). Those security improvements are not substitutes for shared room
+membership, atomic creator/global quotas or reliable reconnect.
+
+The next slice must wire the API and SignalR into a fully authorized,
+atomic distributed coordinator; handle cross-node expiry/logout cleanup,
+global anti-abuse limits, crash recovery, and Redis operational failover.
+Any snapshot reads used by endpoint logic must first enforce trusted
+membership and protect the invite from enumeration. Public multi-node
+deployment also requires TLS edge/Redis availability, durability and
+observability checks. Do not claim production-ready multiplayer yet.
