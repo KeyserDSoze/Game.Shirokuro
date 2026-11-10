@@ -1,4 +1,6 @@
 using System.Net;
+using System.IO;
+using System.Security.Cryptography;
 using System.Security.Claims;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -13,6 +15,25 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 
 public sealed class DistributedGuestSessionTests
 {
+    private sealed class FailedRedis : IDistributedCache
+    {
+        private static IOException Unavailable() => new("Guest store offline.");
+        public byte[]? Get(string key) => throw Unavailable();
+        public Task<byte[]?> GetAsync(string key, CancellationToken token = default) =>
+            Task.FromException<byte[]?>(Unavailable());
+        public void Refresh(string key) => throw Unavailable();
+        public Task RefreshAsync(string key, CancellationToken token = default) =>
+            Task.FromException(Unavailable());
+        public void Remove(string key) => throw Unavailable();
+        public Task RemoveAsync(string key, CancellationToken token = default) =>
+            Task.FromException(Unavailable());
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
+            throw Unavailable();
+        public Task SetAsync(string key, byte[] value,
+            DistributedCacheEntryOptions options, CancellationToken token = default) =>
+            Task.FromException(Unavailable());
+    }
+
     private sealed class ManualClock : TimeProvider
     {
         private DateTimeOffset _now = DateTimeOffset.UtcNow;
@@ -125,6 +146,49 @@ public sealed class DistributedGuestSessionTests
         Assert.Throws<InvalidOperationException>(() =>
             GuestSessionRedisConfiguration.Configure(
                 services, config, new FakeEnvironment("Production")));
+    }
+
+    [Fact]
+    public async Task SharedStoreOutageNeverAuthorizesOrIssuesGuestTickets()
+    {
+        var clock = new ManualClock();
+        var id = GuestSessions.NewPlayerId();
+        var token = new string('a', 32);
+        var principal = GuestSessions.CreatePrincipal(id, token);
+        var unavailable = new GuestSessionRegistry(clock, new FailedRedis());
+
+        Assert.False(await unavailable.IsActiveAsync(principal));
+        await Assert.ThrowsAsync<IOException>(() =>
+            unavailable.RegisterAsync(id, clock.GetUtcNow().AddHours(1)));
+        await Assert.ThrowsAsync<IOException>(() =>
+            unavailable.RevokeAsync(principal));
+        Assert.Equal(0, unavailable.StoredSessionCount);
+    }
+
+    [Fact]
+    public async Task RedisGuestClaimsMustBeUniqueAndMatchServerStoredIdentity()
+    {
+        var (cache, provider) = Cache();
+        using (provider)
+        {
+            var clock = new ManualClock();
+            var registry = new GuestSessionRegistry(clock, cache);
+            var id = GuestSessions.NewPlayerId();
+            var token = await registry.RegisterAsync(id, clock.GetUtcNow().AddHours(1));
+            var principal = GuestSessions.CreatePrincipal(id, token);
+            Assert.True(await registry.IsActiveAsync(principal));
+
+            var identity = principal.Identities.Single();
+            var duplicate = new ClaimsPrincipal(new ClaimsIdentity(
+                identity.Claims.Append(new Claim(GuestSessions.SessionIdClaim, token)),
+                "Cookies"));
+            Assert.False(await registry.IsActiveAsync(duplicate));
+            Assert.False(await registry.RevokeAsync(duplicate));
+
+            Assert.False(await registry.IsActiveAsync(GuestSessions.CreatePrincipal(
+                GuestSessions.NewPlayerId(), token)));
+            Assert.True(await registry.IsActiveAsync(principal));
+        }
     }
 
     [Fact]

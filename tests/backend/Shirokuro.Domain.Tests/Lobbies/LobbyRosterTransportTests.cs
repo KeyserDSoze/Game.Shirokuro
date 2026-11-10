@@ -257,6 +257,34 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task ExistingHubRejectsSessionRevokedByAnotherRegistry()
+    {
+        var services = new ServiceCollection();
+        services.AddDistributedMemoryCache();
+        using var provider = services.BuildServiceProvider();
+        var shared = provider.GetRequiredService<Microsoft.Extensions.Caching.Distributed.IDistributedCache>();
+        var clock = TimeProvider.System;
+        var onA = new GuestSessionRegistry(clock, shared);
+        var onB = new GuestSessionRegistry(clock, shared);
+        var id = GuestSessions.NewPlayerId();
+        var token = await onA.RegisterAsync(id, clock.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(id, token);
+
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create("shared", ["white", "black"]);
+        coordinator.Join("shared", id, "white", 0);
+        var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator), onA)
+        {
+            Context = new FakeHubContext(principal)
+        };
+
+        Assert.Equal("shared", (await hub.GetRoster("shared")).LobbyId);
+        Assert.True(await onB.RevokeAsync(principal));
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("shared"))).Message);
+    }
+
+    [Fact]
     public void SessionCookieSettingsHaveStrictSecurityDefaults()
     {
         using var server = CreateServer();
