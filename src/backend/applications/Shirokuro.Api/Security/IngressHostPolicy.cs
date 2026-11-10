@@ -133,8 +133,9 @@ public static class IngressHostPolicyRegistration
         // The framework's built-in filter works on names, not (name,port).
         // Keep its defense in depth for the host portion, then enforce the
         // exact Host+port with Shirokuro's strict ingress guard.
-        services.PostConfigure<HostFilteringOptions, IConfiguration, IHostEnvironment>(
-            (options, configuration, env) =>
+        services.AddOptions<HostFilteringOptions>()
+            .PostConfigure<IConfiguration, IHostEnvironment>(
+                (options, configuration, env) =>
             {
                 if (!env.IsDevelopment())
                     options.AllowedHosts = IngressHostPolicy.Create(configuration, false)
