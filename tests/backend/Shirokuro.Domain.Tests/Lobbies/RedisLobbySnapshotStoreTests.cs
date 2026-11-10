@@ -183,6 +183,59 @@ public sealed class RedisLobbySnapshotStoreTests
     }
 
     [Fact]
+    public async Task ExpiredSnapshotCannotBeResurrectedByStaleHeartbeat()
+    {
+        if (RedisConnection() is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var one = new RedisLobbySnapshotStore(a.GetDatabase(), clock);
+            var two = new RedisLobbySnapshotStore(b.GetDatabase(), clock);
+            var id = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateAsync(Room(id, clock.GetUtcNow())));
+            var staleRead = (await two.ReadAsync(id))!;
+            clock.Advance(TimeSpan.FromMinutes(31));
+            var forgedHeartbeat = staleRead.Snapshot with
+            {
+                LastActivityUtc = clock.GetUtcNow()
+            };
+            Assert.False(await one.CompareExchangeAsync(staleRead, forgedHeartbeat));
+            Assert.Null(await two.ReadAsync(id));
+            // Clean up the physical Redis test key even if the fake clock
+            // advanced while the real Redis TTL did not.
+            Assert.True(await two.DeleteIfCurrentAsync(staleRead));
+        }
+    }
+
+    [Fact]
+    public async Task SameRevisionWritesCannotChangeRosterOrCreatorAttribution()
+    {
+        if (RedisConnection() is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var store = new RedisLobbySnapshotStore(a.GetDatabase(), clock);
+            var id = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await store.CreateAsync(Room(id, clock.GetUtcNow())));
+            var original = (await store.ReadAsync(id))!;
+            var old = original.Snapshot.State;
+            var fakeState = LobbyState.Restore(old.Definition, old.Revision,
+                [new LobbyParticipant("mallory", "black", null)]);
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                store.CompareExchangeAsync(original,
+                    original.Snapshot with { State = fakeState }));
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                store.CompareExchangeAsync(original,
+                    original.Snapshot with { CreatorId = "mallory" }));
+            Assert.True(await store.DeleteIfCurrentAsync(original));
+        }
+    }
+
+    [Fact]
     public async Task RedisPhysicalTtlExpiresWithoutBackgroundWorkerOrReads()
     {
         if (RedisConnection() is null) return;

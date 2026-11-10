@@ -71,12 +71,26 @@ public sealed class RedisLobbySnapshotStore(
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(updated);
-        if (!string.Equals(expected.Snapshot.State.Definition.LobbyId,
-                updated.State.Definition.LobbyId, StringComparison.Ordinal) ||
-            updated.State.Revision < expected.Snapshot.State.Revision ||
-            updated.State.Revision > expected.Snapshot.State.Revision + 1 ||
+        var oldState = expected.Snapshot.State;
+        var newState = updated.State;
+        if (!string.Equals(oldState.Definition.LobbyId,
+                newState.Definition.LobbyId, StringComparison.Ordinal) ||
+            !oldState.Definition.TeamIds.SequenceEqual(newState.Definition.TeamIds) ||
+            !oldState.Definition.HeroIds.SequenceEqual(newState.Definition.HeroIds) ||
+            !string.Equals(expected.Snapshot.CreatorId, updated.CreatorId,
+                StringComparison.Ordinal) ||
+            newState.Revision < oldState.Revision ||
+            newState.Revision - oldState.Revision > 1 ||
+            (newState.Revision == oldState.Revision &&
+                !oldState.Participants.SequenceEqual(newState.Participants)) ||
             updated.LastActivityUtc < expected.Snapshot.LastActivityUtc)
             throw new ArgumentException("Invalid atomic lobby update.");
+
+        // A writer that read before the logical inactivity deadline must not
+        // revive that room with a later timestamp. This matters with fake
+        // clocks and also guards Redis TTL lag / cross-node clock skew.
+        if (Remaining(expected.Snapshot) <= TimeSpan.Zero)
+            return false;
 
         var ttl = Remaining(updated);
         if (ttl <= TimeSpan.Zero)
