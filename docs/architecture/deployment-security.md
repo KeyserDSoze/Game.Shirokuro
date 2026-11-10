@@ -40,7 +40,10 @@ wildcards and unconfigured ports are not authorized.
 Every request (including health, read-only APIs, SignalR negotiate, and
 guest/lobby writes) must have **one** syntactically valid Host that exactly
 matches an allowlisted host and port; otherwise the API responds `400`,
-before auth, rate limiting and endpoint logic. `X-Forwarded-Host` is never
+before auth, rate limiting and endpoint logic. The built-in ASP.NET Core
+Host filter receives hostname-only entries as defense-in-depth; Shirokuro's
+additional ingress policy enforces the optional port exactly (including
+non-default ports) and rejects comma-joined/duplicate Host values. `X-Forwarded-Host` is never
 used to bypass this check. Host policy is separate from Origin: configure
 both `AllowedHosts` and `Security:AllowedOrigins`, consistently with the
 actual proxy routing. In Development the Host allowlist restriction is
