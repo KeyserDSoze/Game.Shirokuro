@@ -60,16 +60,24 @@ a real reverse proxy without allowing untrusted clients to spoof their
 IP. `X-Forwarded-Host` is never accepted. See
 [deployment-security.md](deployment-security.md).
 
-These guarantees are **per process**. A restart loses the registry and
-invalidates previous guests (safe but not seamless). The lobby/session registries are not yet shared across instances;
-cross-node revocation, durable identity, recovery, anti-abuse and verified
-accounts remain in #21. Issue #32 adds operator-provided persistent,
-certificate-encrypted Data Protection keys with a stable application
-discriminator, so cookie tickets can be cryptographically read across
-instances and restarts **when the same key ring and decryption
-certificate are mounted**. Guest authorization remains per process:
-another node must still reject an otherwise-decryptable guest cookie if
-its session token is absent from that node's active registry. With #31, non-Development HTTP is denied for all API and SignalR
+**Shared guest authorization and revocation (#33):** Outside Development,
+the session ID is checked on **every HTTP request and SignalR roster method**
+against a TLS-enabled Redis distributed cache. Session issuance persists
+the server-generated 128-bit random token there before issuing a cookie;
+Redis keys contain only the SHA-256 of that token, and values contain the
+guest identity hash and absolute expiry. Redis TTL is never sliding.
+Guest logout removes the shared token before clearing its cookie, so
+another API instance rejects it at the next authentication check.
+A Redis outage never grants access based on local memory.
+
+The key ring and decryption certificate must still be shared across nodes
+(#32), with identical Redis configuration (#33). **Lobby states, member
+rosters and the local 5-minute expiry worker remain per-process**: a
+logout on node B immediately revokes the credential on A and B, but it
+does not remove stale roster membership stored in A until the appropriate
+local cleanup. Distribution of lobby state/cleanup and rate limits is
+still pending #21. In Development, sessions intentionally stay
+in-memory; restarts lose the registry and invalidate old guest tickets. With #31, non-Development HTTP is denied for all API and SignalR
 routes (403 without redirect). Trusted proxies can report HTTPS only
 through the #29 allowlisted peer mechanism; direct clients cannot grant
 themselves HTTPS with `X-Forwarded-Proto`. A bounded 30-day HSTS header

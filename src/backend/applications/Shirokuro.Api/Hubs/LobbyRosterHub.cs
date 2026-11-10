@@ -13,7 +13,7 @@ namespace Shirokuro.Api.Hubs;
 [Authorize]
 public sealed class LobbyRosterHub(LobbyRosterReader reader, GuestSessionRegistry? sessions = null) : Hub
 {
-    public LobbyRosterView GetRoster(string lobbyId)
+    public async Task<LobbyRosterView> GetRoster(string lobbyId)
     {
         var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(Context.User);
         if (trustedPlayerId is null)
@@ -26,7 +26,8 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader, GuestSessionRegistr
         // registration again on every Hub method invocation.
         var isGuestLike = trustedPlayerId.StartsWith("guest-", StringComparison.Ordinal) ||
             Context.User?.FindAll(GuestSessions.SessionKindClaim).Any() == true;
-        if (isGuestLike && sessions?.IsActive(Context.User) != true)
+        if (isGuestLike && (sessions is null ||
+            !await sessions.IsActiveAsync(Context.User, Context.ConnectionAborted)))
         {
             throw new HubException("Lobby unavailable.");
         }

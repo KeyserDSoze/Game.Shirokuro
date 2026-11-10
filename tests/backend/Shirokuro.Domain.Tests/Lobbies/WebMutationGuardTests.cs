@@ -18,7 +18,10 @@ public sealed class WebMutationGuardTests
         {
             builder.UseEnvironment(environment);
             if (environment != "Development")
+            {
                 TestDataProtectionConfiguration.Apply(builder);
+                TestGuestSessionRedisConfiguration.Apply(builder);
+            }
             builder.ConfigureAppConfiguration((_, configuration) =>
             {
                 configuration.AddInMemoryCollection(

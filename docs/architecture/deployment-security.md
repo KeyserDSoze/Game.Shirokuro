@@ -169,6 +169,35 @@ correctly denied there if its guest session belongs only to instance A.
 Shared session revocation, lobby persistence and multi-node reconnect
 remain #21; this feature alone does not make multiplayer multi-node-ready.
 
+## Distributed guest session authorization (issue #33)
+
+All non-Development deployments must configure a shared Redis guest-session
+store with **TLS enabled**:
+
+```sh
+Security__GuestSessions__RedisConnectionString="redis.internal.example:6380,ssl=true,password=<secret from deployment>"
+```
+
+Use the real internal Redis hostname and secret via an appropriate secret
+manager, not the repository. A missing, invalid or plaintext
+`Security:GuestSessions:RedisConnectionString` prevents startup; no
+fallback to the node's local memory is allowed. Redis must be reachable
+only through trusted networks with TLS and authentication. Every API
+instance must use the **same** Redis service and the **same** Data Protection
+key ring/certificates (#32). Key names contain SHA-256 hashes of the
+128-bit server-generated session tokens, not tokens or player IDs in
+plaintext; cache values bind a guest identity hash and absolute expiration.
+`OnValidatePrincipal` and SignalR `GetRoster` check Redis on each use,
+and logout deletes the shared entry before clearing the browser cookie.
+
+The Redis store **does not** distribute the in-memory lobby coordinator,
+administrative membership cleanup, session expiry notification queue or
+per-IP rate limits. Consequently this feature does not complete multi-node
+gameplay or multi-instance lobby reconnect. Tests with two independently
+hosted APIs and a shared fake distributed cache verify cookie acceptance
+and revocation; **real Redis cluster failover/performance testing** is
+still required before public deployment.
+
 ## Security regression coverage
 
 `WebMutationGuardTests` uses real TestServer endpoints in Production,
@@ -182,6 +211,6 @@ writes, HSTS, ignored `X-Forwarded-Proto` from unknown peers and
 unchanged local Development HTTP behavior. The Playwright local-browser
 workflows remain unchanged.
 
-This does not solve distributed session revocation, edge TLS/network validation,
-distributed rate limiting, lobby persistence or durable player accounts:
+This does not solve distributed lobby state/cleanup, edge TLS/network validation,
+distributed rate limiting, Redis availability/failover or durable player accounts:
 all remain open in #21.

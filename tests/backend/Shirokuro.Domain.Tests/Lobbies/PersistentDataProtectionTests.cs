@@ -9,6 +9,8 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -199,10 +201,12 @@ public sealed class PersistentDataProtectionTests
         Assert.Equal("signed", protector.Unprotect(token));
     }
 
-    private static WebApplicationFactory<Program> Server(KeyRingFiles ring)
+    private static WebApplicationFactory<Program> Server(KeyRingFiles ring,
+        IDistributedCache? shared = null)
         => new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
+            TestGuestSessionRedisConfiguration.Apply(builder, shared);
             foreach (var (key, value) in ring.Settings())
                 builder.UseSetting(key, value);
             builder.ConfigureAppConfiguration((_, configuration) =>
@@ -229,7 +233,7 @@ public sealed class PersistentDataProtectionTests
     }
 
     [Fact]
-    public async Task CookieCryptoIsPortableButGuestAuthorizationIsNotYetDistributed()
+    public async Task CookieCryptoIsPortableButGuestAuthorizationStillRequiresSharedStore()
     {
         using var ring = new KeyRingFiles();
         using var firstServer = Server(ring);

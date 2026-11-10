@@ -17,6 +17,8 @@ TrustedProxyForwarding.Configure(builder.Services, builder.Configuration);
 builder.Services.AddIngressHostPolicy();
 PersistentDataProtection.Configure(
     builder.Services, builder.Configuration, builder.Environment);
+GuestSessionRedisConfiguration.Configure(
+    builder.Services, builder.Configuration, builder.Environment);
 // A bounded HSTS policy for HTTPS-only non-Development ingress. Do not
 // include arbitrary subdomains or request preload before edge TLS is verified.
 builder.Services.AddHsts(options =>
@@ -47,7 +49,7 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         options.SlidingExpiration = false;
         // Treat guest-like or legacy guest tickets as invalid unless their
         // signed session token remains present in the server's active registry.
-        options.Events.OnValidatePrincipal = context =>
+        options.Events.OnValidatePrincipal = async context =>
         {
             var principal = context.Principal;
             var playerId = AuthenticatedPlayerIdentity.FromPrincipal(principal);
@@ -57,10 +59,10 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             {
                 var registry = context.HttpContext.RequestServices
                     .GetRequiredService<GuestSessionRegistry>();
-                if (!registry.IsActive(principal))
+                if (!await registry.IsActiveAsync(
+                        principal, context.HttpContext.RequestAborted))
                     context.RejectPrincipal();
             }
-            return Task.CompletedTask;
         };
         options.Events.OnRedirectToLogin = context =>
         {
@@ -188,7 +190,8 @@ app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment 
     var expires = context.RequestServices.GetRequiredService<TimeProvider>()
         .GetUtcNow().AddHours(8);
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
-    var sessionId = registry.Register(playerId, expires);
+    var sessionId = await registry.RegisterAsync(
+        playerId, expires, context.RequestAborted);
     var principal = GuestSessions.CreatePrincipal(playerId, sessionId);
     try
     {
@@ -203,7 +206,7 @@ app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment 
     }
     catch
     {
-        registry.Revoke(principal);
+        await registry.RevokeAsync(principal, context.RequestAborted);
         throw;
     }
     return Results.Ok(new { playerId, kind = "guest" });
@@ -227,7 +230,7 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     context.Response.Headers.CacheControl = "no-store";
     // Revoke on the server BEFORE the cookie is cleared client-side.
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
-    if (!registry.Revoke(context.User))
+    if (!await registry.RevokeAsync(context.User, context.RequestAborted))
         return Results.Forbid();
 
     // The guest can no longer authenticate. Remove their stale pre-match

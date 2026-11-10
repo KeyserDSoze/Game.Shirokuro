@@ -98,7 +98,10 @@ public sealed class IngressHostPolicyTests
         {
             builder.UseEnvironment(environment);
             if (environment != "Development")
+            {
                 TestDataProtectionConfiguration.Apply(builder);
+                TestGuestSessionRedisConfiguration.Apply(builder);
+            }
             builder.ConfigureAppConfiguration((_, config) =>
             {
                 var settings = new Dictionary<string, string?>
