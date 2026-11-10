@@ -100,6 +100,31 @@ public sealed class DistributedGuestSessionTests
     }
 
     [Fact]
+    public async Task ConcurrentCrossNodeChecksCannotResurrectARevokedTicket()
+    {
+        var (cache, provider) = Cache();
+        using (provider)
+        {
+            var clock = new ManualClock();
+            var a = new GuestSessionRegistry(clock, cache);
+            var b = new GuestSessionRegistry(clock, cache);
+            var id = GuestSessions.NewPlayerId();
+            var token = await a.RegisterAsync(id, clock.GetUtcNow().AddHours(1));
+            var principal = GuestSessions.CreatePrincipal(id, token);
+
+            var before = await Task.WhenAll(Enumerable.Range(0, 48).Select(i =>
+                (i % 2 == 0 ? a : b).IsActiveAsync(principal)));
+            Assert.All(before, Assert.True);
+
+            Assert.True(await b.RevokeAsync(principal));
+            var after = await Task.WhenAll(Enumerable.Range(0, 96).Select(i =>
+                (i % 2 == 0 ? a : b).IsActiveAsync(principal)));
+            Assert.All(after, value => Assert.False(value));
+            Assert.False(await a.RevokeAsync(principal));
+        }
+    }
+
+    [Fact]
     public async Task UnsharedStoresDenyEvenWithIdenticalSignedGuestClaims()
     {
         var (firstCache, firstProvider) = Cache();
