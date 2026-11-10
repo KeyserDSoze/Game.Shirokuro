@@ -192,7 +192,7 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
-    public void SignalRMethodReauthorizesMemberAndRejectsSpoofedContextUserIdentifier()
+    public async Task SignalRMethodReauthorizesMemberAndRejectsSpoofedContextUserIdentifier()
     {
         var coordinator = new InMemoryLobbyCoordinator();
         coordinator.Create("room", ["white", "black"]);
@@ -203,29 +203,29 @@ public sealed class LobbyRosterTransportTests
         // The caller's authenticated principal, not a transport-supplied or
         // caller-controlled identifier, is the authoritative identity.
         hub.Context = new FakeHubContext(Principal("alice"), "spoofed-bob");
-        var roster = hub.GetRoster("room");
+        var roster = await hub.GetRoster("room");
         Assert.Equal("room", roster.LobbyId);
         Assert.Equal(2, roster.Participants.Count);
 
         hub.Context = new FakeHubContext(Principal("outsider"), "alice");
         Assert.Equal("Lobby unavailable.",
-            Assert.Throws<HubException>(() => hub.GetRoster("room")).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("room"))).Message);
 
         hub.Context = new FakeHubContext(Principal("alice"));
         Assert.Equal("Lobby unavailable.",
-            Assert.Throws<HubException>(() => hub.GetRoster("unknown")).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("unknown"))).Message);
 
         hub.Context = new FakeHubContext(new ClaimsPrincipal(new ClaimsIdentity()));
         Assert.Equal("Lobby unavailable.",
-            Assert.Throws<HubException>(() => hub.GetRoster("room")).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("room"))).Message);
 
         hub.Context = new FakeHubContext(Principal("bob"));
-        Assert.Equal("room", hub.GetRoster("room").LobbyId);
+        Assert.Equal("room", (await hub.GetRoster("room")).LobbyId);
     }
 
 
     [Fact]
-    public void ExistingSignalRConnectionCannotReadAfterGuestLogoutRevocation()
+    public async Task ExistingSignalRConnectionCannotReadAfterGuestLogoutRevocation()
     {
         var playerId = "guest-" + new string('a', 32);
         var clock = TimeProvider.System;
@@ -243,17 +243,17 @@ public sealed class LobbyRosterTransportTests
         {
             Context = new FakeHubContext(principal)
         };
-        Assert.Equal("secret", hub.GetRoster("secret").LobbyId);
+        Assert.Equal("secret", (await hub.GetRoster("secret")).LobbyId);
         Assert.True(registry.Revoke(principal));
         Assert.Equal("Lobby unavailable.",
-            Assert.Throws<HubException>(() => hub.GetRoster("secret")).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("secret"))).Message);
 
         // A valid ticket with a session ID no longer registered also fails.
         var newHub = new LobbyRosterHub(new LobbyRosterReader(coordinator), registry)
         {
             Context = new FakeHubContext(principal)
         };
-        Assert.Throws<HubException>(() => newHub.GetRoster("secret"));
+        await Assert.ThrowsAsync<HubException>(() => newHub.GetRoster("secret"));
     }
 
     [Fact]
