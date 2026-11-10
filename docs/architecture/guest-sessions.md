@@ -61,10 +61,15 @@ IP. `X-Forwarded-Host` is never accepted. See
 [deployment-security.md](deployment-security.md).
 
 These guarantees are **per process**. A restart loses the registry and
-invalidates previous guests (safe but not seamless). The store and
-Data Protection keys are not yet shared across instances; cross-node
-revocation, durable identity, recovery, anti-abuse and verified accounts
-remain in #21. With #31, non-Development HTTP is denied for all API and SignalR
+invalidates previous guests (safe but not seamless). The lobby/session registries are not yet shared across instances;
+cross-node revocation, durable identity, recovery, anti-abuse and verified
+accounts remain in #21. Issue #32 adds operator-provided persistent,
+certificate-encrypted Data Protection keys with a stable application
+discriminator, so cookie tickets can be cryptographically read across
+instances and restarts **when the same key ring and decryption
+certificate are mounted**. Guest authorization remains per process:
+another node must still reject an otherwise-decryptable guest cookie if
+its session token is absent from that node's active registry. With #31, non-Development HTTP is denied for all API and SignalR
 routes (403 without redirect). Trusted proxies can report HTTPS only
 through the #29 allowlisted peer mechanism; direct clients cannot grant
 themselves HTTPS with `X-Forwarded-Proto`. A bounded 30-day HSTS header

@@ -15,6 +15,8 @@ var builder = WebApplication.CreateBuilder(args);
 // Ingress forwarding stays disabled unless exact trusted proxy IPs are configured.
 TrustedProxyForwarding.Configure(builder.Services, builder.Configuration);
 builder.Services.AddIngressHostPolicy();
+PersistentDataProtection.Configure(
+    builder.Services, builder.Configuration, builder.Environment);
 // A bounded HSTS policy for HTTPS-only non-Development ingress. Do not
 // include arbitrary subdomains or request preload before edge TLS is verified.
 builder.Services.AddHsts(options =>

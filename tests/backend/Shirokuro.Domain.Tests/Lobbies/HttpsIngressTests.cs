@@ -17,6 +17,8 @@ public sealed class HttpsIngressTests
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment(environment);
+            if (environment != "Development")
+                TestDataProtectionConfiguration.Apply(builder);
             builder.ConfigureAppConfiguration((_, configuration) =>
             {
                 var settings = new Dictionary<string, string?>

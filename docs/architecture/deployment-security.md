@@ -1,9 +1,11 @@
-# Deployment security: Origin, Host and reverse-proxy trust — #28, #29, #30
+# Deployment security: Origin, Host, proxy and cryptographic keys — #28–#32
 
 This is an **intermediate hardening step**, not a production-ready
 multi-node deployment. Shirokuro currently holds its room/session registries
 in memory on each process; persistent accounts, distributed session revocation,
-Data Protection key-ring persistence and shared room state remain #21.
+guest session registry and shared room state remain #21. A persistent
+encrypted Data Protection key ring can now be operator-configured (#32),
+but does not make those in-memory stores distributed.
 
 ## CSRF Origin allowlist
 
@@ -116,6 +118,57 @@ origins (`http://localhost:5173` and `http://127.0.0.1:5173`)
 are accepted. This prevents a forged `Host: evil.example` matching
 `Origin: http://evil.example` from granting CSRF trust even in dev.
 
+## Persistent encrypted Data Protection key ring (issue #32)
+
+Production, Staging and other non-Development environments require an
+explicit persistent key directory and a PFX **with a private key**.
+The API fails to start if these values are absent, relative, missing or
+unreadable. Local Development continues to support its existing ephemeral
+keys when no Data Protection storage is configured.
+
+```sh
+# Illustrative paths only; mount these as dedicated, access-controlled volumes
+Security__DataProtection__KeysDirectory=/srv/shirokuro/data-protection
+Security__DataProtection__CertificatePath=/run/secrets/shirokuro-keys.pfx
+Security__DataProtection__CertificatePassword=<provided via secret manager>
+```
+
+The key directory **must already exist**; Shirokuro does not create it or
+silently switch to an unencrypted repository. The PFX file and password
+must come from deployment secrets, **not the Git repository or the public
+web root**. Give only the service identity read/write access to the key
+directory, and only authorized service identities access to PFX material.
+Backup the key ring and PFX securely and restrict who may overwrite or
+delete them: compromise of either affects cookie confidentiality or
+integrity. A shared key ring can be mounted read/write across processes,
+but requires storage that supports consistent concurrent writes.
+
+The API uses `PersistKeysToFileSystem` and `ProtectKeysWithCertificate`
+to encrypt the XML key ring at rest, a stable Data Protection application
+discriminator `Shirokuro`, and automatic Data Protection key lifetime
+of 90 days. Older key files must be **retained** so existing cookies remain
+cryptographically readable after automatic key rotation; do not delete
+old key files as part of a deployment.
+
+To rotate the **PFX wrapping certificate**, replace
+`Security__DataProtection__CertificatePath` and configure old
+certificates with their individual secrets during the transition:
+
+```sh
+Security__DataProtection__PreviousCertificates__0__Path=/run/secrets/shirokuro-previous.pfx
+Security__DataProtection__PreviousCertificates__0__Password=<previous secret>
+```
+
+Keep the previous decryptors until any keys they wrap have been retired
+according to your operational retention policy. Do not log PFX passwords,
+ticket payloads or key XML. Configuration is verified with xUnit
+cross-provider crypto, encrypted XML, certificate migration and cookie
+TestServer tests. **Guest authorization still uses per-process session
+registries:** a cookie cryptographically readable on instance B is
+correctly denied there if its guest session belongs only to instance A.
+Shared session revocation, lobby persistence and multi-node reconnect
+remain #21; this feature alone does not make multiplayer multi-node-ready.
+
 ## Security regression coverage
 
 `WebMutationGuardTests` uses real TestServer endpoints in Production,
@@ -129,6 +182,6 @@ writes, HSTS, ignored `X-Forwarded-Proto` from unknown peers and
 unchanged local Development HTTP behavior. The Playwright local-browser
 workflows remain unchanged.
 
-This does not solve shared Data Protection keys, edge TLS/network validation,
-distributed rate limiting, session persistence or durable player accounts:
+This does not solve distributed session revocation, edge TLS/network validation,
+distributed rate limiting, lobby persistence or durable player accounts:
 all remain open in #21.

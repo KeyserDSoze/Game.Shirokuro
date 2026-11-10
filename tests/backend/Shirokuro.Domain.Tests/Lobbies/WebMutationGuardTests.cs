@@ -17,6 +17,8 @@ public sealed class WebMutationGuardTests
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment(environment);
+            if (environment != "Development")
+                TestDataProtectionConfiguration.Apply(builder);
             builder.ConfigureAppConfiguration((_, configuration) =>
             {
                 configuration.AddInMemoryCollection(

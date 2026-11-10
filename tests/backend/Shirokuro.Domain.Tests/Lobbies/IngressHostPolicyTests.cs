@@ -97,6 +97,8 @@ public sealed class IngressHostPolicyTests
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment(environment);
+            if (environment != "Development")
+                TestDataProtectionConfiguration.Apply(builder);
             builder.ConfigureAppConfiguration((_, config) =>
             {
                 var settings = new Dictionary<string, string?>
