@@ -9,18 +9,19 @@ namespace Shirokuro.Api.Lobbies;
 /// never a replacement for member-authorized LobbyRosterView projection.
 /// </summary>
 public sealed record LobbySnapshot(
-    LobbyState State, DateTimeOffset LastActivityUtc, string? CreatorId);
+    LobbyState State, DateTimeOffset LastActivityUtc, string? CreatorId,
+    bool QuotaTracked = false);
 
 public static class RedisLobbySnapshotCodec
 {
-    private const int Version = 1;
+    private const int Version = 2;
     public const int MaxBytes = 32768;
 
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
     private sealed record Payload(
         int Version, string LobbyId, string[] TeamIds, string[] HeroIds,
         long Revision, LobbyParticipant[] Participants,
-        string? CreatorId, long LastActivityUtcTicks);
+        string? CreatorId, long LastActivityUtcTicks, bool QuotaTracked);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -36,7 +37,7 @@ public static class RedisLobbySnapshotCodec
             Version, state.Definition.LobbyId, state.Definition.TeamIds.ToArray(),
             state.Definition.HeroIds.ToArray(), state.Revision,
             state.Participants.ToArray(), snapshot.CreatorId,
-            snapshot.LastActivityUtc.UtcTicks), JsonOptions);
+            snapshot.LastActivityUtc.UtcTicks, snapshot.QuotaTracked), JsonOptions);
         if (bytes.Length > MaxBytes)
             throw new InvalidDataException("Lobby snapshot exceeds storage limit.");
         return bytes;
@@ -63,7 +64,8 @@ public static class RedisLobbySnapshotCodec
                 definition, payload.Revision, payload.Participants);
             var lastActivity = new DateTimeOffset(
                 payload.LastActivityUtcTicks, TimeSpan.Zero);
-            var result = new LobbySnapshot(state, lastActivity, payload.CreatorId);
+            var result = new LobbySnapshot(state, lastActivity, payload.CreatorId,
+                payload.QuotaTracked);
             Validate(result);
             return result;
         }
@@ -85,7 +87,8 @@ public static class RedisLobbySnapshotCodec
             snapshot.State.Definition.HeroIds.Count is < 1 or > 128 ||
             snapshot.State.Participants.Count > 16 ||
             (snapshot.CreatorId is not null &&
-                string.IsNullOrWhiteSpace(snapshot.CreatorId)))
+                string.IsNullOrWhiteSpace(snapshot.CreatorId)) ||
+            (snapshot.QuotaTracked && snapshot.CreatorId is null))
             throw new InvalidDataException("Invalid persisted lobby metadata.");
 
         // Reconstruction deliberately repeats the same domain-level checks

@@ -169,3 +169,42 @@ Any snapshot reads used by endpoint logic must first enforce trusted
 membership and protect the invite from enumeration. Public multi-node
 deployment also requires TLS edge/Redis availability, durability and
 observability checks. Do not claim production-ready multiplayer yet.
+
+## Atomic creator/global Redis room quotas (#35)
+
+`RedisLobbySnapshotStore.CreateBoundedAsync` provides the technical
+global **256 active rooms** and **4 active rooms per server-authenticated
+guest creator** admission primitive for future distributed coordinator
+operations. Both checks and insertion execute in **one Redis Lua script**
+with a shared global sorted index and a per-creator sorted index. Creator
+IDs and bearer invitation codes are SHA-256 hashed in Redis key names;
+index entries themselves contain only hashed room-key references.
+No quota counters are accepted from the browser.
+
+The index scores are taken from Redis's own `PEXPIRETIME`, avoiding
+cross-node clock differences when reclaiming expired quotas. When a
+snapshot changes (including a valid same-revision heartbeat), the Lua CAS
+also moves both index deadlines; a versioned, stale or missing index
+cannot authorize a write. Conditional deletes remove indexes **only**
+when the matching current snapshot is actually removed. Creator
+attribution survives the creator leaving while other guests remain.
+Both indexes expire after inactivity, with opportunistic pruning on
+creation, without requiring a background sweeper.
+
+All keys share a Redis Cluster `{rooms}` hash tag (or a separate test
+namespace tag), deliberately keeping capacity transactions within a
+single slot. This favors consistency at the current 256-room technical
+capacity limit, at the cost of concentrating writes in one slot. The
+unindexed `CreateAsync` path remains only for low-level #34 tests and
+**must not be used for live room creation after endpoint migration**.
+The payload codec is v2 and explicitly distinguishes quota-tracked
+rooms, so an accidental missing index fails closed rather than silently
+bypassing quotas.
+
+xUnit integration on real Redis in CI tests two independently connected
+clients, 48 concurrent creates per identity, both capacity limits,
+creator departure, stale delete, heartbeat, physical TTL and recovery
+without a worker. **Still not connected to live HTTP/SignalR:** the
+distributed lobby coordinator must use only bounded creation and
+authorized CAS for every operation, then migrate logout/expiry cleanup
+and member-scoped reads together (#21).

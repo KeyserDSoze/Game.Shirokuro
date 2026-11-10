@@ -1,54 +1,143 @@
 using System.Security.Cryptography;
 using System.Text;
+using Shirokuro.Application.Lobbies;
 using StackExchange.Redis;
 
 namespace Shirokuro.Api.Lobbies;
 
 /// <summary>
-/// Atomic single-room Redis storage foundation (#34).
-/// NOT wired into the HTTP/SignalR coordinator: cross-room quotas, member
-/// authorization and cleanup require their own distributed transactions.
+/// Redis foundation for atomic, per-room snapshots (#34) and shared creator
+/// and global capacity indexes (#35). Deliberately not wired to HTTP yet:
+/// live membership, quotas, expiry/cleanup must migrate as one unit.
 /// </summary>
 public sealed class RedisLobbySnapshotStore(
-    IDatabase database, TimeProvider clock, TimeSpan? inactivityTimeout = null)
+    IDatabase database, TimeProvider clock, TimeSpan? inactivityTimeout = null,
+    string? namespaceName = null)
 {
-    private const string KeyPrefix = "shirokuro:lobby:v1:";
     private readonly TimeSpan _timeout = inactivityTimeout ??
         TimeSpan.FromMinutes(30);
+    // All room, global and owner keys use the SAME Redis Cluster hash tag,
+    // making their multi-key Lua scripts legal in a cluster.
+    private readonly string _prefix = Prefix(namespaceName);
 
-    // Compare the complete stored snapshot, not just its revision. This
-    // detects concurrent authorized heartbeat/TTL refreshes whose revision
-    // is intentionally unchanged, and protects against stale deletes.
+    // Compare the complete stored snapshot, including its activity timestamp:
+    // unchanged-revision authorized heartbeats must still detect conflicts.
     private const string CompareExchangeScript = """
         local current = redis.call('GET', KEYS[1])
         if not current or current ~= ARGV[1] then return 0 end
+
+        if ARGV[5] == '1' then
+            if not redis.call('ZSCORE', KEYS[2], KEYS[1]) or
+               not redis.call('ZSCORE', KEYS[3], KEYS[1]) then
+                return 0
+            end
+        end
+
         redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[2])
+        if ARGV[5] == '1' then
+            local deadline = redis.call('PEXPIRETIME', KEYS[1])
+            redis.call('ZADD', KEYS[2], deadline, KEYS[1])
+            redis.call('ZADD', KEYS[3], deadline, KEYS[1])
+            redis.call('PEXPIRE', KEYS[2], ARGV[4])
+            redis.call('PEXPIRE', KEYS[3], ARGV[4])
+        end
         return 1
         """;
 
     private const string DeleteIfCurrentScript = """
         local current = redis.call('GET', KEYS[1])
         if not current or current ~= ARGV[1] then return 0 end
-        return redis.call('DEL', KEYS[1])
+        if ARGV[2] == '1' then
+            if not redis.call('ZSCORE', KEYS[2], KEYS[1]) or
+               not redis.call('ZSCORE', KEYS[3], KEYS[1]) then
+                return 0
+            end
+        end
+        redis.call('DEL', KEYS[1])
+        if ARGV[2] == '1' then
+            redis.call('ZREM', KEYS[2], KEYS[1])
+            redis.call('ZREM', KEYS[3], KEYS[1])
+        end
+        return 1
+        """;
+
+    // All quota checks and the room insertion share the same Redis Lua
+    // execution, even when N independent API processes create concurrently.
+    // Scores use Redis's own clock and PEXPIRETIME, not per-node clocks.
+    private const string BoundedCreateScript = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+
+        local nowparts = redis.call('TIME')
+        local now = tonumber(nowparts[1]) * 1000 +
+                    math.floor(tonumber(nowparts[2]) / 1000)
+        redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+        redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+
+        if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then
+            return -1
+        end
+        if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
+            return -2
+        end
+
+        redis.call('PSETEX', KEYS[1], ARGV[2], ARGV[1])
+        local deadline = redis.call('PEXPIRETIME', KEYS[1])
+        redis.call('ZADD', KEYS[2], deadline, KEYS[1])
+        redis.call('ZADD', KEYS[3], deadline, KEYS[1])
+        redis.call('PEXPIRE', KEYS[2], ARGV[5])
+        redis.call('PEXPIRE', KEYS[3], ARGV[5])
+        return 1
         """;
 
     public sealed record Stored(LobbySnapshot Snapshot, byte[] RawBytes);
 
+    /// <summary>Unindexed low-level create retained for #34 compatibility.</summary>
     public async Task<bool> CreateAsync(LobbySnapshot snapshot)
     {
-        var ttl = Remaining(snapshot);
-        if (ttl <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(snapshot),
-                "Cannot create expired room.");
+        if (snapshot.QuotaTracked)
+            throw new ArgumentException(
+                "Quota-tracked snapshots require bounded creation.", nameof(snapshot));
+        var ttl = DeadlineMilliseconds(snapshot);
         return await database.StringSetAsync(
             RoomKey(snapshot.State.Definition.LobbyId),
             RedisLobbySnapshotCodec.Encode(snapshot),
-            expiry: ttl, when: When.NotExists);
+            expiry: TimeSpan.FromMilliseconds(ttl), when: When.NotExists);
     }
 
     /// <summary>
-    /// Pure read, never refreshing Redis TTL or exposing nonmember state
-    /// through an HTTP endpoint. Caller must authorize before projection.
+    /// Admit a server-authenticated creator atomically under BOTH global and
+    /// creator limits. Never called with an actor supplied by the browser.
+    /// </summary>
+    public async Task<bool> CreateBoundedAsync(
+        LobbySnapshot snapshot, int maxRooms, int maxRoomsPerCreator)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(snapshot.CreatorId);
+        if (snapshot.QuotaTracked)
+            throw new ArgumentException("Already quota-tracked.", nameof(snapshot));
+        if (maxRooms < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxRooms));
+        if (maxRoomsPerCreator < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxRoomsPerCreator));
+
+        var bounded = snapshot with { QuotaTracked = true };
+        var ttl = DeadlineMilliseconds(bounded);
+        var result = (long)await database.ScriptEvaluateAsync(
+            BoundedCreateScript,
+            [RoomKey(bounded.State.Definition.LobbyId), GlobalIndexKey,
+             CreatorIndexKey(bounded.CreatorId!)],
+            [RedisLobbySnapshotCodec.Encode(bounded), ttl,
+             maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()]);
+        if (result is -1 or -2)
+            throw new LobbyCapacityException();
+        if (result is not (0 or 1))
+            throw new InvalidOperationException("Unexpected Redis lobby result.");
+        return result == 1;
+    }
+
+    /// <summary>
+    /// Internal read only: never refreshes Redis TTL, and is not an HTTP
+    /// roster response. API layers must authorize membership first.
     /// </summary>
     public async Task<Stored?> ReadAsync(string lobbyId)
     {
@@ -59,18 +148,19 @@ public sealed class RedisLobbySnapshotStore(
         var snapshot = RedisLobbySnapshotCodec.Decode(bytes, lobbyId);
         return Remaining(snapshot) > TimeSpan.Zero
             ? new Stored(snapshot, bytes)
-            : null; // Redis's TTL is a second, independent expiry guard.
+            : null;
     }
 
     /// <summary>
-    /// For an already-authorized domain mutation, save iff nothing has
-    /// changed since ReadAsync, including original activity timestamp.
-    /// No retry here: the caller must re-read and reauthorize on conflict.
+    /// Save only if the complete previously-read value matches. If bounded,
+    /// update the room plus both quota-index deadlines in the same script.
     /// </summary>
     public async Task<bool> CompareExchangeAsync(Stored expected, LobbySnapshot updated)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(updated);
+        ValidateExpected(expected);
+
         var oldState = expected.Snapshot.State;
         var newState = updated.State;
         if (!string.Equals(oldState.Definition.LobbyId,
@@ -79,6 +169,7 @@ public sealed class RedisLobbySnapshotStore(
             !oldState.Definition.HeroIds.SequenceEqual(newState.Definition.HeroIds) ||
             !string.Equals(expected.Snapshot.CreatorId, updated.CreatorId,
                 StringComparison.Ordinal) ||
+            expected.Snapshot.QuotaTracked != updated.QuotaTracked ||
             newState.Revision < oldState.Revision ||
             newState.Revision - oldState.Revision > 1 ||
             (newState.Revision == oldState.Revision &&
@@ -86,30 +177,40 @@ public sealed class RedisLobbySnapshotStore(
             updated.LastActivityUtc < expected.Snapshot.LastActivityUtc)
             throw new ArgumentException("Invalid atomic lobby update.");
 
-        // A writer that read before the logical inactivity deadline must not
-        // revive that room with a later timestamp. This matters with fake
-        // clocks and also guards Redis TTL lag / cross-node clock skew.
+        // A stale read cannot revive an expired room with a later timestamp.
         if (Remaining(expected.Snapshot) <= TimeSpan.Zero)
             return false;
 
         var ttl = Remaining(updated);
         if (ttl <= TimeSpan.Zero)
             return false;
+        var bytes = RedisLobbySnapshotCodec.Encode(updated);
         var result = await database.ScriptEvaluateAsync(
-            CompareExchangeScript, [RoomKey(updated.State.Definition.LobbyId)],
-            [expected.RawBytes, RedisLobbySnapshotCodec.Encode(updated),
-             (long)Math.Ceiling(ttl.TotalMilliseconds)]);
+            CompareExchangeScript,
+            [RoomKey(newState.Definition.LobbyId), GlobalIndexKey,
+             CreatorIndexKey(updated.CreatorId)],
+            [expected.RawBytes, bytes, DeadlineMilliseconds(updated),
+             IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0]);
         return (long)result == 1;
     }
 
     public async Task<bool> DeleteIfCurrentAsync(Stored expected)
     {
         ArgumentNullException.ThrowIfNull(expected);
+        ValidateExpected(expected);
         var result = await database.ScriptEvaluateAsync(
             DeleteIfCurrentScript,
-            [RoomKey(expected.Snapshot.State.Definition.LobbyId)],
-            [expected.RawBytes]);
+            [RoomKey(expected.Snapshot.State.Definition.LobbyId), GlobalIndexKey,
+             CreatorIndexKey(expected.Snapshot.CreatorId)],
+            [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0]);
         return (long)result == 1;
+    }
+
+    private static void ValidateExpected(Stored expected)
+    {
+        if (!expected.RawBytes.AsSpan().SequenceEqual(
+                RedisLobbySnapshotCodec.Encode(expected.Snapshot)))
+            throw new InvalidDataException("Untrusted persisted lobby version.");
     }
 
     private TimeSpan Remaining(LobbySnapshot snapshot)
@@ -119,11 +220,39 @@ public sealed class RedisLobbySnapshotStore(
         return snapshot.LastActivityUtc + _timeout - clock.GetUtcNow();
     }
 
-    private static RedisKey RoomKey(string lobbyId)
+    private long DeadlineMilliseconds(LobbySnapshot snapshot)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(lobbyId);
-        // Room invites stay opaque: do not reveal bearer codes in Redis keys.
-        return KeyPrefix + Convert.ToHexStringLower(
-            SHA256.HashData(Encoding.UTF8.GetBytes(lobbyId)));
+        var remaining = Remaining(snapshot);
+        if (remaining <= TimeSpan.Zero ||
+            remaining > _timeout)
+            throw new ArgumentOutOfRangeException(nameof(snapshot),
+                "Invalid or expired lobby activity time.");
+        return Math.Max(1, (long)Math.Ceiling(remaining.TotalMilliseconds));
+    }
+
+    private long IndexTtlMilliseconds() =>
+        checked(2 * (long)Math.Ceiling(_timeout.TotalMilliseconds) + 10000);
+
+    private RedisKey RoomKey(string id) =>
+        _prefix + "room:" + Hash(id);
+    private RedisKey GlobalIndexKey => _prefix + "capacity:all";
+    private RedisKey CreatorIndexKey(string? creatorId) =>
+        _prefix + "capacity:creator:" + Hash(creatorId ?? "untracked");
+
+    private static string Prefix(string? name)
+    {
+        name ??= "rooms";
+        if (name.Length is < 1 or > 48 ||
+            name.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-'))
+            throw new ArgumentException("Invalid Redis lobby key namespace.",
+                nameof(name));
+        return "shirokuro:lobby:{" + name + "}:v2:";
+    }
+
+    private static string Hash(string id)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(id);
+        return Convert.ToHexStringLower(
+            SHA256.HashData(Encoding.UTF8.GetBytes(id)));
     }
 }
