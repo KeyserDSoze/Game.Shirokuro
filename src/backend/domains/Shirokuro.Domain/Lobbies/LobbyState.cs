@@ -26,6 +26,34 @@ public sealed class LobbyState
         return new LobbyState(definition, 0, Array.Empty<LobbyParticipant>());
     }
 
+    /// <summary>
+    /// Rehydrates only a validated immutable room snapshot from trusted
+    /// infrastructure storage; it is never exposed as an HTTP mutation.
+    /// </summary>
+    public static LobbyState Restore(
+        LobbyDefinition definition, long revision,
+        IEnumerable<LobbyParticipant> participants)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentNullException.ThrowIfNull(participants);
+        if (revision < 0)
+            throw new ArgumentOutOfRangeException(nameof(revision));
+
+        var members = participants.ToArray();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var member in members)
+        {
+            if (member is null ||
+                !seen.Add(LobbyDefinition.RequireId(member.PlayerId, nameof(participants))) ||
+                !definition.AllowsTeam(member.TeamId) ||
+                (member.HeroId is not null && !definition.AllowsHero(member.HeroId)))
+                throw new ArgumentException("Invalid persisted participant.", nameof(participants));
+        }
+        if (members.Length > 0 && revision < members.Length)
+            throw new ArgumentException("Invalid persisted revision.", nameof(revision));
+        return new LobbyState(definition, revision, members);
+    }
+
     public LobbyState Join(string trustedPlayerId, string teamId, long expectedRevision)
     {
         CheckRevision(expectedRevision);

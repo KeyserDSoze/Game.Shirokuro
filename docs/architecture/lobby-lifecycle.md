@@ -129,4 +129,35 @@ key storage/rotation, global rate limiting, durable accounts, cross-identity abu
 cross-instance reconnect and operational metrics/privacy policy.
 Do not deploy publicly as a distributed or production-ready multiplayer
 service until these are designed, built and tested.
+## Redis atomic lobby snapshot foundation (#34)
 
+The API project includes `RedisLobbySnapshotCodec` and
+`RedisLobbySnapshotStore` as a **not-yet-wired infrastructure layer**.
+A versioned snapshot retains the trusted invite, team/hero definition,
+immutable roster, revision, original creator and last authorized activity.
+Decoding revalidates all domain invariants. Redis keys include a SHA-256
+hash of the opaque invite rather than revealing invite codes as key names.
+
+`CreateAsync` uses Redis `SET NX` with the remaining inactivity TTL.
+`CompareExchangeAsync` uses a single-key Lua transaction to compare the
+**full previous snapshot**, not only the revision, before changing content
+and TTL. A roster revision may be unchanged during a valid reconnect,
+so two concurrent heartbeat/refresh operations must still conflict.
+`DeleteIfCurrentAsync` similarly refuses to delete a newer snapshot.
+Read-only `ReadAsync` never extends the TTL, and stale snapshots are
+rejected even if Redis has not physically deleted the key yet. Redis
+also removes truly abandoned keys via its own TTL without a worker.
+
+The GitHub backend CI starts an isolated local Redis service and runs
+xUnit integration with **two independent Redis clients**, including
+concurrent CAS race, stale delete, same-revision heartbeat, logical
+expiry and physical Redis TTL tests. The local CI instance is deliberately
+not a production TLS deployment. Production Redis TLS/network/secret
+requirements from #33 continue to apply.
+
+**Important boundary:** production HTTP endpoints, quota enforcement,
+the coordinator, SignalR membership reads and expiry workers still
+use `InMemoryLobbyCoordinator`. This primitive is not a completed
+multi-node lobby architecture. Integrating all mutations and read
+authorization atomically, as well as global room/creator caps and cleanup,
+is still required in #21. No request may expose a raw Redis snapshot.

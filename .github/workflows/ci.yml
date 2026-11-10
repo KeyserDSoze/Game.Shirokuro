@@ -11,6 +11,16 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -19,6 +29,8 @@ jobs:
       - run: dotnet restore Shirokuro.slnx
       - run: dotnet build Shirokuro.slnx -c Release --no-restore
       - run: dotnet test Shirokuro.slnx -c Release --no-build
+        env:
+          SHIROKURO_TEST_REDIS: localhost:6379
 
   frontend:
     runs-on: ubuntu-latest
