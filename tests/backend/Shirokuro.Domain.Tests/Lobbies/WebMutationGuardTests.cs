@@ -30,8 +30,11 @@ public sealed class WebMutationGuardTests
     private static HttpClient Client(WebApplicationFactory<Program> server,
         string? cookie = null)
     {
+        var env = server.Services.GetRequiredService<IHostEnvironment>().EnvironmentName;
         var client = server.CreateClient(new WebApplicationFactoryClientOptions
         {
+            BaseAddress = new Uri(env == "Development"
+                ? "http://localhost" : "https://localhost"),
             AllowAutoRedirect = false,
             HandleCookies = false
         });

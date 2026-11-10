@@ -64,8 +64,13 @@ These guarantees are **per process**. A restart loses the registry and
 invalidates previous guests (safe but not seamless). The store and
 Data Protection keys are not yet shared across instances; cross-node
 revocation, durable identity, recovery, anti-abuse and verified accounts
-remain in #21. Use HTTPS and persistent/shared Data Protection before
-production; proxies must reliably set scheme and host.
+remain in #21. With #31, non-Development HTTP is denied for all API and SignalR
+routes (403 without redirect). Trusted proxies can report HTTPS only
+through the #29 allowlisted peer mechanism; direct clients cannot grant
+themselves HTTPS with `X-Forwarded-Proto`. A bounded 30-day HSTS header
+is emitted on HTTPS responses outside Development. Use actual TLS at
+the edge and persistent/shared Data Protection before production;
+proxies must reliably set scheme and host.
 
 Session issuance by itself does not grant admission. #20 now exposes
 invitation-based room creation/join, and the #18 HTTP roster and SignalR

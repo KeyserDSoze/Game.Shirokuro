@@ -15,6 +15,14 @@ var builder = WebApplication.CreateBuilder(args);
 // Ingress forwarding stays disabled unless exact trusted proxy IPs are configured.
 TrustedProxyForwarding.Configure(builder.Services, builder.Configuration);
 builder.Services.AddIngressHostPolicy();
+// A bounded HSTS policy for HTTPS-only non-Development ingress. Do not
+// include arbitrary subdomains or request preload before edge TLS is verified.
+builder.Services.AddHsts(options =>
+{
+    options.MaxAge = TimeSpan.FromDays(30);
+    options.IncludeSubDomains = false;
+    options.Preload = false;
+});
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<GuestSessionRegistry>();
@@ -120,6 +128,25 @@ app.Use(async (context, next) =>
     }
     await next(context);
 });
+
+// Fail closed on plaintext HTTP outside Development. Trust proxy-reported
+// scheme only after ForwardedHeadersMiddleware has authenticated the TCP
+// peer via Security:KnownProxies (#29). No automatic 30x redirects for APIs,
+// authenticated cookies or SignalR negotiation.
+if (!app.Environment.IsDevelopment())
+{
+    app.Use(async (context, next) =>
+    {
+        if (!context.Request.IsHttps)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+        await next(context);
+    });
+    app.UseHsts();
+}
 
 if (app.Environment.IsDevelopment())
 {

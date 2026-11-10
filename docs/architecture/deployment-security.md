@@ -50,8 +50,29 @@ actual proxy routing. In Development the Host allowlist restriction is
 disabled to preserve Vite/localhost; cookie writes still require the
 loopback/Vite Origin checks of #28.
 
-TLS/HTTPS termination and ingress network restrictions are still a deployment
-responsibility; this middleware does **not** automatically provision TLS.
+## HTTPS-only API ingress (issue #31)
+
+Outside `Development`, **every** HTTP request, including health, public
+preview, session reads/writes, lobby actions and SignalR negotiation,
+must arrive with an HTTPS request scheme. Plain HTTP is rejected with
+`403 Forbidden` and `Cache-Control: no-store`, **without a redirect** that
+could interfere with authenticated API clients. HTTPS responses use HSTS
+(`max-age=2592000`, 30 days), with neither `includeSubDomains` nor
+`preload` implicitly enabled. Local `Development` HTTP and Vite are
+unchanged, and HSTS is not emitted in Development.
+
+For TLS-terminating reverse proxies, forward the external `https` scheme
+in `X-Forwarded-Proto` **only from the explicitly configured proxy peer**
+(`Security:KnownProxies`, #29). Incoming HTTP with an arbitrary
+`X-Forwarded-Proto: https` is not trusted when the TCP peer is unknown:
+the API still returns 403. Hosts remain independently allowlisted (#30)
+and `X-Forwarded-Host` stays ignored. The proxy must strip incoming
+client-supplied forwarding headers and set its own before relaying.
+
+**TLS termination, certificates, port exposure and the ingress firewall
+remain deployment-operator responsibilities.** This guard checks the
+trusted effective request scheme; it does not open a TLS listener,
+provision a certificate or independently verify edge TLS security.
 
 ## Trusted reverse proxy (issue #29)
 
@@ -102,7 +123,11 @@ Staging and Development. It checks unconfigured fail-closed behavior;
 configured HTTPS issuance, lobby mutation and logout; preservation of
 cookies/roster after rejected writes; malformed and spoofed origins;
 host and forwarded-header spoof attempts; and the local Vite flow.
-The Playwright local-browser workflows remain unchanged.
+`HttpsIngressTests` verifies plaintext rejection across route types,
+valid direct and trusted-proxy HTTPS, cookie/lobby protection after HTTP
+writes, HSTS, ignored `X-Forwarded-Proto` from unknown peers and
+unchanged local Development HTTP behavior. The Playwright local-browser
+workflows remain unchanged.
 
 This does not solve shared Data Protection keys, edge TLS/network validation,
 distributed rate limiting, session persistence or durable player accounts:

@@ -115,6 +115,7 @@ public sealed class IngressHostPolicyTests
     {
         var client = server.CreateClient(new WebApplicationFactoryClientOptions
         {
+            BaseAddress = new Uri("https://localhost"),
             AllowAutoRedirect = false,
             HandleCookies = false
         });
