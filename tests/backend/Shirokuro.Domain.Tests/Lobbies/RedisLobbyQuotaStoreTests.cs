@@ -1,4 +1,6 @@
 using System.Text;
+using System.Security.Cryptography;
+using System.Text.Json.Nodes;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Domain.Lobbies;
@@ -208,6 +210,61 @@ public sealed class RedisLobbyQuotaStoreTests
                 "guest-alice", clock.GetUtcNow());
             Assert.True(await two.CreateBoundedAsync(newRoom, 1, 1));
         }
+    }
+
+    [Fact]
+    public async Task MissingIndexedCreatorEntryCannotAuthorizeWritesOrDeletes()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "corruption-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var id = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(id, "guest-alice", clock.GetUtcNow()), 2, 1));
+
+            var rawRead = (await two.ReadAsync(id))!;
+            var redisKeys = a.GetServer(a.GetEndPoints().First())
+                .Keys(pattern: "shirokuro:lobby:{" + ns + "}:v2:*")
+                .Select(key => key.ToString()).ToArray();
+            Assert.NotEmpty(redisKeys);
+            Assert.All(redisKeys, key =>
+            {
+                Assert.DoesNotContain(id, key, StringComparison.Ordinal);
+                Assert.DoesNotContain("guest-alice", key, StringComparison.Ordinal);
+                Assert.Contains("{" + ns + "}", key, StringComparison.Ordinal);
+            });
+
+            var creatorHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes("guest-alice")));
+            var keyName = "shirokuro:lobby:{" + ns +
+                "}:v2:capacity:creator:" + creatorHash;
+            Assert.True(await a.GetDatabase().KeyDeleteAsync(keyName));
+
+            clock.Advance(TimeSpan.FromSeconds(1));
+            Assert.False(await two.CompareExchangeAsync(rawRead,
+                rawRead.Snapshot with { LastActivityUtc = clock.GetUtcNow() }));
+            Assert.False(await one.DeleteIfCurrentAsync(rawRead));
+            Assert.NotNull(await two.ReadAsync(id));
+        }
+    }
+
+    [Fact]
+    public void V2SnapshotsRequireQuotaTrackingMetadata()
+    {
+        var room = Room("room-required-metadata", "guest-alice",
+            DateTimeOffset.UtcNow);
+        var json = JsonNode.Parse(RedisLobbySnapshotCodec.Encode(room))!.AsObject();
+        Assert.True(json.Remove("QuotaTracked"));
+        Assert.Throws<InvalidDataException>(() =>
+            RedisLobbySnapshotCodec.Decode(
+                Encoding.UTF8.GetBytes(json.ToJsonString()),
+                room.State.Definition.LobbyId));
     }
 
     [Fact]

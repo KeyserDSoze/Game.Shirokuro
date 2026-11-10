@@ -21,7 +21,8 @@ public static class RedisLobbySnapshotCodec
     private sealed record Payload(
         int Version, string LobbyId, string[] TeamIds, string[] HeroIds,
         long Revision, LobbyParticipant[] Participants,
-        string? CreatorId, long LastActivityUtcTicks, bool QuotaTracked);
+        string? CreatorId, long LastActivityUtcTicks,
+        [property: JsonRequired] bool QuotaTracked);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
