@@ -204,7 +204,13 @@ bypassing quotas.
 xUnit integration on real Redis in CI tests two independently connected
 clients, 48 concurrent creates per identity, both capacity limits,
 creator departure, stale delete, heartbeat, physical TTL and recovery
-without a worker. **Still not connected to live HTTP/SignalR:** the
+without a worker. Version-2 snapshots require explicit quota metadata,
+and loss of a quota index causes tracked updates/deletes to fail closed.
+This protects against accidental index corruption; operational Redis
+integrity and network access control remain necessary. 
+[CI #42747294057](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/42747294057)
+passed 294 xUnit, 106 Vitest, 24 Playwright and 35 Python checks.
+**Still not connected to live HTTP/SignalR:** the
 distributed lobby coordinator must use only bounded creation and
 authorized CAS for every operation, then migrate logout/expiry cleanup
 and member-scoped reads together (#21).
