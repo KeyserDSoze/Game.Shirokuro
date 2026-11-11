@@ -121,11 +121,28 @@ public sealed class GuestLogoutRecoveryTests
         }
     }
 
+    private sealed class TestFence : IGuestRevocationFence
+    {
+        public bool Fail { get; set; }
+        public int Calls { get; private set; }
+
+        public Task FenceGuestAsync(string id, CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            if (Fail)
+                throw new IOException("sensitive Redis fence exception");
+            Assert.StartsWith("guest-", id, StringComparison.Ordinal);
+            Calls++;
+            return Task.CompletedTask;
+        }
+    }
+
     private static (WebApplicationFactory<Program> Server, TestIndex Index,
-        ToggleLobby Lobby) Setup()
+        ToggleLobby Lobby, TestFence Fence) Setup()
     {
         var clock = TimeProvider.System;
         var index = new TestIndex(clock);
+        var fence = new TestFence();
         var coordinator = new InMemoryLobbyCoordinator(clock);
         var reader = new LobbyRosterReader(coordinator);
         var commands = new GuestLobbyCommands(coordinator, reader);
@@ -148,11 +165,13 @@ public sealed class GuestLogoutRecoveryTests
                 services.AddSingleton<IGuestExpiryIndex>(index);
                 services.RemoveAll<IAsyncGuestLobby>();
                 services.AddSingleton<IAsyncGuestLobby>(lobby);
+                services.RemoveAll<IGuestRevocationFence>();
+                services.AddSingleton<IGuestRevocationFence>(fence);
                 services.RemoveAll<InMemoryLobbyCoordinator>();
                 services.AddSingleton(coordinator);
             });
         });
-        return (server, index, lobby);
+        return (server, index, lobby, fence);
     }
 
     private static HttpClient Client(WebApplicationFactory<Program> server,
@@ -209,7 +228,7 @@ public sealed class GuestLogoutRecoveryTests
     [Fact]
     public async Task RevokedGuestOutageReturns503AndOtherNodeWorkerCleansDueWork()
     {
-        var (server, index, lobby) = Setup();
+        var (server, index, lobby, fence) = Setup();
         using (server)
         using (var visitor = Client(server))
         {
@@ -227,6 +246,7 @@ public sealed class GuestLogoutRecoveryTests
                     Assert.True(response.Headers.CacheControl?.NoStore == true);
                     Assert.DoesNotContain(alice, await response.Content.ReadAsStringAsync());
                 }
+                Assert.Equal(1, fence.Calls);
                 Assert.Equal(1, index.RevokedSchedules);
                 Assert.Equal(1, index.DueCount);
                 Assert.Equal(1, lobby.CleanupCalls);
@@ -241,7 +261,7 @@ public sealed class GuestLogoutRecoveryTests
                 var worker = new GuestSessionExpiryWorker(
                     server.Services.GetRequiredService<GuestSessionRegistry>(),
                     server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
-                    TimeProvider.System, lobby, index);
+                    TimeProvider.System, lobby, index, fence);
                 Assert.Equal(1, await worker.SweepOnceAsync());
                 Assert.Equal(0, await worker.SweepOnceAsync());
                 Assert.Equal(0, index.DueCount);
@@ -254,7 +274,7 @@ public sealed class GuestLogoutRecoveryTests
     [Fact]
     public async Task QueueOutageDoesNotPreventDirectLogoutCleanup()
     {
-        var (server, index, lobby) = Setup();
+        var (server, index, lobby, fence) = Setup();
         using (server)
         using (var visitor = Client(server))
         {
@@ -278,7 +298,7 @@ public sealed class GuestLogoutRecoveryTests
     [Fact]
     public async Task QueueAndLobbyOutageNeverReportSuccessfulCleanup()
     {
-        var (server, index, lobby) = Setup();
+        var (server, index, lobby, fence) = Setup();
         using (server)
         using (var visitor = Client(server))
         {
@@ -301,9 +321,52 @@ public sealed class GuestLogoutRecoveryTests
     }
 
     [Fact]
+    public async Task RedisFenceOutageStillRevokesAndRetriesWithoutAcknowledgingCleanup()
+    {
+        var (server, index, lobby, fence) = Setup();
+        using (server)
+        using (var visitor = Client(server))
+        {
+            var (_, cookie) = await Issue(visitor);
+            using var player = Client(server, cookie);
+            await Room(player);
+
+            // Revocation succeeds but the fence write fails. Even if direct
+            // cleanup succeeds, the API must NOT claim a fully fenced logout,
+            // and the due item must survive to retry fencing on another node.
+            fence.Fail = true;
+            using (var response = await Logout(player))
+            {
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+                Assert.Contains("expires=", Assert.Single(response.Headers.GetValues("Set-Cookie")),
+                    StringComparison.OrdinalIgnoreCase);
+                Assert.True(response.Headers.CacheControl?.NoStore == true);
+            }
+            Assert.Equal(0, fence.Calls);
+            Assert.Equal(1, lobby.CleanupCalls);
+            Assert.Equal(1, index.DueCount);
+            using (var staleCookie = await player.GetAsync("/api/sessions/me"))
+                Assert.Equal(HttpStatusCode.Unauthorized, staleCookie.StatusCode);
+
+            // Failing the fence in the worker must retain work without ack.
+            var worker = new GuestSessionExpiryWorker(
+                server.Services.GetRequiredService<GuestSessionRegistry>(),
+                server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
+                TimeProvider.System, lobby, index, fence);
+            await Assert.ThrowsAsync<IOException>(() => worker.SweepOnceAsync());
+            Assert.Equal(1, index.DueCount);
+
+            fence.Fail = false;
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            Assert.Equal(0, index.DueCount);
+            Assert.Equal(1, fence.Calls);
+        }
+    }
+
+    [Fact]
     public async Task FailedAckStillReturnsSuccessfulLogoutAndIsIdempotentlyRetried()
     {
-        var (server, index, lobby) = Setup();
+        var (server, index, lobby, fence) = Setup();
         using (server)
         using (var visitor = Client(server))
         {
@@ -321,7 +384,7 @@ public sealed class GuestLogoutRecoveryTests
             var worker = new GuestSessionExpiryWorker(
                 server.Services.GetRequiredService<GuestSessionRegistry>(),
                 server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
-                TimeProvider.System, lobby, index);
+                TimeProvider.System, lobby, index, fence);
             Assert.Equal(0, await worker.SweepOnceAsync());
             Assert.Equal(0, index.DueCount);
             Assert.True(index.Acknowledgements > 0);

@@ -101,7 +101,7 @@ public sealed class RedisGuestExpiryIndexTests
 
             var cleanup = new GuestSessionExpiryWorker(
                 new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
-                clock, runtime, workerIndex);
+                clock, runtime, workerIndex, store);
             clock.Advance(TimeSpan.FromMinutes(4));
             Assert.Equal(0, await cleanup.SweepOnceAsync());
             Assert.Equal(2, (await store.ReadAsync(shared.LobbyId))!.Snapshot
@@ -116,6 +116,8 @@ public sealed class RedisGuestExpiryIndexTests
             Assert.Equal(3, after.State.Revision);
             Assert.Equal(bob, Assert.Single(after.State.Participants).PlayerId);
             Assert.Equal(initial, after.LastActivityUtc); // Admin cleanup doesn't renew TTL.
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                runtime.JoinAsync(shared.LobbyId, alice, "white", null));
         }
         finally
         {

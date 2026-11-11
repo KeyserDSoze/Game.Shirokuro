@@ -56,6 +56,8 @@ else
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));
     builder.Services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
+    builder.Services.AddSingleton<IGuestRevocationFence>(
+        provider => provider.GetRequiredService<RedisLobbySnapshotStore>());
     builder.Services.AddSingleton<IReadinessKeyVerifier, ReadinessKeyVerifier>();
     builder.Services.AddSingleton<IDeploymentReadiness, RedisDeploymentReadiness>();
     builder.Services.AddSingleton<IGuestMutationLimiter>(sp =>
@@ -375,11 +377,27 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     if (!await registry.RevokeAsync(context.User, context.RequestAborted))
         return Results.Forbid();
 
-    // This ticket is NOW invalid across nodes. Queue immediate durable cleanup
-    // only AFTER successful revocation: scheduling first could expel a still-
-    // authorized player if revocation later failed.
+    // The shared ticket is NOW invalid across nodes. Install the mutation
+    // fence after revocation but before cleanup: an already-authenticated
+    // in-flight request cannot commit after the Redis fence is installed.
+    // Failures cannot restore the revoked cookie.
     var playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User)!;
     var lobby = context.RequestServices.GetRequiredService<IAsyncGuestLobby>();
+    var fenceInstalled = environment.IsDevelopment();
+    if (!environment.IsDevelopment())
+    {
+        try
+        {
+            await context.RequestServices.GetRequiredService<IGuestRevocationFence>()
+                .FenceGuestAsync(playerId, context.RequestAborted);
+            fenceInstalled = true;
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            // Continue with immediate durable cleanup and direct removal.
+            // A 503 below must disclose no Redis or identity details.
+        }
+    }
     IGuestExpiryIndex? expiryIndex = null;
     string? queuedMember = null;
     if (!environment.IsDevelopment())
@@ -415,7 +433,7 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     // that cannot be used to retry logout.
     await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
 
-    if (!cleanupCompleted)
+    if (!cleanupCompleted || !fenceInstalled)
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
 
     // Best-effort ack prevents a needless later scan when direct cleanup

@@ -223,12 +223,18 @@ public sealed class RedisLobbyHttpIntegrationTests
                 };
                 Assert.Equal(sharedRoom, (await hubOnB.GetRoster(sharedRoom)).LobbyId);
 
-                // Logout on B revokes A's session in shared cache, then finds
-                // and removes Alice from all Redis rooms without renewing TTL.
+                // Logout on B revokes A's session in shared cache, fences
+                // future lobby CAS scripts and then removes Alice's rooms
+                // without renewing survivor TTLs.
                 using (var logout = Write(HttpMethod.Delete, "/api/sessions/guest"))
                 using (var signedOut = await aliceB.SendAsync(logout))
                     Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
 
+                // Even an already-authenticated node cannot recreate Alice's
+                // membership after the cross-node revocation fence.
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                    serverA.Services.GetRequiredService<IAsyncGuestLobby>()
+                        .JoinAsync(sharedRoom, aliceId, "white", null));
                 Assert.Equal("Lobby unavailable.",
                     (await Assert.ThrowsAsync<HubException>(
                         () => hubOnB.GetRoster(sharedRoom))).Message);

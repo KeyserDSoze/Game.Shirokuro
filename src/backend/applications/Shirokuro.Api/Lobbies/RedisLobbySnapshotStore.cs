@@ -13,7 +13,7 @@ namespace Shirokuro.Api.Lobbies;
 /// </summary>
 public sealed class RedisLobbySnapshotStore(
     IDatabase database, TimeProvider clock, TimeSpan? inactivityTimeout = null,
-    string? namespaceName = null)
+    string? namespaceName = null) : IGuestRevocationFence
 {
     private readonly TimeSpan _timeout = inactivityTimeout ??
         TimeSpan.FromMinutes(30);
@@ -24,6 +24,11 @@ public sealed class RedisLobbySnapshotStore(
     // Compare the complete stored snapshot, including its activity timestamp:
     // unchanged-revision authorized heartbeats must still detect conflicts.
     private const string CompareExchangeScript = """
+        -- KEYS[4] shares the exact cluster hash tag with the room and quota.
+        -- Fencing and CAS occur within one atomic Lua operation.
+        if ARGV[6] == '1' and redis.call('EXISTS', KEYS[4]) == 1 then
+            return -1
+        end
         local current = redis.call('GET', KEYS[1])
         if not current or current ~= ARGV[1] then return 0 end
 
@@ -46,6 +51,9 @@ public sealed class RedisLobbySnapshotStore(
         """;
 
     private const string DeleteIfCurrentScript = """
+        if ARGV[3] == '1' and redis.call('EXISTS', KEYS[4]) == 1 then
+            return -1
+        end
         local current = redis.call('GET', KEYS[1])
         if not current or current ~= ARGV[1] then return 0 end
         if ARGV[2] == '1' then
@@ -66,6 +74,7 @@ public sealed class RedisLobbySnapshotStore(
     // execution, even when N independent API processes create concurrently.
     // Scores use Redis's own clock and PEXPIRETIME, not per-node clocks.
     private const string BoundedCreateScript = """
+        if redis.call('EXISTS', KEYS[4]) == 1 then return -3 end
         if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 
         local nowparts = redis.call('TIME')
@@ -91,6 +100,30 @@ public sealed class RedisLobbySnapshotStore(
         """;
 
     public sealed record Stored(LobbySnapshot Snapshot, byte[] RawBytes);
+
+    // Guest cookie TTL is 8h. Keep a hashed actor tombstone no longer than
+    // that duration after revocation; a new guest has a different random ID.
+    public static readonly TimeSpan RevocationFenceTtl = TimeSpan.FromHours(8);
+
+    /// <summary>
+    /// After revocation (or natural session expiry), mark this server-issued
+    /// actor as permanently ineligible for lobby mutations while a stale
+    /// request may still be in flight. A failed Redis write must propagate:
+    /// availability is not permission. The hash slot is shared with all room
+    /// create/CAS/delete scripts, including Redis Cluster deployments.
+    /// </summary>
+    public async Task FenceGuestAsync(
+        string trustedGuestId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!ValidServerGuestId(trustedGuestId))
+            throw new ArgumentException("Invalid trusted guest identity.",
+                nameof(trustedGuestId));
+
+        // No raw identity/session token in either key or value.
+        await database.StringSetAsync(RevokedGuestKey(trustedGuestId),
+            "1", expiry: RevocationFenceTtl, when: When.NotExists);
+    }
 
     /// <summary>Unindexed low-level create retained for #34 compatibility.</summary>
     public async Task<bool> CreateAsync(LobbySnapshot snapshot)
@@ -126,9 +159,11 @@ public sealed class RedisLobbySnapshotStore(
         var result = (long)await database.ScriptEvaluateAsync(
             BoundedCreateScript,
             [RoomKey(bounded.State.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(bounded.CreatorId!)],
+             CreatorIndexKey(bounded.CreatorId!), RevokedGuestKey(bounded.CreatorId!)],
             [RedisLobbySnapshotCodec.Encode(bounded), ttl,
              maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()]);
+        if (result == -3)
+            throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is -1 or -2)
             throw new LobbyCapacityException();
         if (result is not (0 or 1))
@@ -156,7 +191,8 @@ public sealed class RedisLobbySnapshotStore(
     /// Save only if the complete previously-read value matches. If bounded,
     /// update the room plus both quota-index deadlines in the same script.
     /// </summary>
-    public async Task<bool> CompareExchangeAsync(Stored expected, LobbySnapshot updated)
+    public async Task<bool> CompareExchangeAsync(
+        Stored expected, LobbySnapshot updated, string? trustedActor = null)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(updated);
@@ -186,25 +222,38 @@ public sealed class RedisLobbySnapshotStore(
         if (ttl <= TimeSpan.Zero)
             return false;
         var bytes = RedisLobbySnapshotCodec.Encode(updated);
-        var result = await database.ScriptEvaluateAsync(
+        var result = (long)await database.ScriptEvaluateAsync(
             CompareExchangeScript,
             [RoomKey(newState.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(updated.CreatorId)],
+             CreatorIndexKey(updated.CreatorId),
+             RevokedGuestKey(trustedActor ?? "administrative")],
             [expected.RawBytes, bytes, DeadlineMilliseconds(updated),
-             IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0]);
-        return (long)result == 1;
+             IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0,
+             trustedActor is null ? 0 : 1]);
+        if (result == -1)
+            throw new UnauthorizedAccessException("Lobby unavailable.");
+        if (result is not (0 or 1))
+            throw new InvalidDataException("Invalid Redis lobby result.");
+        return result == 1;
     }
 
-    public async Task<bool> DeleteIfCurrentAsync(Stored expected)
+    public async Task<bool> DeleteIfCurrentAsync(
+        Stored expected, string? trustedActor = null)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ValidateExpected(expected);
-        var result = await database.ScriptEvaluateAsync(
+        var result = (long)await database.ScriptEvaluateAsync(
             DeleteIfCurrentScript,
             [RoomKey(expected.Snapshot.State.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(expected.Snapshot.CreatorId)],
-            [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0]);
-        return (long)result == 1;
+             CreatorIndexKey(expected.Snapshot.CreatorId),
+             RevokedGuestKey(trustedActor ?? "administrative")],
+            [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0,
+             trustedActor is null ? 0 : 1]);
+        if (result == -1)
+            throw new UnauthorizedAccessException("Lobby unavailable.");
+        if (result is not (0 or 1))
+            throw new InvalidDataException("Invalid Redis lobby result.");
+        return result == 1;
     }
 
     private static void ValidateExpected(Stored expected)
@@ -270,6 +319,16 @@ public sealed class RedisLobbySnapshotStore(
     private RedisKey GlobalIndexKey => _prefix + "capacity:all";
     private RedisKey CreatorIndexKey(string? creatorId) =>
         _prefix + "capacity:creator:" + Hash(creatorId ?? "untracked");
+    private RedisKey RevokedGuestKey(string trustedGuestId) =>
+        _prefix + "revoked:" + Hash(trustedGuestId);
+
+    private static bool ValidServerGuestId(string? value)
+    {
+        if (value is not { Length: 38 } ||
+            !value.StartsWith("guest-", StringComparison.Ordinal))
+            return false;
+        return value.AsSpan(6).IndexOfAnyExcept("0123456789abcdef") < 0;
+    }
 
     private static string Prefix(string? name)
     {

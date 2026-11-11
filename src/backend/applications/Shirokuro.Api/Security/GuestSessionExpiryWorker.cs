@@ -10,7 +10,8 @@ namespace Shirokuro.Api.Security;
 public sealed class GuestSessionExpiryWorker(
     GuestSessionRegistry registry, InMemoryLobbyCoordinator coordinator,
     TimeProvider clock, IAsyncGuestLobby? lobby = null,
-    IGuestExpiryIndex? expiryIndex = null) : BackgroundService
+    IGuestExpiryIndex? expiryIndex = null,
+    IGuestRevocationFence? revocationFence = null) : BackgroundService
 {
     public static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(5);
 
@@ -63,6 +64,13 @@ public sealed class GuestSessionExpiryWorker(
                 foreach (var item in await expiryIndex.ReadDueAsync(cancellationToken))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    // If the guest expired or revoked while a request was
+                    // in flight, fence its future room mutations atomically
+                    // with the eventual lobby CAS cleanup. Never ack on
+                    // fence failure; other nodes can retry the durable item.
+                    if (revocationFence is not null)
+                        await revocationFence.FenceGuestAsync(
+                            item.PlayerId, cancellationToken);
                     removed += await lobby.RemovePlayerFromAllRoomsAsync(
                         item.PlayerId, cancellationToken);
                     await expiryIndex.AcknowledgeAsync(

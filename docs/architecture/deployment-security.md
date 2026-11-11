@@ -387,3 +387,49 @@ between the shared session cache and Redis room/index keys; logout and
 another already-authenticated in-flight mutation can still race. Hard
 atomic cross-key fencing, real Redis TLS/failover, signed-in accounts and
 multi-IP/Sybil defenses remain #21.
+
+## Atomic guest revocation fences for lobby mutations (#42)
+
+The API verifies the guest session cookie against the shared Redis session
+registry before entering a lobby handler. An **already-authenticated in-flight
+request** can have read a valid room snapshot before a second node revokes the
+cookie. Rechecking the cookie only at the HTTP handler is not enough to stop
+the old request from writing the snapshot after logout.
+
+In non-Development, the server now uses a bounded *mutation fence* in the
+same Redis Cluster hash slot as the authoritative lobby snapshot:
+`shirokuro:lobby:{rooms}:v2:revoked:<SHA256(server-owned-guest-ID)>`.
+The key stores only `1`, expires no later than 8 hours after installation,
+and uses `SET NX`, so duplicate fence attempts do **not** slide its TTL.
+Neither player IDs, session tokens, IPs, cookie contents nor invite references
+are present in the fence key/value or in application logs.
+
+A logout that **successfully revokes** its guest session then installs the
+fence **before** scheduling due cleanup and removing lobby memberships.
+The expiry worker installs the same fence for the naturally expired session
+before acknowledging its encrypted Redis work item; failure retains that item
+for a later retry. A fence write failure during logout cannot restore the
+already-invalid cookie; even if direct room cleanup succeeds, the request
+responds **503** with the browser cookie cleared and a queued due cleanup
+item is left for worker retry if available.
+
+The **same Lua script** that performs each actor-owned room create, CAS,
+delete or read-heartbeat checks the fence key atomically:
+- create (including global/per-creator quota index writes);
+- join, choose hero, change team and leave;
+- member-only roster read's activity refresh (HTTP and SignalR).
+An actor with an installed fence gets the generic hidden-lobby denial, not
+an error mentioning a session or Redis. Other guests are not fenced.
+Administrative CAS cleanup omits the actor fence so a worker can still remove
+a revoked guest without changing survivor room TTLs. A concurrent write that
+completed **before** the fence is handled by cleanup. Writes attempted after
+the fence are rejected even if they hold an old complete Redis snapshot.
+
+**Limit of the guarantee:** the Redis guest ticket registry is maintained
+through a different `IDistributedCache` key space and is not atomically
+committed in the same Lua script as the lobby fence. A revocation can succeed
+but the fence write can fail; a two-dependency outage may defer cleanup to
+the natural 8h expiration. This implementation is a **lobby write barrier
+after successful fence installation**, not full cross-store atomic
+revocation, and does not certify TLS Redis cluster/Sentinel failover,
+observability exporter or durable accounts. Those stay open in #21.

@@ -58,7 +58,8 @@ public sealed class RedisGuestLobbyRuntime(
                 throw new LobbyCapacityException();
             var next = before.Join(trustedPlayerId, teamId, before.Revision);
             if (await store.CompareExchangeAsync(found,
-                found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) }))
+                found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
+                trustedPlayerId))
                 return Project(next);
             if (expectedRevision.HasValue)
                 throw new LobbyRevisionConflictException(expectedRevision.Value,
@@ -90,9 +91,10 @@ public sealed class RedisGuestLobbyRuntime(
         EnsureMember(found.Snapshot.State, trustedPlayerId);
         var next = found.Snapshot.State.Leave(trustedPlayerId, expectedRevision);
         var success = next.Participants.Count == 0
-            ? await store.DeleteIfCurrentAsync(found)
+            ? await store.DeleteIfCurrentAsync(found, trustedPlayerId)
             : await store.CompareExchangeAsync(found,
-                found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) });
+                found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
+                trustedPlayerId);
         if (!success)
             throw new LobbyRevisionConflictException(expectedRevision,
                 (await store.ReadAsync(roomId))?.Snapshot.State.Revision ?? expectedRevision);
@@ -109,7 +111,8 @@ public sealed class RedisGuestLobbyRuntime(
             var found = await Find(roomId);
             EnsureMember(found.Snapshot.State, trustedPlayerId);
             if (await store.CompareExchangeAsync(found,
-                found.Snapshot with { LastActivityUtc = NextActivity(found) }))
+                found.Snapshot with { LastActivityUtc = NextActivity(found) },
+                trustedPlayerId))
                 return Project(found.Snapshot.State);
         }
         throw new InvalidOperationException("Concurrent lobby reads exceeded retry budget.");
@@ -164,7 +167,8 @@ public sealed class RedisGuestLobbyRuntime(
         EnsureMember(found.Snapshot.State, actor);
         var next = mutation(found.Snapshot.State);
         if (!await store.CompareExchangeAsync(found,
-            found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) }))
+            found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
+            actor))
             throw new LobbyRevisionConflictException(revision,
                 (await store.ReadAsync(roomId))?.Snapshot.State.Revision ?? revision);
         return Project(next);
