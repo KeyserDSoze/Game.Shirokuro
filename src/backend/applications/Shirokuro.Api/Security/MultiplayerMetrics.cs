@@ -14,6 +14,7 @@ public static class MultiplayerMetrics
     public const string MeterVersion = "0.0.1";
     public const string MutationDecisionsName = "shirokuro.guest_mutation.decisions";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
+    public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string ExpirySweepsName = "shirokuro.guest_expiry.sweeps";
     public const string ExpiryMembershipsRemovedName = "shirokuro.guest_expiry.memberships_removed";
     public const string ExpiryUnreadableItemsName = "shirokuro.guest_expiry.unreadable_items";
@@ -25,6 +26,9 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> ReadinessProbes = Meter.CreateCounter<long>(
         ReadinessProbesName, unit: "{probe}",
         description: "Executed node-readiness probes, excluding cache hits.");
+    private static readonly Histogram<double> ReadinessDurationSeconds =
+        Meter.CreateHistogram<double>(ReadinessDurationSecondsName, unit: "s",
+            description: "Elapsed time of executed Redis/Data Protection readiness probes only.");
     private static readonly Counter<long> ExpirySweeps = Meter.CreateCounter<long>(
         ExpirySweepsName, unit: "{sweep}",
         description: "Guest-session expiry cleanup sweep outcomes.");
@@ -59,6 +63,39 @@ public static class MultiplayerMetrics
         ReadinessProbes.Add(1, new KeyValuePair<string, object?>(
             "outcome", ready ? "ready" : "unavailable"));
 
+    /// <summary>
+    /// Record one real Production readiness probe, not every HTTP waiter or
+    /// cached result. Stage is the bounded *phase* reached when a probe
+    /// failed, not a claim that one specific Redis connector caused it.
+    /// Stopwatch-monotonic seconds and closed tags prevent sensitive data
+    /// from becoming dimensions in external dashboards.
+    /// </summary>
+    public static void RecordReadinessDuration(
+        bool ready, ReadinessProbeStage stage, double seconds)
+    {
+        if (!double.IsFinite(seconds) || seconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(seconds));
+
+        if (ready != (stage == ReadinessProbeStage.Success))
+            throw new ArgumentException(
+                "Readiness result and technical stage must agree.", nameof(stage));
+
+        var stageName = stage switch
+        {
+            ReadinessProbeStage.Success => "ok",
+            ReadinessProbeStage.RedisWrite => "redis-write",
+            ReadinessProbeStage.SessionRead => "session-read",
+            ReadinessProbeStage.KeyRing => "key-ring",
+            ReadinessProbeStage.Timeout => "timeout",
+            _ => throw new ArgumentOutOfRangeException(nameof(stage))
+        };
+
+        ReadinessDurationSeconds.Record(seconds,
+            new KeyValuePair<string, object?>("outcome",
+                ready ? "ready" : "unavailable"),
+            new KeyValuePair<string, object?>("stage", stageName));
+    }
+
     // No tags: malformed or unreadable encrypted data is never an identity,
     // an exception label or a Redis key exposed to an exporter.
     public static void RecordUnreadableExpiryItem() =>
@@ -81,3 +118,13 @@ public static class MultiplayerMetrics
 }
 
 public enum MutationOutcome { Allowed, Limited, Unavailable }
+
+/// <summary>Finite technical readiness probe phase; never error text.</summary>
+public enum ReadinessProbeStage
+{
+    Success,
+    RedisWrite,
+    SessionRead,
+    KeyRing,
+    Timeout
+}

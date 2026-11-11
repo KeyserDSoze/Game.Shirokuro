@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
 using Shirokuro.Api.Security;
@@ -105,7 +106,11 @@ public sealed class RedisDeploymentReadiness(
 
     private async Task CompleteProbeAsync(TaskCompletionSource<bool> completion)
     {
+        // Stopwatch is monotonic and cannot be distorted by clock sync or
+        // a TimeProvider used to advance the 3-second cache in tests.
+        var startedAt = Stopwatch.GetTimestamp();
         bool ready;
+        var stage = ReadinessProbeStage.RedisWrite;
         using var timeout = new CancellationTokenSource(ProbeTimeout);
         try
         {
@@ -124,20 +129,26 @@ public sealed class RedisDeploymentReadiness(
             if (!await lobbyWrite)
                 throw new InvalidOperationException("Lobby probe write denied.");
 
+            stage = ReadinessProbeStage.SessionRead;
             var observed = await guestSessions.GetAsync(
                 CacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
             if (observed is null || !observed.AsSpan().SequenceEqual(ProbeValue))
                 throw new InvalidOperationException("Session probe write unreadable.");
 
             // The configured, shared encrypted key ring must be usable too.
+            stage = ReadinessProbeStage.KeyRing;
             keyVerifier.Verify();
             ready = true;
+            stage = ReadinessProbeStage.Success;
         }
         catch (Exception)
         {
             // Never disclose a Redis endpoint, password or key-ring path.
-            // Timeout and any dependency failure both mean not ready.
+            // Labels are bounded to phases; simultaneous Redis writes do not
+            // identify which connector failed. A timeout takes precedence.
             ready = false;
+            if (timeout.IsCancellationRequested)
+                stage = ReadinessProbeStage.Timeout;
         }
 
         lock (_stateGate)
@@ -149,6 +160,8 @@ public sealed class RedisDeploymentReadiness(
 
         // Count a real probe only once, regardless of HTTP fan-out/cancel.
         MultiplayerMetrics.RecordReadinessProbe(ready);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready, stage, Stopwatch.GetElapsedTime(startedAt).TotalSeconds);
         completion.TrySetResult(ready);
     }
 }
