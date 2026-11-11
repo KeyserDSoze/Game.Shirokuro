@@ -631,6 +631,11 @@ The CI recovery drill tests this contract with a TLS-only Redis server and
    `key-*.xml` files** does not validate old cookies, and that restoring
    old XML keys with an unrelated PFX cannot decrypt the older ciphertext.
 
+The two Production TLS test classes share a **serialized xUnit collection**:
+the independent Redis pause/resume test from #46 must not overlap the
+keyring backup/restore test, since both use the same ephemeral TLS Redis
+fixture. A failing external dependency cannot be silently ignored.
+
 All keys, PFX passwords and guest identities in this drill are freshly
 generated at runtime on the runner; the source directory is private to the
 test process, no key material is committed or uploaded, and temporary
