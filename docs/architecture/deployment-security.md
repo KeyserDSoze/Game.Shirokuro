@@ -433,3 +433,41 @@ the natural 8h expiration. This implementation is a **lobby write barrier
 after successful fence installation**, not full cross-store atomic
 revocation, and does not certify TLS Redis cluster/Sentinel failover,
 observability exporter or durable accounts. Those stay open in #21.
+
+## Actual Production Redis TLS transport contract in CI (#43)
+
+The standard backend job retains its independently tested Redis 7.4
+**plaintext fixture** for low-level Lua/CAS, quotas and expiry tests.
+A second, entirely ephemeral Redis 7.4 service on port **6380** now exercises
+the unmodified **Production** API dependency graph with **TLS-only** enabled
+(`--port 0 --tls-port 6380`). The test service is bound only to the CI
+runner's loopback interface and is not exposed outside the runner.
+
+Each CI run creates a fresh root CA and a server certificate with SAN
+`DNS:localhost,IP:127.0.0.1` using OpenSSL, explicitly verifies the
+certificate chain and hostname, and adds **only that temporary CA** to the
+runner's system trust store. No private key or certificate is committed,
+cached, sent to an artifact, or used outside CI. The container is configured
+not to require **client certificates**; that is intentional to test the
+server-authenticated TLS transport, not mTLS. No test callback overrides
+certificate validation and the backend keeps `ssl=true` with
+`sslHost=localhost`. Incorrect hostname certificates and attempts to speak
+unencrypted Redis to the TLS port must fail.
+
+The dedicated `RedisTlsProductionTests` suite starts **two independent
+Production TestServer API hosts**, with shared encrypted Data Protection
+keyring and **real** `IDistributedCache`, `IConnectionMultiplexer`,
+rate limiter, lobby snapshot/quotas, encrypted expiry index and revocation
+fence. It verifies both nodes' readiness, guest issuance on A and
+cross-node authentication on B, room creation/join/roster, logout on B,
+denial of replay on A/B, atomic lobby fencing after logout and preservation
+of an unaffected player's membership.
+
+This verifies TLS **transport and server authentication in CI**, not a
+real deployment. It does not validate cloud/cluster/Sentinel connection
+topologies, Redis ACL/password rotation, replication, TLS certificate
+rotation, HA/failover, firewall/ingress TLS termination, backup/restore,
+or that the deployment is using the same trust and security configuration.
+Those are still production acceptance criteria in #21. Never configure
+`abortConnect=false`, permissive certificate callbacks or local-memory
+fallback merely to make a broken deployment appear available.

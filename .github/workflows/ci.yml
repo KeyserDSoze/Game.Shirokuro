@@ -32,6 +32,82 @@ jobs:
         env:
           SHIROKURO_TEST_REDIS: localhost:6379
 
+      # This separate TLS-only fixture exercises the *actual* Production
+      # StackExchangeRedisCache and lobby multiplexer, not test DI fakes.
+      # CA, cert and keys are freshly generated on each CI runner, never
+      # stored in the repo or uploaded as artifacts.
+      - name: Start ephemeral certificate-validated TLS-only Redis
+        shell: bash
+        run: |
+          set -euo pipefail
+          certdir="$(mktemp -d /tmp/shirokuro-redis-tls-XXXXXX)"
+          echo "SHIROKURO_TLS_CERT_DIR=$certdir" >> "$GITHUB_ENV"
+
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -subj "/CN=Shirokuro Ephemeral CI Root" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout "$certdir/ca.key" -out "$certdir/ca.crt"
+          openssl req -new -newkey rsa:2048 -nodes -sha256 \
+            -subj "/CN=localhost" \
+            -keyout "$certdir/server.key" -out "$certdir/server.csr"
+          cat > "$certdir/server.ext" <<'CERT_EXT'
+          basicConstraints=critical,CA:FALSE
+          keyUsage=digitalSignature,keyEncipherment
+          extendedKeyUsage=serverAuth
+          subjectAltName=DNS:localhost,IP:127.0.0.1
+          CERT_EXT
+          openssl x509 -req -in "$certdir/server.csr" \
+            -CA "$certdir/ca.crt" -CAkey "$certdir/ca.key" -CAcreateserial \
+            -out "$certdir/server.crt" -days 1 -sha256 \
+            -extfile "$certdir/server.ext"
+          openssl verify -CAfile "$certdir/ca.crt" \
+            -verify_hostname localhost "$certdir/server.crt"
+
+          # Trust the CA on the runner, not by disabling TLS verification
+          # inside Shirokuro or a test-only certificate callback.
+          sudo cp "$certdir/ca.crt" \
+            /usr/local/share/ca-certificates/shirokuro-ci-redis.crt
+          sudo update-ca-certificates
+          # The rootless Redis image must read the ephemeral test key.
+          chmod 755 "$certdir"
+          chmod 644 "$certdir/ca.crt" "$certdir/server.crt" "$certdir/server.key"
+          docker run -d --name shirokuro-ci-redis-tls \
+            -p 127.0.0.1:6380:6380 \
+            -v "$certdir:/certs:ro" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6380 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no
+
+          for i in $(seq 1 50); do
+            if docker exec shirokuro-ci-redis-tls redis-cli \
+                --tls --cacert /certs/ca.crt -h localhost -p 6380 ping \
+                2>/dev/null | grep -qx PONG; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "TLS Redis fixture could not become ready."
+          exit 1
+
+      - name: Test real Production Redis TLS, cert hostname and plaintext denial
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsProductionTests'
+        env:
+          SHIROKURO_TEST_REDIS_TLS: localhost:6380,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
+
+      - name: Destroy ephemeral Redis TLS certificates and container
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f shirokuro-ci-redis-tls 2>/dev/null || true
+          if [ -n "${SHIROKURO_TLS_CERT_DIR:-}" ]; then
+            rm -rf "$SHIROKURO_TLS_CERT_DIR"
+          fi
+          sudo rm -f /usr/local/share/ca-certificates/shirokuro-ci-redis.crt
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
