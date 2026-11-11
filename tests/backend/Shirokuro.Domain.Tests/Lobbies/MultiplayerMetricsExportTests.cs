@@ -173,6 +173,10 @@ public sealed class MultiplayerMetricsExportTests
             true, ReadinessProbeStage.Success, 0.12);
         MultiplayerMetrics.RecordReadinessDuration(
             false, ReadinessProbeStage.Timeout, 2.0);
+        MultiplayerMetrics.RecordRedisConnection(
+            RedisConnector.Lobby, RedisConnectionTransition.Failed);
+        MultiplayerMetrics.RecordRedisConnection(
+            RedisConnector.GuestSessions, RedisConnectionTransition.Restored);
 
         Assert.True(meter.ForceFlush(5_000));
         Assert.NotEmpty(collector.Calls);
@@ -195,6 +199,7 @@ public sealed class MultiplayerMetricsExportTests
             .Select(call => Encoding.UTF8.GetString(call.Body)));
         Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
         Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
+        Assert.Contains(MultiplayerMetrics.RedisConnectionEventsName, payload);
         Assert.DoesNotContain("password=", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("guest-private", payload, StringComparison.OrdinalIgnoreCase);
     }

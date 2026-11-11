@@ -1332,3 +1332,37 @@ network segmentation, collector availability, telemetry persistence or
 alert delivery; these and Redis/Sentinel replication metrics remain #21.
 
 The #60 OTLP metrics integration and #61 per-ref CI concurrency passed in [CI implementation #43119051733](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43119051733) SUCCESS on `5231016`: **397 xUnit standard**, 5 Production Redis TLS, 2 Redis TLS ACL, 1 ACL blue/green rotation, 1 RDB restore, 1 replica manual promotion, 1 automatic Sentinel TLS ACL failover, **106 Vitest, 24 Playwright, 35 Python tests**, .NET 10 and React builds. The CI revealed that .NET OTLP metric export can use `HttpClient.Send` (synchronous) during ForceFlush; the CI-only fake collector now supports both `Send` and `SendAsync` without changing Production transport. Additional integration tests verify collector HTTP 503 cannot prevent **guest sign-in, lobby creation, active cookie lookup, logout and revocation**, and that OTLP requests do not carry application guest cookies or authorization headers. The collector remains privately configured and disabled by default. No real exporter credentials, production receiver or alert system were provisioned by the test.
+
+## Redis client lifecycle events for operational triage (#62)
+
+The optional OTLP-backed meter `Shirokuro.Api.Multiplayer` now also publishes
+`Counter<long> shirokuro.redis.connection.events`. It counts StackExchange.Redis
+connection notifications for the two **independent** Production multiplexers,
+without emitting exception text or connection identifiers.
+
+| Bounded label | Values | Interpretation |
+| --- | --- | --- |
+| `client` | `lobby`, `session` | The server-side lobby Redis connector or the separate guest-session cache connector. Not a room, player or network address. |
+| `event` | `failed`, `restored`, `configuration-changed` | Physical connection failure, connection restoration, or client reconfiguration notification from StackExchange.Redis. |
+
+The lobby multiplexer has event subscriptions immediately after being
+constructed; the ASP.NET Core Redis cache uses
+`RedisCacheOptions.ConnectionMultiplexerFactory` to observe its own
+lazy, independent multiplexer while preserving the same validated TLS
+and optional Sentinel settings. Later test/deployment
+`RedisCacheOptions.ConfigurationOptions` overrides are honored at actual
+connection time; this wiring does not share the lobby mux or configure
+an in-memory fallback.
+
+These **are client notifications**, not Redis server exporter signals,
+per-host availability gauges, a trusted master election count or
+durability acknowledgements. An outage or Sentinel primary switch can
+generate multiple events per connector or may not generate one restored
+event for the old endpoint; do not build exact-once logic or RTO/RPO
+guarantees from these counters. Combine their rate changes with
+`shirokuro.readiness.probes`, `shirokuro.readiness.duration`,
+Redis server role/lag metrics from an independently secured exporter
+and independently validated alerts. The public `/api/ready` and
+`/api/health` routes remain as before, with **no** `/metrics` ingress
+exposure. Collector and alert deployment, network partition tests,
+durable account authentication and robust failure domains remain #21.
