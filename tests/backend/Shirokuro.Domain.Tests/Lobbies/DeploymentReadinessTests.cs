@@ -1,0 +1,232 @@
+using System.IO;
+using System.Net;
+using System.Text.Json;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Shirokuro.Api.Readiness;
+using StackExchange.Redis;
+using Xunit;
+
+namespace Shirokuro.Domain.Tests.Lobbies;
+
+public sealed class DeploymentReadinessTests
+{
+    private static string? RedisAddress =>
+        Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS");
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private long _milliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        public override DateTimeOffset GetUtcNow() =>
+            DateTimeOffset.FromUnixTimeMilliseconds(Interlocked.Read(ref _milliseconds));
+        public void Advance(TimeSpan duration) =>
+            Interlocked.Add(ref _milliseconds, (long)duration.TotalMilliseconds);
+    }
+
+    private sealed class ToggleSessionStore : IDistributedCache
+    {
+        private int _reads;
+        public int Reads => Volatile.Read(ref _reads);
+        public bool Fail { get; set; }
+
+        public byte[]? Get(string key) => null;
+        public Task<byte[]?> GetAsync(string key,
+            CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _reads);
+            if (Fail)
+                throw new IOException("sensitive guest-session Redis error");
+            return Task.FromResult<byte[]?>(null);
+        }
+        public void Refresh(string key) { }
+        public Task RefreshAsync(string key, CancellationToken token = default) =>
+            Task.CompletedTask;
+        public void Remove(string key) { }
+        public Task RemoveAsync(string key, CancellationToken token = default) =>
+            Task.CompletedTask;
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options) { }
+        public Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options,
+            CancellationToken token = default) => Task.CompletedTask;
+    }
+
+    private sealed class BrokenKeyRing : IDataProtectionProvider
+    {
+        public IDataProtector CreateProtector(string purpose) =>
+            throw new IOException("secret certificate path and password");
+    }
+
+    private static WebApplicationFactory<Program> Production(
+        IConnectionMultiplexer redis, ToggleSessionStore sessions,
+        ManualClock clock, bool brokenKeys = false, bool realSessions = false) =>
+        new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Production");
+            TestDataProtectionConfiguration.Apply(builder);
+            TestGuestSessionRedisConfiguration.Apply(builder, sessions);
+            builder.ConfigureAppConfiguration((_, config) =>
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["AllowedHosts"] = "game.example",
+                    ["Security:AllowedOrigins:0"] = "https://game.example"
+                }));
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IConnectionMultiplexer>();
+                services.AddSingleton(redis);
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton<TimeProvider>(clock);
+                services.RemoveAll<IDistributedCache>();
+                if (realSessions)
+                    services.AddStackExchangeRedisCache(options =>
+                    {
+                        options.Configuration = RedisAddress!;
+                        options.InstanceName = "shirokuro-readiness-test:";
+                    });
+                else
+                    services.AddSingleton<IDistributedCache>(sessions);
+
+                if (brokenKeys)
+                {
+                    services.RemoveAll<IDataProtectionProvider>();
+                    services.AddSingleton<IDataProtectionProvider>(new BrokenKeyRing());
+                }
+            });
+        });
+
+    private static HttpClient Client(WebApplicationFactory<Program> server,
+        string baseAddress = "https://game.example") =>
+        server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri(baseAddress),
+            AllowAutoRedirect = false,
+            HandleCookies = false
+        });
+
+    private static async Task AssertStatus(
+        HttpResponseMessage response, HttpStatusCode code, string value)
+    {
+        Assert.Equal(code, response.StatusCode);
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        var raw = await response.Content.ReadAsStringAsync();
+        using var json = JsonDocument.Parse(raw);
+        Assert.Equal(value, json.RootElement.GetProperty("status").GetString());
+        Assert.Single(json.RootElement.EnumerateObject());
+        Assert.DoesNotContain("Redis", raw, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("guest-", raw, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("password", raw, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task DevelopmentReadinessAndLivenessWorkWithoutRedisOrCredentials()
+    {
+        using var server = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder => builder.UseEnvironment("Development"));
+        using var client = Client(server, "http://localhost");
+        using var ready = await client.GetAsync("/api/ready");
+        await AssertStatus(ready, HttpStatusCode.OK, "ready");
+        using var health = await client.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+    }
+
+    [Fact]
+    public async Task ProductionChecksBothStoresCoalescesCallsAndRecoversAfterOutage()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var sessionStore = new ToggleSessionStore();
+        var clock = new ManualClock();
+        using var server = Production(redis, sessionStore, clock);
+        using var client = Client(server);
+
+        // Repeated and concurrent public probes must not run an unbounded
+        // number of session-cache/Redis commands.
+        var responses = await Task.WhenAll(
+            Enumerable.Range(0, 24).Select(_ => client.GetAsync("/api/ready")));
+        foreach (var response in responses)
+        {
+            using (response)
+                await AssertStatus(response, HttpStatusCode.OK, "ready");
+        }
+        Assert.Equal(1, sessionStore.Reads);
+
+        sessionStore.Fail = true;
+        using (var cached = await client.GetAsync("/api/ready"))
+            await AssertStatus(cached, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, sessionStore.Reads);
+
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var unavailable = await client.GetAsync("/api/ready"))
+            await AssertStatus(unavailable, HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(2, sessionStore.Reads);
+
+        using (var stillAlive = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, stillAlive.StatusCode);
+
+        sessionStore.Fail = false;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(3, sessionStore.Reads);
+    }
+
+    [Fact]
+    public async Task ProductionRefusesUnhealthyRoomRedisAndDoesNotBypassIngressPolicy()
+    {
+        if (RedisAddress is null) return;
+        var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var clock = new ManualClock();
+        var sessionStore = new ToggleSessionStore();
+        using var server = Production(redis, sessionStore, clock);
+        using var valid = Client(server);
+
+        using (var healthy = await valid.GetAsync("/api/ready"))
+            await AssertStatus(healthy, HttpStatusCode.OK, "ready");
+
+        using (var insecure = Client(server, "http://game.example"))
+        using (var denied = await insecure.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+
+        using (var unknownHost = Client(server, "https://untrusted.example"))
+        using (var denied = await unknownHost.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+
+        redis.Dispose();
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var unready = await valid.GetAsync("/api/ready"))
+            await AssertStatus(unready, HttpStatusCode.ServiceUnavailable, "unavailable");
+        using (var alive = await valid.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, alive.StatusCode);
+    }
+
+    [Fact]
+    public async Task DataProtectionFailureNeverLeaksConfigurationOrReportsReady()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var server = Production(redis, new ToggleSessionStore(),
+            new ManualClock(), brokenKeys: true);
+        using var client = Client(server);
+        using var response = await client.GetAsync("/api/ready");
+        await AssertStatus(response, HttpStatusCode.ServiceUnavailable, "unavailable");
+    }
+
+    [Fact]
+    public async Task ActualRedisSessionCacheAndIndependentLobbyConnectorAreBothReady()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var server = Production(redis, new ToggleSessionStore(),
+            new ManualClock(), realSessions: true);
+        using var client = Client(server);
+        using var response = await client.GetAsync("/api/ready");
+        await AssertStatus(response, HttpStatusCode.OK, "ready");
+    }
+}

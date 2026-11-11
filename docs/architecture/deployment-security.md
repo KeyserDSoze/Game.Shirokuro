@@ -195,8 +195,7 @@ SignalR roster reads, and logout/expiry membership cleanup use the
 **Redis coordinator**, not the process-local one. The same TLS Redis
 connection configuration is used for sessions and rooms, with fail-closed
 behavior on outages. Since #37, the guest-session/room-creation **per-IP
-rate limits are also shared via Redis**, while expiry-notification queues
-remain local to the originating API process. Production needs Redis TLS
+rate limits are also shared via Redis**, while durable encrypted expiry work is now shared between nodes (#38). Production needs Redis TLS
 network access control, durable storage/backup and tested failover.
 The xUnit integration uses **two Production TestServers, independent
 Redis connections and a shared fake guest session cache**; it is not
@@ -238,10 +237,9 @@ and cannot prevent abuse spread over multiple IP addresses.
 TestServer/CI Redis is local non-TLS and does not prove TLS availability,
 persistence after failover or operation under network partitions.
 
-This does not solve crash-proof expired session cleanup, edge TLS/network
-validation, rotating-IP/Sybil attacks, Redis availability/failover or
-durable player accounts:
-all remain open in #21.
+This does not solve edge TLS/network validation, rotating-IP/Sybil attacks,
+Redis availability/failover or durable player accounts:
+all remain open in #21. Crash-safe guest expiry cleanup is handled by #38.
 
 ## Crash-safe guest expiry maintenance (issue #38)
 
@@ -274,3 +272,40 @@ or protection against attackers controlling many IP addresses (#21).
 Operators must retain and share old Data Protection keys/certificates until
 all protected expiry items have been processed; an unreadable entry is not
 silently discarded. Real TLS Redis failover still needs deployment testing.
+
+## Liveness and readiness for node routing (issue #39)
+
+`GET /api/health` is **process liveness**: it answers 200 while the API
+process is serving HTTP, even if Redis or the shared Data Protection key ring
+cannot be used. It must **not** be used to decide whether a production node
+can serve multiplayer traffic.
+
+`GET /api/ready` is **node readiness** and remains unauthenticated for an
+internal load balancer. Outside Development, every fresh check requires:
+
+- a read-only Redis `PING` on the **lobby/mutation/expiry** multiplexer;
+- a read-only missing-key lookup through the **separate guest session
+  `IDistributedCache`** client (neither check writes session/lobby state);
+- a small round-trip through the configured purpose-isolated ASP.NET Core
+  **Data Protection** key ring to confirm the node can protect and unprotect.
+
+All checks must pass. Responses are intentionally identical across failures:
+`200 {"status":"ready"}` or `503 {"status":"unavailable"}`, always
+`Cache-Control: no-store`. Exceptions, secret paths, Redis credentials,
+player identities and invitation details are never returned to clients or
+written to readiness logs. Each process coalesces probes behind a gate and
+caches both success and failure for **3 seconds**, with a **2-second**
+probe timeout. This is a bounded operational signal, not a full health audit.
+For fast convergence after a failure/recovery, a load balancer must poll
+periodically instead of caching HTTP responses. Development returns ready
+without Redis, preserving local Vite/Playwright.
+
+Existing fail-closed HTTPS and exact-Host ingress rules still apply before
+either endpoint in non-Development. Operators must probe with the **expected
+HTTPS scheme and allowlisted Host** through a trusted network/ingress, not
+disable ingress protections for the health checks. Limit exposure or
+rate-limit health endpoints at the edge: public anonymous probes reveal only
+one-bit readiness but should not be advertised to arbitrary external clients.
+A green local CI with plain Redis does **not** prove real Redis TLS, Sentinel/
+cluster failover, backup/restore, load-balancer configuration or durable
+accounts; these remain under #21.

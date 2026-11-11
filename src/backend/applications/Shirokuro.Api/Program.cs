@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Shirokuro.Api.Hubs;
 using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Readiness;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Application.Preview;
@@ -41,6 +42,7 @@ builder.Services.AddSingleton<GuestLobbyCommands>();
 if (builder.Environment.IsDevelopment())
 {
     builder.Services.AddSingleton<IAsyncGuestLobby, LocalGuestLobbyRuntime>();
+    builder.Services.AddSingleton<IDeploymentReadiness, DevelopmentReadiness>();
 }
 else
 {
@@ -54,6 +56,7 @@ else
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));
     builder.Services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
+    builder.Services.AddSingleton<IDeploymentReadiness, RedisDeploymentReadiness>();
     builder.Services.AddSingleton<IGuestMutationLimiter>(sp =>
         new RedisGuestMutationLimiter(
             sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase()));
@@ -231,6 +234,19 @@ if (!app.Environment.IsDevelopment())
 app.UseRateLimiter();
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }));
+
+// Liveness above is intentionally independent of Redis; the readiness route
+// is for load balancers and checks BOTH Redis connections plus Data Protection.
+// It returns a minimal, uncached response without exposing failed dependencies.
+app.MapGet("/api/ready", async (HttpContext context, IDeploymentReadiness readiness) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    var ready = await readiness.IsReadyAsync(context.RequestAborted);
+    return Results.Json(new { status = ready ? "ready" : "unavailable" },
+        statusCode: ready
+            ? StatusCodes.Status200OK
+            : StatusCodes.Status503ServiceUnavailable);
+});
 
 // Ephemeral guests: identity comes solely from cryptographically random server bytes.
 var guestSessionIssuance = app.MapPost("/api/sessions/guest",
