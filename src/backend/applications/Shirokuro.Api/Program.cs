@@ -26,6 +26,10 @@ GuestSessionRedisConfiguration.Configure(
 // HTTPS OTLP collector. Never add an unauthenticated HTTP /metrics endpoint.
 MultiplayerMetricsExport.Configure(
     builder.Services, builder.Configuration, builder.Environment);
+// Production-only opt-in read-only INFO replication sampler. Neither a
+// Redis collector outage nor INFO permissions may gate lobby/guest routes.
+RedisReplicationMonitoring.Configure(
+    builder.Services, builder.Configuration, builder.Environment);
 // An operator-managed cutoff lives OUTSIDE Redis and therefore survives
 // rollback of an older RDB. Validate it at startup rather than accepting a
 // misformatted setting or treating restored Redis tokens as authority.

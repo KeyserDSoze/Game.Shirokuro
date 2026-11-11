@@ -17,6 +17,12 @@ public static class MultiplayerMetrics
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
+    public const string RedisReplicationObservationsName =
+        "shirokuro.redis.replication.observations";
+    public const string RedisConnectedReplicasName =
+        "shirokuro.redis.replication.connected_replicas";
+    public const string RedisReplicaAckLagSecondsName =
+        "shirokuro.redis.replication.replica_ack_lag_seconds";
     public const string ExpirySweepsName = "shirokuro.guest_expiry.sweeps";
     public const string ExpiryMembershipsRemovedName = "shirokuro.guest_expiry.memberships_removed";
     public const string ExpiryUnreadableItemsName = "shirokuro.guest_expiry.unreadable_items";
@@ -34,6 +40,15 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> RedisConnectionEvents =
         Meter.CreateCounter<long>(RedisConnectionEventsName, unit: "{event}",
             description: "Production Redis connector lifecycle events; no endpoint or identity labels.");
+    private static readonly Counter<long> RedisReplicationObservations =
+        Meter.CreateCounter<long>(RedisReplicationObservationsName, unit: "{observation}",
+            description: "Explicit INFO replication probe result, including failed polls.");
+    private static readonly Histogram<double> RedisConnectedReplicas =
+        Meter.CreateHistogram<double>(RedisConnectedReplicasName, unit: "{replica}",
+            description: "Connected replica count reported in successful primary INFO samples, not a gauge.");
+    private static readonly Histogram<double> RedisReplicaAckLagSeconds =
+        Meter.CreateHistogram<double>(RedisReplicaAckLagSecondsName, unit: "s",
+            description: "Maximum ONLINE replica acknowledgement lag reported by primary INFO, not replication RPO.");
     private static readonly Counter<long> ExpirySweeps = Meter.CreateCounter<long>(
         ExpirySweepsName, unit: "{sweep}",
         description: "Guest-session expiry cleanup sweep outcomes.");
@@ -127,6 +142,64 @@ public static class MultiplayerMetrics
             new KeyValuePair<string, object?>("event", outcome));
     }
 
+    /// <summary>
+    /// Record one read-only INFO replication poll. The report can contain
+    /// sensitive replica IPs and authentication context, but NONE of its
+    /// string fields can become a metric dimension. Missing/failed samples
+    /// never report a healthy zero-replica measurement.
+    /// </summary>
+    public static void RecordRedisReplication(
+        RedisReplicationSnapshot? observation, RedisReplicationPollOutcome outcome)
+    {
+        var result = outcome switch
+        {
+            RedisReplicationPollOutcome.Ok => "ok",
+            RedisReplicationPollOutcome.Unavailable => "unavailable",
+            RedisReplicationPollOutcome.Timeout => "timeout",
+            RedisReplicationPollOutcome.Invalid => "invalid",
+            _ => throw new ArgumentOutOfRangeException(nameof(outcome))
+        };
+        if ((outcome == RedisReplicationPollOutcome.Ok) != (observation is not null))
+            throw new ArgumentException("Probe outcome and observation must agree.", nameof(observation));
+
+        var role = observation?.Role switch
+        {
+            RedisReplicationRole.Primary => "master",
+            RedisReplicationRole.Replica => "replica",
+            null => "unknown",
+            _ => throw new ArgumentOutOfRangeException(nameof(observation))
+        };
+        var link = observation?.Link switch
+        {
+            RedisReplicaLink.Up => "up",
+            RedisReplicaLink.Down => "down",
+            RedisReplicaLink.NotApplicable or null => "na",
+            _ => throw new ArgumentOutOfRangeException(nameof(observation))
+        };
+        if (observation is { } state &&
+            (state.Role == RedisReplicationRole.Primary
+                ? state.Link != RedisReplicaLink.NotApplicable ||
+                  state.ConnectedReplicas is null or < 0 ||
+                  state.MaxOnlineAckLagSeconds is < 0
+                : state.Role != RedisReplicationRole.Replica ||
+                  state.Link == RedisReplicaLink.NotApplicable ||
+                  state.ConnectedReplicas is not null ||
+                  state.MaxOnlineAckLagSeconds is not null))
+            throw new ArgumentException("Invalid replication sample.", nameof(observation));
+
+        RedisReplicationObservations.Add(1,
+            new KeyValuePair<string, object?>("outcome", result),
+            new KeyValuePair<string, object?>("role", role),
+            new KeyValuePair<string, object?>("link", link));
+
+        if (observation is { Role: RedisReplicationRole.Primary } primary)
+        {
+            RedisConnectedReplicas.Record(primary.ConnectedReplicas!.Value);
+            if (primary.MaxOnlineAckLagSeconds is int lag)
+                RedisReplicaAckLagSeconds.Record(lag);
+        }
+    }
+
     // No tags: malformed or unreadable encrypted data is never an identity,
     // an exception label or a Redis key exposed to an exporter.
     public static void RecordUnreadableExpiryItem() =>
@@ -163,3 +236,11 @@ public enum ReadinessProbeStage
 public enum RedisConnector { Lobby, GuestSessions }
 
 public enum RedisConnectionTransition { Failed, Restored, ConfigurationChanged }
+
+public enum RedisReplicationRole { Primary, Replica }
+public enum RedisReplicaLink { NotApplicable, Up, Down }
+public enum RedisReplicationPollOutcome { Ok, Unavailable, Timeout, Invalid }
+
+public readonly record struct RedisReplicationSnapshot(
+    RedisReplicationRole Role, RedisReplicaLink Link,
+    int? ConnectedReplicas, int? MaxOnlineAckLagSeconds);
