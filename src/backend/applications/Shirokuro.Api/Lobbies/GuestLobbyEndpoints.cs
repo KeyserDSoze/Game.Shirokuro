@@ -25,7 +25,7 @@ public static class GuestLobbyEndpoints
     {
         var route = app.MapGroup("/api/lobbies").RequireAuthorization();
 
-        route.MapPost("", async (CreateRoomRequest request, HttpContext context,
+        var createRoom = route.MapPost("", async (CreateRoomRequest request, HttpContext context,
             IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
@@ -36,7 +36,12 @@ public static class GuestLobbyEndpoints
                     request.TeamId, context.RequestAborted);
                 return Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster);
             });
-        }).RequireRateLimiting("guest-room-creation");
+        });
+        if (app.ServiceProvider.GetRequiredService<IHostEnvironment>().IsDevelopment())
+            createRoom.RequireRateLimiting("guest-room-creation");
+        else
+            createRoom.WithMetadata(
+                new GuestMutationRateLimit(GuestMutationKind.RoomCreation));
 
         route.MapPost("/{roomId}/join", async (string roomId, JoinRoomRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>

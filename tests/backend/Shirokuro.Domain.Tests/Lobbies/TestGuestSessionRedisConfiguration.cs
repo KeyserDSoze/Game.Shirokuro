@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Security;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
 
@@ -39,6 +40,13 @@ internal static class TestGuestSessionRedisConfiguration
             // tests explicitly replace this with the production Redis runtime.
             services.RemoveAll<IAsyncGuestLobby>();
             services.AddSingleton<IAsyncGuestLobby, LocalGuestLobbyRuntime>();
+
+            // All other Production TestServers intentionally use an isolated
+            // deterministic fake for only the Redis limits, never the
+            // production fallback. Real multi-node tests explicitly restore
+            // RedisGuestMutationLimiter with real Redis.
+            services.RemoveAll<IGuestMutationLimiter>();
+            services.AddSingleton<IGuestMutationLimiter, TestGuestMutationLimiter>();
         });
     }
 }

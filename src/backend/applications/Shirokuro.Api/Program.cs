@@ -53,6 +53,9 @@ else
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));
     builder.Services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
+    builder.Services.AddSingleton<IGuestMutationLimiter>(sp =>
+        new RedisGuestMutationLimiter(
+            sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase()));
 }
 
 // The cookie may contain a server-generated, non-verified guest ID.
@@ -178,12 +181,54 @@ if (app.Environment.IsDevelopment())
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+// Routing/authorization have already selected a trusted endpoint. Only the
+// two explicit POST endpoints carry metadata, avoiding URL/case aliases
+// bypassing a path-based filter. Redis errors deny issuance/creation (503).
+if (!app.Environment.IsDevelopment())
+{
+    app.Use(async (context, next) =>
+    {
+        var rule = context.GetEndpoint()?.Metadata
+            .GetMetadata<GuestMutationRateLimit>();
+        if (rule is not null)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            GuestMutationDecision decision;
+            try
+            {
+                decision = await context.RequestServices
+                    .GetRequiredService<IGuestMutationLimiter>()
+                    .AcquireAsync(rule, context.Connection.RemoteIpAddress,
+                        context.RequestAborted);
+            }
+            catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                // Fail closed on Redis/connection/protocol outages, without
+                // printing remote IP, Redis credentials or secret identities.
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                return;
+            }
+            if (!decision.Allowed)
+            {
+                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                context.Response.Headers.RetryAfter =
+                    Math.Max(1, (long)Math.Ceiling(
+                        decision.RetryAfterMilliseconds / 1000d)).ToString(
+                            System.Globalization.CultureInfo.InvariantCulture);
+                return;
+            }
+        }
+        await next(context);
+    });
+}
 app.UseRateLimiter();
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }));
 
 // Ephemeral guests: identity comes solely from cryptographically random server bytes.
-app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment environment) =>
+var guestSessionIssuance = app.MapPost("/api/sessions/guest",
+    async (HttpContext context, IHostEnvironment environment) =>
 {
     if (!WebMutationGuard.Allows(context, environment))
         return Results.StatusCode(StatusCodes.Status403Forbidden);
@@ -229,7 +274,12 @@ app.MapPost("/api/sessions/guest", async (HttpContext context, IHostEnvironment 
         throw;
     }
     return Results.Ok(new { playerId, kind = "guest" });
-}).RequireRateLimiting("guest-session-issuance");
+});
+if (app.Environment.IsDevelopment())
+    guestSessionIssuance.RequireRateLimiting("guest-session-issuance");
+else
+    guestSessionIssuance.WithMetadata(
+        new GuestMutationRateLimit(GuestMutationKind.SessionIssuance));
 
 app.MapGet("/api/sessions/me", (HttpContext context) =>
 {
