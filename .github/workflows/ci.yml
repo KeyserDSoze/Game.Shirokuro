@@ -308,7 +308,7 @@ jobs:
             cat > "$state/sentinel-$id/users.acl" <<EOF
           user default off
           user shirokuro-sentinel-peer on >$peer_pass allchannels +@all
-          user shirokuro-sentinel-client on >$sentinel_pass allchannels -@all +auth +client|getname +client|id +client|setname +client|setinfo +command +hello +ping +role +info +echo +subscribe +psubscribe +sentinel|get-master-addr-by-name +sentinel|master +sentinel|myid +sentinel|replicas +sentinel|sentinels +sentinel|masters
+          user shirokuro-sentinel-client on >$sentinel_pass allchannels -@all +auth +client|getname +client|id +client|setname +client|setinfo +command +hello +ping +role +info +subscribe +psubscribe +sentinel|get-master-addr-by-name +sentinel|master +sentinel|myid +sentinel|replicas +sentinel|sentinels +sentinel|masters
           EOF
             chmod 644 "$state/sentinel-$id/users.acl"
             port=$((26379 + id))
