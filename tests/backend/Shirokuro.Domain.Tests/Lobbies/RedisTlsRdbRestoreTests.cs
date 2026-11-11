@@ -381,7 +381,11 @@ public sealed class RedisTlsRdbRestoreTests
             // gate and rotates this trusted config value AFTER the snapshot.
             // Redis cannot undo it by loading old keys or session tokens.
             var cutoff = DateTimeOffset.UtcNow;
-            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            // The framework serializes cookie ticket issued-at values with
+            // second-level granularity. Wait beyond that boundary before
+            // expecting fresh issuance to pass the strict '>' comparison.
+            // A session minted in the cutoff second must fail closed.
+            await Task.Delay(TimeSpan.FromSeconds(2));
             using var guardedA = Server(cutoff);
             using var guardedB = Server(cutoff);
             using var staleOnA = Client(guardedA, cookieAlice);
