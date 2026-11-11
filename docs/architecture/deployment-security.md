@@ -163,11 +163,11 @@ Keep the previous decryptors until any keys they wrap have been retired
 according to your operational retention policy. Do not log PFX passwords,
 ticket payloads or key XML. Configuration is verified with xUnit
 cross-provider crypto, encrypted XML, certificate migration and cookie
-TestServer tests. **Guest authorization still uses per-process session
-registries:** a cookie cryptographically readable on instance B is
-correctly denied there if its guest session belongs only to instance A.
-Shared session revocation, lobby persistence and multi-node reconnect
-remain #21; this feature alone does not make multiplayer multi-node-ready.
+TestServer tests. Since #33, Production guest tickets use a **shared Redis
+session registry**: the key ring alone is not authorization, but a token
+present in the shared registry is valid across API nodes. Since #36,
+pre-match lobby state is also shared through Redis. Availability and
+public production hardening still remain #21.
 
 ## Distributed guest session authorization (issue #33)
 
@@ -190,13 +190,16 @@ plaintext; cache values bind a guest identity hash and absolute expiration.
 `OnValidatePrincipal` and SignalR `GetRoster` check Redis on each use,
 and logout deletes the shared entry before clearing the browser cookie.
 
-The Redis store **does not** distribute the in-memory lobby coordinator,
-administrative membership cleanup, session expiry notification queue or
-per-IP rate limits. Consequently this feature does not complete multi-node
-gameplay or multi-instance lobby reconnect. Tests with two independently
-hosted APIs and a shared fake distributed cache verify cookie acceptance
-and revocation; **real Redis cluster failover/performance testing** is
-still required before public deployment.
+Since #36, non-Development lobby API mutations, member-scoped HTTP and
+SignalR roster reads, and logout/expiry membership cleanup use the
+**Redis coordinator**, not the process-local one. The same TLS Redis
+connection configuration is used for sessions and rooms, with fail-closed
+behavior on outages. Per-IP rate limits and expiry-notification queues
+remain local to the originating API process. Production needs Redis TLS
+network access control, durable storage/backup and tested failover.
+The xUnit integration uses **two Production TestServers, independent
+Redis connections and a shared fake guest session cache**; it is not
+a complete TLS Redis cluster failover or soak test.
 
 ## Security regression coverage
 
@@ -211,6 +214,7 @@ writes, HSTS, ignored `X-Forwarded-Proto` from unknown peers and
 unchanged local Development HTTP behavior. The Playwright local-browser
 workflows remain unchanged.
 
-This does not solve distributed lobby state/cleanup, edge TLS/network validation,
-distributed rate limiting, Redis availability/failover or durable player accounts:
+This does not solve crash-proof expired session cleanup, edge TLS/network
+validation, distributed per-IP limits, Redis availability/failover or
+durable player accounts:
 all remain open in #21.

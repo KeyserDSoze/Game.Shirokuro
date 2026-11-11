@@ -70,14 +70,15 @@ Guest logout removes the shared token before clearing its cookie, so
 another API instance rejects it at the next authentication check.
 A Redis outage never grants access based on local memory.
 
-The key ring and decryption certificate must still be shared across nodes
-(#32), with identical Redis configuration (#33). **Lobby states, member
-rosters and the local 5-minute expiry worker remain per-process**: a
-logout on node B immediately revokes the credential on A and B, but it
-does not remove stale roster membership stored in A until the appropriate
-local cleanup. Distribution of lobby state/cleanup and rate limits is
-still pending #21. In Development, sessions intentionally stay
-in-memory; restarts lose the registry and invalidate old guest tickets. With #31, non-Development HTTP is denied for all API and SignalR
+The key ring/certificate must be shared across nodes (#32), with identical
+TLS Redis configuration (#33). Since #36, lobby states, rosters and
+membership cleanup are **shared through Redis** in non-Development:
+logout B revokes the credential across nodes and removes that guest from
+rooms created on A, without renewing their idle TTL. The 5-minute
+expiry worker uses the same coordinator, but notifications about naturally
+expired sessions are queued on the issuing process and may be lost if it
+crashes. Crash-proof reconciliation and per-IP distributed rate limits
+are still pending #21. Development remains completely in-memory. With #31, non-Development HTTP is denied for all API and SignalR
 routes (403 without redirect). Trusted proxies can report HTTPS only
 through the #29 allowlisted peer mechanism; direct clients cannot grant
 themselves HTTPS with `X-Forwarded-Proto`. A bounded 30-day HSTS header
@@ -85,9 +86,10 @@ is emitted on HTTPS responses outside Development. Use actual TLS at
 the edge and persistent/shared Data Protection before production;
 proxies must reliably set scheme and host.
 
-Session issuance by itself does not grant admission. #20 now exposes
-invitation-based room creation/join, and the #18 HTTP roster and SignalR
-reads still require server-side membership and expose no secret PvP
-positions/routes. Per-process logout revocation is now delivered by #23;
-durable identity and distributed revocation require #21. Actual match
-networking and visibility still depend on #3/#5/#9.
+Session issuance by itself does not grant admission. #20 exposes
+invitation-based room creation/join; the #18 HTTP roster and SignalR
+reads require server-side membership and expose no secret PvP
+positions/routes. Distributed session revocation (#33) and pre-match
+roster cleanup (#36) are now in place outside Development. Durable
+identity and operational hardening remain #21; actual match networking
+and visibility still depend on #3/#5/#9.

@@ -1,4 +1,4 @@
-# Process-local room expiry and guest session revocation — #22 and #23
+# Lobby lifecycle: Development-local and Redis multi-node — #22–#36
 
 These safeguards secure **temporary pre-match** rooms; they do not add
 any new PvP mechanics and are not sufficient for public production hosting.
@@ -122,7 +122,7 @@ authorization, solo-room deletion and absence of invite revival.
 ## Redis atomic lobby snapshot foundation (#34)
 
 The API project includes `RedisLobbySnapshotCodec` and
-`RedisLobbySnapshotStore` as a **not-yet-wired infrastructure layer**.
+`RedisLobbySnapshotStore` as a persistence foundation (#34), now activated in non-Development by #36.
 A versioned snapshot retains the trusted invite, team/hero definition,
 immutable roster, revision, original creator and last authorized activity.
 Decoding revalidates all domain invariants. Redis keys include a SHA-256
@@ -145,30 +145,11 @@ expiry and physical Redis TTL tests. The local CI instance is deliberately
 not a production TLS deployment. Production Redis TLS/network/secret
 requirements from #33 continue to apply.
 
-**Important boundary:** production HTTP endpoints, quota enforcement,
-the coordinator, SignalR membership reads and expiry workers still
-use `InMemoryLobbyCoordinator`. This primitive is not a completed
-multi-node lobby architecture. Integrating all mutations and read
-authorization atomically, as well as global room/creator caps and cleanup,
-is still required in #21. No request may expose a raw Redis snapshot.
-
-## Remaining work in parent issue #21
-
-The **HTTP lobby coordinator, roster, technical quotas and cleanup are
-still in-memory, per-process**. An API restart discards those active rooms
-and membership, even though the new #34 Redis primitive is available.
-Production session **authentication and revocation** use shared TLS Redis
-(#33), and the cookie key ring can be persisted and encrypted with X.509
-(#32). Those security improvements are not substitutes for shared room
-membership, atomic creator/global quotas or reliable reconnect.
-
-The next slice must wire the API and SignalR into a fully authorized,
-atomic distributed coordinator; handle cross-node expiry/logout cleanup,
-global anti-abuse limits, crash recovery, and Redis operational failover.
-Any snapshot reads used by endpoint logic must first enforce trusted
-membership and protect the invite from enumeration. Public multi-node
-deployment also requires TLS edge/Redis availability, durability and
-observability checks. Do not claim production-ready multiplayer yet.
+**Now active (#36):** non-Development HTTP lobby endpoints, SignalR
+member roster reads and guest cleanup use one Redis-backed `IAsyncGuestLobby`
+coordinator; Development still uses `InMemoryLobbyCoordinator`. No
+request exposes a raw Redis snapshot, and unindexed legacy rooms fail
+closed instead of circumventing technical room quotas.
 
 ## Atomic creator/global Redis room quotas (#35)
 
@@ -210,7 +191,56 @@ This protects against accidental index corruption; operational Redis
 integrity and network access control remain necessary. 
 [CI #42747294057](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/42747294057)
 passed 294 xUnit, 106 Vitest, 24 Playwright and 35 Python checks.
-**Still not connected to live HTTP/SignalR:** the
-distributed lobby coordinator must use only bounded creation and
-authorized CAS for every operation, then migrate logout/expiry cleanup
-and member-scoped reads together (#21).
+**Activated on live non-Development HTTP/SignalR routes by #36.** The
+runtime always uses bounded room creation and authorized Redis CAS; the
+older unindexed storage path remains only for isolated infrastructure tests.
+
+## Production and Staging Redis lobby runtime (#36)
+
+`IAsyncGuestLobby` is the only lobby contract used by the API, SignalR
+roster and session cleanup worker. The implementation is selected at
+startup: `LocalGuestLobbyRuntime` wraps the original lock-safe
+coordinator **only in Development**; outside Development,
+`RedisGuestLobbyRuntime` uses the same TLS Redis endpoint configured
+for guest session validation (#33), with no local fallback. The
+encrypted/shared Data Protection key ring remains mandatory (#32).
+
+New lobby creation uses the shared 256-room / 4-per-creator quota script
+(#35). Join/reconnect, team/hero choices, departure and member-only
+roster reads apply domain invariants and a full-snapshot Redis CAS.
+Only an authorized roster read or successful client mutation refreshes
+the 30-minute inactivity TTL; unknown/nonmember roster reads remain
+indistinguishable (HTTP 404 or generic SignalR HubException).
+Untracked legacy snapshots are never served or mutated through the
+production coordinator. Raw Redis data is not sent to clients.
+
+Guest logout revokes the shared session token **first**, then scans
+the bounded internal Redis capacity index and removes that verified
+identity from every affected room via CAS. Surviving roster revisions
+increment without renewing the room's activity; an empty room is
+deleted and releases quota. The session expiry worker uses the same
+Redis coordinator, retrying queued IDs after temporary cleanup errors.
+The creator retains quota attribution after departure if other
+participants remain.
+
+xUnit exercises two independent Production TestServers and Redis clients
+with a shared test key ring and fake guest-session cache: create on A,
+join and read on B, nonmember privacy, hero/team revisions, concurrent
+joins, creator quota across hosts, room recovery from a newly started
+server, logout B revoking A, a cached SignalR principal rejected after
+logout, natural expiry cleanup across nodes and rejection of legacy
+unindexed rooms. Redis integration tests in CI use local non-TLS Redis
+only; production configuration requires TLS as described in
+`docs/architecture/deployment-security.md`.
+
+## Remaining work in parent issue #21
+
+Shared pre-match room state and session revocation are now implemented
+outside Development, but **this is not public production readiness**.
+Per-IP rate limiting remains local to each API process; queued guest
+expiry notifications originate on the issuing node and may be lost after
+a crash; recovery/reconciliation of stale membership, Redis TLS
+operational failover, deployment ingress/certificates, observability,
+account upgrade and multi-node soak/performance tests still need work.
+A logout racing a previously authenticated in-flight mutation needs
+further hardening. Those remain tracked under #21.
