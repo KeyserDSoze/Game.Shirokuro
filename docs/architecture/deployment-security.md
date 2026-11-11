@@ -343,3 +343,47 @@ policy, not a hard-coded gameplay rule. Counts are per process until an
 external collector aggregates nodes. Instrumentation is not an abuse
 prevention mechanism or a substitute for Redis TLS, HA/failover testing,
 controlled monitoring access or durable identity (#21).
+
+## Immediate durable cleanup after guest logout (#41)
+
+Guest logout previously revoked the Redis session token first, then removed
+the player's pre-match lobby memberships. When room cleanup failed after
+revocation, the player's old browser cookie could not retry logout, but an
+inactive roster entry could persist until the **original 8-hour expiry**.
+The existing crash-safe encrypted expiry index (#38) is now also used for
+**immediate revoked-session cleanup**.
+
+Outside Development the server performs these operations in order:
+
+1. The trusted guest cookie is authenticated and the Redis session token is
+   **revoked** across nodes. A failed revocation must **never enqueue an
+   immediate removal**, since the player could still be authorized.
+2. Only after revocation, the server schedules a new **already-due encrypted
+   item** in `shirokuro:guest-expiry:{default}:v1:pending`. The member
+   contains Data Protection-protected UTC timestamp and server-owned guest ID,
+   never an IP, cookie, raw identity or invitation in Redis keys/logs.
+3. The logout handler attempts the usual synchronous Redis lobby cleanup.
+   If it succeeds, best-effort acknowledgement removes the extra immediate
+   item; acknowledgement failure is harmless and the worker will replay the
+   idempotent cleanup. If it fails, the HTTP response is a minimal **503**
+   with the browser cookie **cleared**, and the due item remains for the
+   startup/periodic worker of any healthy node to recover within its bounded
+   maintenance cadence.
+4. If queuing the immediate item fails, the server **still attempts direct
+   cleanup**. A successful direct cleanup allows the logout to finish with
+   204; if both operations fail, the response is 503 and the already
+   scheduled original 8-hour expiration is a weaker backstop. Do not
+   claim immediate guaranteed recovery in this double-failure case.
+
+The logout cookie is invalid after revocation even if cleanup later returns
+503; a replay cannot authorize, rejoin or perform further mutations. Cleanup
+does not extend survivor room TTLs or change other players. Local Development
+continues to use the in-memory lobby and expiration registry without Redis.
+A due member may be processed by overlapping workers and the normal
+8-hour item is retained: administrative CAS removal and ack are idempotent.
+
+This is eventual stale-roster cleanup, **not** transactional atomicity
+between the shared session cache and Redis room/index keys; logout and
+another already-authenticated in-flight mutation can still race. Hard
+atomic cross-key fencing, real Redis TLS/failover, signed-in accounts and
+multi-IP/Sybil defenses remain #21.

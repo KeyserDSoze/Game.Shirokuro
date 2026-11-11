@@ -375,13 +375,63 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     if (!await registry.RevokeAsync(context.User, context.RequestAborted))
         return Results.Forbid();
 
-    // The guest can no longer authenticate. Remove their stale pre-match
-    // memberships, preserving the other players' roster and room TTL.
+    // This ticket is NOW invalid across nodes. Queue immediate durable cleanup
+    // only AFTER successful revocation: scheduling first could expel a still-
+    // authorized player if revocation later failed.
     var playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User)!;
-    await context.RequestServices.GetRequiredService<IAsyncGuestLobby>()
-        .RemovePlayerFromAllRoomsAsync(playerId, context.RequestAborted);
+    var lobby = context.RequestServices.GetRequiredService<IAsyncGuestLobby>();
+    IGuestExpiryIndex? expiryIndex = null;
+    string? queuedMember = null;
+    if (!environment.IsDevelopment())
+    {
+        expiryIndex = context.RequestServices.GetRequiredService<IGuestExpiryIndex>();
+        try
+        {
+            queuedMember = await expiryIndex.ScheduleRevokedAsync(
+                playerId, context.RequestAborted);
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            // The natural 8h expiry work item remains queued. Still attempt
+            // synchronous cleanup below; never claim immediate recovery if
+            // both operations fail.
+        }
+    }
 
+    var cleanupCompleted = false;
+    try
+    {
+        await lobby.RemovePlayerFromAllRoomsAsync(playerId, context.RequestAborted);
+        cleanupCompleted = true;
+    }
+    catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        // The already-due encrypted queue item is retried from any node on
+        // the next maintenance pass. Do not expose Redis or identity details.
+    }
+
+    // After revocation, even an unsuccessful cleanup cannot re-enable the
+    // ticket. Clear the browser cookie rather than leaving an invalid cookie
+    // that cannot be used to retry logout.
     await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+    if (!cleanupCompleted)
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
+    // Best-effort ack prevents a needless later scan when direct cleanup
+    // succeeded. If ack fails, the worker's replay remains idempotent.
+    if (queuedMember is not null)
+    {
+        try
+        {
+            await expiryIndex!.AcknowledgeAsync(queuedMember, context.RequestAborted);
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            // The queue safely retains a retryable, already-due item.
+        }
+    }
+
     return Results.NoContent();
 }).RequireAuthorization();
 

@@ -102,6 +102,16 @@ internal sealed class TestGuestExpiryIndex(TimeProvider clock) : IGuestExpiryInd
         return Task.CompletedTask;
     }
 
+    public Task<string> ScheduleRevokedAsync(string trustedPlayerId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = Guid.NewGuid().ToString("N");
+        lock (_gate)
+            _pending.Add(key, (trustedPlayerId, clock.GetUtcNow()));
+        return Task.FromResult(key);
+    }
+
     public Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
         CancellationToken cancellationToken = default)
     {

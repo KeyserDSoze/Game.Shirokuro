@@ -33,6 +33,10 @@ public sealed class GuestExpiryIssuanceTests
             return Task.CompletedTask;
         }
 
+        public Task<string> ScheduleRevokedAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult("test-revoked-member");
+
         public Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<DueGuestExpiry>>([]);

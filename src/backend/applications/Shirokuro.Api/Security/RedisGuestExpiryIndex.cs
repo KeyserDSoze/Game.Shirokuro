@@ -45,12 +45,34 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         if (expiresUtc <= _clock.GetUtcNow())
             throw new ArgumentOutOfRangeException(nameof(expiresUtc));
 
+        await SaveAsync(trustedPlayerId, expiresUtc);
+    }
+
+    /// <summary>
+    /// Queue post-revocation lobby cleanup immediately using the same
+    /// encrypted, crash-resilient index as natural session expiration.
+    /// The caller must have already revoked the server-side ticket. Unlike
+    /// natural issuance the score is already due at the current clock time.
+    /// </summary>
+    public async Task<string> ScheduleRevokedAsync(
+        string trustedPlayerId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!ValidGuestId(trustedPlayerId))
+            throw new ArgumentException("Invalid trusted guest identity.",
+                nameof(trustedPlayerId));
+        return await SaveAsync(trustedPlayerId, _clock.GetUtcNow());
+    }
+
+    private async Task<string> SaveAsync(string trustedPlayerId, DateTimeOffset dueUtc)
+    {
         // Do not persist plain guest IDs or session tokens, even as members.
-        var plaintext = expiresUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) +
+        var plaintext = dueUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) +
                         ":" + trustedPlayerId;
         var member = _protector.Protect(plaintext);
         await _database.SortedSetAddAsync(
-            _key, member, CeilingUnixMilliseconds(expiresUtc));
+            _key, member, CeilingUnixMilliseconds(dueUtc));
+        return member;
     }
 
     public async Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(

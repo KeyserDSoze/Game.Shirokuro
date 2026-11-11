@@ -8,6 +8,14 @@ public interface IGuestExpiryIndex
 {
     Task ScheduleAsync(string trustedPlayerId, DateTimeOffset expiresUtc,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Persist an already-due cleanup AFTER an authoritative logout revokes
+    /// the guest. Returns an opaque member for optional acknowledgement if
+    /// synchronous lobby cleanup succeeds. Do not call before revocation.
+    /// </summary>
+    Task<string> ScheduleRevokedAsync(string trustedPlayerId,
+        CancellationToken cancellationToken = default);
     Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
         CancellationToken cancellationToken = default);
     Task AcknowledgeAsync(string protectedMember,

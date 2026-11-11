@@ -84,6 +84,10 @@ public sealed class MultiplayerMetricsTests
         public Task ScheduleAsync(string player, DateTimeOffset expires,
             CancellationToken cancellationToken = default) => Task.CompletedTask;
 
+        public Task<string> ScheduleRevokedAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult("test-revoked-member");
+
         public Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
             CancellationToken cancellationToken = default)
         {

@@ -171,6 +171,106 @@ public sealed class RedisGuestExpiryIndexTests
     }
 
     [Fact]
+    public async Task RevokedSessionSchedulesImmediateEncryptedCrossNodeCleanup()
+    {
+        if (RedisAddress is null) return;
+        using var issuerRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var recoveryRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var directory = Path.Combine(Path.GetTempPath(), "shirokuro-revoked-"
+            + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var issuerKeys = KeyRing(directory);
+            using var recoveryKeys = KeyRing(directory);
+            var clock = new ManualClock();
+            var ns = "revoke-" + Guid.NewGuid().ToString("N");
+            var issuerIndex = new RedisGuestExpiryIndex(
+                issuerRedis.GetDatabase(),
+                issuerKeys.GetRequiredService<IDataProtectionProvider>(),
+                clock, ns);
+            var recoveryIndex = new RedisGuestExpiryIndex(
+                recoveryRedis.GetDatabase(),
+                recoveryKeys.GetRequiredService<IDataProtectionProvider>(),
+                clock, ns);
+            var alice = GuestSessions.NewPlayerId();
+            var bob = GuestSessions.NewPlayerId();
+
+            // The original natural expiry remains in the queue: immediate
+            // revocation adds a separate already-due encrypted record.
+            await issuerIndex.ScheduleAsync(alice, clock.GetUtcNow().AddHours(8));
+            Assert.Empty(await recoveryIndex.ReadDueAsync());
+
+            var storage = new RedisLobbySnapshotStore(recoveryRedis.GetDatabase(),
+                clock, namespaceName: ns);
+            var lobby = new RedisGuestLobbyRuntime(storage, clock);
+            var room = await lobby.CreateAsync(alice,
+                ["white", "black"], "white");
+            await lobby.JoinAsync(room.LobbyId, bob, "black", room.Revision);
+            var before = (await storage.ReadAsync(room.LobbyId))!.Snapshot;
+
+            // The caller may enqueue ONLY after revoking the ticket.
+            // Redis sees an opaque member and a due score, not a guest ID.
+            var opaque = await issuerIndex.ScheduleRevokedAsync(alice);
+            Assert.DoesNotContain(alice, opaque, StringComparison.Ordinal);
+            Assert.DoesNotContain("guest-", opaque, StringComparison.Ordinal);
+            var members = await issuerRedis.GetDatabase().SortedSetRangeByRankAsync(
+                "shirokuro:guest-expiry:{" + ns + "}:v1:pending");
+            Assert.Equal(2, members.Length);
+            Assert.All(members, member =>
+                Assert.DoesNotContain(alice, member.ToString(), StringComparison.Ordinal));
+            var due = Assert.Single(await recoveryIndex.ReadDueAsync());
+            Assert.Equal(opaque, due.ProtectedMember);
+            Assert.Equal(alice, due.PlayerId);
+
+            // Issuer dies or its synchronous lobby cleanup fails.
+            var brokenWorker = new GuestSessionExpiryWorker(
+                new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
+                clock, new FailingLobby(), issuerIndex);
+            await Assert.ThrowsAsync<IOException>(() => brokenWorker.SweepOnceAsync());
+            Assert.Single(await recoveryIndex.ReadDueAsync());
+
+            var recoveredWorker = new GuestSessionExpiryWorker(
+                new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
+                clock, lobby, recoveryIndex);
+            Assert.Equal(1, await recoveredWorker.SweepOnceAsync());
+            Assert.Equal(0, await recoveredWorker.SweepOnceAsync());
+            Assert.Empty(await issuerIndex.ReadDueAsync()); // only 8h item remains
+
+            var after = (await storage.ReadAsync(room.LobbyId))!.Snapshot;
+            Assert.Equal(before.State.Revision + 1, after.State.Revision);
+            Assert.Equal(bob, Assert.Single(after.State.Participants).PlayerId);
+            Assert.Equal(before.LastActivityUtc, after.LastActivityUtc);
+            Assert.Equal(1, (await issuerRedis.GetDatabase().SortedSetLengthAsync(
+                "shirokuro:guest-expiry:{" + ns + "}:v1:pending")));
+        }
+        finally
+        {
+            try { Directory.Delete(directory, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Fact]
+    public async Task RevokedCleanupRejectsForgedIdWithoutWritingToRedis()
+    {
+        if (RedisAddress is null) return;
+        using var connection = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var services = new ServiceCollection();
+        services.AddDataProtection();
+        using var provider = services.BuildServiceProvider();
+        var clock = new ManualClock();
+        var ns = "revoked-validation-" + Guid.NewGuid().ToString("N");
+        var index = new RedisGuestExpiryIndex(connection.GetDatabase(),
+            provider.GetRequiredService<IDataProtectionProvider>(), clock, ns);
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => index.ScheduleRevokedAsync("attacker-raw-client-id"));
+        Assert.False(await connection.GetDatabase().KeyExistsAsync(
+            "shirokuro:guest-expiry:{" + ns + "}:v1:pending"));
+    }
+
+    [Fact]
     public async Task BoundedDueBatchCannotScanUnboundedGuestWork()
     {
         if (RedisAddress is null) return;
