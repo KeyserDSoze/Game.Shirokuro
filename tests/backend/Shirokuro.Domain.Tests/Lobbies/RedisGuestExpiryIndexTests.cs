@@ -273,6 +273,89 @@ public sealed class RedisGuestExpiryIndexTests
     }
 
     [Fact]
+    public async Task RecoveryCutoffFencesOldMembershipEarlyButNeverRemovesNewGuestOrExtendsRoomTtl()
+    {
+        if (RedisAddress is null) return;
+        using var issuerRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var recoveryRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var directory = Path.Combine(Path.GetTempPath(), "shirokuro-recovery-"
+            + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var issuerKeys = KeyRing(directory);
+            using var recoveryKeys = KeyRing(directory);
+            var clock = new ManualClock();
+            var cutoff = clock.GetUtcNow().AddMinutes(2);
+            var ns = "recovery-" + Guid.NewGuid().ToString("N");
+            var issuer = new RedisGuestExpiryIndex(
+                issuerRedis.GetDatabase(),
+                issuerKeys.GetRequiredService<IDataProtectionProvider>(), clock, ns);
+            var recovery = new RedisGuestExpiryIndex(
+                recoveryRedis.GetDatabase(),
+                recoveryKeys.GetRequiredService<IDataProtectionProvider>(), clock, ns,
+                recoveryCutoffUtc: cutoff);
+            var oldGuest = GuestSessions.NewPlayerId();
+            var freshGuest = GuestSessions.NewPlayerId();
+            var oldExpiry = clock.GetUtcNow().AddHours(8);
+            await issuer.ScheduleAsync(oldGuest, oldExpiry);
+            var store = new RedisLobbySnapshotStore(
+                recoveryRedis.GetDatabase(), clock, namespaceName: ns);
+            var lobby = new RedisGuestLobbyRuntime(store, clock);
+            var roster = await lobby.CreateAsync(oldGuest,
+                ["white", "black"], "white");
+
+            // An issuance strictly AFTER cutover has a natural expiry
+            // beyond cutoff+8h. An older natural expiry is *not yet due*
+            // in normal mode, but reconciliation treats it as due.
+            clock.Advance(TimeSpan.FromMinutes(3));
+            await issuer.ScheduleAsync(freshGuest, clock.GetUtcNow().AddHours(8));
+            await lobby.JoinAsync(roster.LobbyId, freshGuest, "black", roster.Revision);
+            var before = (await store.ReadAsync(roster.LobbyId))!.Snapshot;
+            Assert.Empty(await issuer.ReadDueAsync());
+            var early = Assert.Single(await recovery.ReadDueAsync());
+            Assert.Equal(oldGuest, early.PlayerId);
+
+            var worker = new GuestSessionExpiryWorker(
+                new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
+                clock, lobby, recovery, store);
+            Assert.Equal(1, await worker.SweepOnceAsync());
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            var after = (await store.ReadAsync(roster.LobbyId))!.Snapshot;
+            Assert.Equal(before.State.Revision + 1, after.State.Revision);
+            Assert.Equal(freshGuest, Assert.Single(after.State.Participants).PlayerId);
+            Assert.Equal(before.LastActivityUtc, after.LastActivityUtc);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                lobby.JoinAsync(roster.LobbyId, oldGuest, "white", null));
+            Assert.Empty(await issuer.ReadDueAsync());
+            var key = "shirokuro:guest-expiry:{" + ns + "}:v1:pending";
+            var remaining = Assert.Single(await issuerRedis.GetDatabase()
+                .SortedSetRangeByRankAsync(key)).ToString();
+            Assert.DoesNotContain(oldGuest, remaining, StringComparison.Ordinal);
+
+            // Deliberately tamper with the ZSET score for the healthy
+            // future entry: Redis scores alone may not authorize cleanup.
+            // Its authenticated encrypted natural expiry still lies
+            // after cutoff+8h and therefore MUST NOT be acknowledged.
+            await issuerRedis.GetDatabase().SortedSetAddAsync(
+                key, remaining, cutoff.ToUnixTimeMilliseconds());
+            Assert.Empty(await recovery.ReadDueAsync());
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            Assert.NotNull(await store.ReadAsync(roster.LobbyId));
+            Assert.Equal(1, await recoveryRedis.GetDatabase().SortedSetLengthAsync(key));
+            Assert.Equal(freshGuest,
+                Assert.Single((await store.ReadAsync(roster.LobbyId))!
+                    .Snapshot.State.Participants).PlayerId);
+        }
+        finally
+        {
+            try { Directory.Delete(directory, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Fact]
     public async Task BoundedDueBatchCannotScanUnboundedGuestWork()
     {
         if (RedisAddress is null) return;

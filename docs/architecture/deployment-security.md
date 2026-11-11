@@ -814,3 +814,61 @@ operators restore an older **configuration** too, or leave unguarded
 nodes behind the load balancer. Automatic global recovery fencing and
 full post-restore queue/roster reconciliation, secure deployment
 coordination, Sentinel/Cluster HA and real RPO/RTO are still open in #21.
+
+## Pre-cutover guest lobby reconciliation from encrypted Redis expiry queue (#50)
+
+The external cookie `AcceptIssuedAfterUtc` cutoff from #49 rejects historical
+guest authentication after restoring an older RDB, but *authentication
+alone* left the corresponding pre-match roster memberships in Redis until
+their original eight-hour absolute session expiration. Those orphaned
+participants could consume room capacity and appear in a survivor's
+roster even though their cookie no longer works.
+
+With a configured, trusted UTC cutoff, the **Production** Redis guest-expiry
+index now expands its *bounded* due window to the later of the current time
+and **cutoff + eight hours**, matching Shirokuro's fixed eight-hour
+non-sliding guest session lifetime. This advances recovery of naturally
+scheduled, Data Protection-encrypted expiry records created on or before
+the cutover. The existing Redis Lua shared cursor still returns **at most
+128 members per sweep**. Before any cleanup, the index **authenticates
+the protected due timestamp and guest identity** and discards from this
+pass any payload still scheduled beyond both now and the trusted
+recovery ceiling, even if its Redis sorted-set score is manipulated.
+No client input, redis-stored cutoff, untrusted roster claim or new
+public admin route is introduced.
+
+The existing durable worker then executes **fence → administrative
+lobby CAS removal → acknowledgement** for those trusted pre-cutover
+items, preserving survivor activity timestamps and the original
+room TTL. Independent due items continue despite per-item failures,
+while unverifiable encrypted entries stay in the queue for operator
+key-ring recovery. A fresh guest created *after* cutover receives an
+expiry after `cutoff + 8h` and is not selected for premature cleanup.
+Production hosts sharing the same cutoff and Data Protection key ring
+can resume pending reconciliation across crashes and restarts.
+When the recovery cutoff is **absent**, normal expiry scheduling and
+Development's local worker remain unchanged.
+
+**Required deployment precondition:** rotate the external cutoff while
+ingress is **closed** and all old issuing nodes are stopped, then start
+replacement nodes with identical cutoff, matching Data Protection ring
+and Redis state. The guarantee that `expiry <= cutoff + 8h` means
+pre-cutover issuance depends on the fixed 8h issuance contract and
+having no concurrent issuance across the cutover. Do not enable recovery
+while old nodes can continue issuing guest tickets: a ticket registered
+before the cutoff but signed just after it might otherwise have an
+older natural expiry yet be accepted by another node. Changing the
+guest lifetime requires a coordinated migration of this rule and the
+recovery tests. System clocks should be synchronized.
+
+**Limitations:** the queue must contain the authenticated natural
+expiry record created before cookie issuance; a missing entry, lost
+Data Protection key, malformed member or interrupted Redis write
+requires operator remediation. This work does not bulk delete the
+separately stored old Redis session tokens (they remain until their
+original absolute TTL and cannot authenticate due to the cookie cutoff),
+remove unrelated unindexed legacy room snapshots or automatically
+coordinate deployment maintenance. The operator remains responsible
+for verifying all API nodes are guarded before opening ingress.
+Automatic full reconciliation, a persistent global epoch independent
+of snapshots and real TLS Redis Sentinel/Cluster HA are still #21.

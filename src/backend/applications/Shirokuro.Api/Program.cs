@@ -22,6 +22,12 @@ PersistentDataProtection.Configure(
     builder.Services, builder.Configuration, builder.Environment);
 GuestSessionRedisConfiguration.Configure(
     builder.Services, builder.Configuration, builder.Environment);
+// An operator-managed cutoff lives OUTSIDE Redis and therefore survives
+// rollback of an older RDB. Validate it at startup rather than accepting a
+// misformatted setting or treating restored Redis tokens as authority.
+var guestRecoveryCutoffUtc = GuestSessionRecoveryCutoff.Read(
+    builder.Configuration, builder.Environment);
+
 // A bounded HSTS policy for HTTPS-only non-Development ingress. Do not
 // include arbitrary subdomains or request preload before edge TLS is verified.
 builder.Services.AddHsts(options =>
@@ -67,14 +73,9 @@ else
         new RedisGuestExpiryIndex(
             sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
             sp.GetRequiredService<IDataProtectionProvider>(),
-            sp.GetRequiredService<TimeProvider>()));
+            sp.GetRequiredService<TimeProvider>(),
+            recoveryCutoffUtc: guestRecoveryCutoffUtc));
 }
-
-// An operator-managed cutoff lives OUTSIDE Redis and therefore survives
-// rollback of an older RDB. Validate it at startup rather than accepting a
-// misformatted setting or treating restored Redis tokens as authority.
-var guestRecoveryCutoffUtc = GuestSessionRecoveryCutoff.Read(
-    builder.Configuration, builder.Environment);
 
 // The cookie may contain a server-generated, non-verified guest ID.
 // No trusted account login or client-selected player ID is supported.

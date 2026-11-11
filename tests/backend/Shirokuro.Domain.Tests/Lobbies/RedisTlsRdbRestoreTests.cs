@@ -397,13 +397,44 @@ public sealed class RedisTlsRdbRestoreTests
                 Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
             }
 
+            // The recovery-mode expiry worker must also remove old
+            // pre-match memberships BEFORE their original 8h expiration,
+            // while preserving the encrypted-fence/CAS/ack ordering.
+            // Worker startup may have raced and already completed it.
+            var maintenance = Assert.Single(guardedA.Services
+                .GetServices<Microsoft.Extensions.Hosting.IHostedService>()
+                .OfType<GuestSessionExpiryWorker>());
+            await maintenance.SweepOnceAsync();
+            var restoredStorage = guardedA.Services
+                .GetRequiredService<RedisLobbySnapshotStore>();
+            Assert.Null(await restoredStorage.ReadAsync(room));
+            var restoredExpiry = guardedA.Services
+                .GetRequiredService<IConnectionMultiplexer>().GetDatabase();
+            Assert.Equal(0, await restoredExpiry.SortedSetLengthAsync(ExpiryIndexKey));
+
             // New guest sessions after the cutover remain valid across
-            // independently started Production nodes on the same TLS Redis.
+            // independently started Production nodes on the same TLS Redis,
+            // including an explicit additional recovery sweep. New lobby
+            // and expiry entries must not be accidentally purged.
             using var visitor = Client(guardedA);
             var (_, freshCookie) = await Login(visitor);
             using var freshAcrossNodes = Client(guardedB, freshCookie);
             using var freshMe = await freshAcrossNodes.GetAsync("/api/sessions/me");
             Assert.Equal(HttpStatusCode.OK, freshMe.StatusCode);
+            using (var freshCreate = Mutation(HttpMethod.Post, "/api/lobbies",
+                       new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+            using (var createdFresh = await freshAcrossNodes.SendAsync(freshCreate))
+            {
+                Assert.Equal(HttpStatusCode.Created, createdFresh.StatusCode);
+                using var doc = JsonDocument.Parse(await createdFresh.Content.ReadAsStringAsync());
+                var freshRoom = doc.RootElement.GetProperty("lobbyId").GetString()!;
+                await maintenance.SweepOnceAsync();
+                Assert.NotNull(await restoredStorage.ReadAsync(freshRoom));
+                Assert.Equal(1, await restoredExpiry.SortedSetLengthAsync(ExpiryIndexKey));
+                using var freshRoster = await freshAcrossNodes.GetAsync(
+                    "/api/lobbies/" + freshRoom + "/roster");
+                Assert.Equal(HttpStatusCode.OK, freshRoster.StatusCode);
+            }
         }
         finally
         {

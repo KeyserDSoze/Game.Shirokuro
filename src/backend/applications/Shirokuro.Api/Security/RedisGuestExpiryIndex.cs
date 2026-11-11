@@ -49,14 +49,27 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     private readonly TimeProvider _clock;
     private readonly RedisKey _key;
     private readonly RedisKey _cursorKey;
+    private readonly DateTimeOffset? _recoveryDueCeilingUtc;
 
     public RedisGuestExpiryIndex(
         IDatabase database, IDataProtectionProvider protection, TimeProvider clock,
-        string? namespaceName = null)
+        string? namespaceName = null, DateTimeOffset? recoveryCutoffUtc = null)
     {
         _database = database;
         _protector = protection.CreateProtector("Shirokuro.GuestExpiryIndex.v1");
         _clock = clock;
+        // Guest issuance is fixed at 8 hours with no sliding renewal.
+        // A cutoff is trusted only when supplied from deployment config
+        // outside the restored Redis snapshot (never from a client).
+        // Saturate the upper bound for a deliberately future-dated cutoff
+        // rather than allowing a timestamp overflow to bypass maintenance.
+        if (recoveryCutoffUtc.HasValue)
+        {
+            var maximumCutoff = DateTimeOffset.MaxValue - TimeSpan.FromHours(8);
+            _recoveryDueCeilingUtc = recoveryCutoffUtc.Value >= maximumCutoff
+                ? DateTimeOffset.MaxValue
+                : recoveryCutoffUtc.Value.AddHours(8);
+        }
         var name = namespaceName ?? "default";
         if (name.Length is < 1 or > 48 ||
             name.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-'))
@@ -113,9 +126,18 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     {
         cancellationToken.ThrowIfCancellationRequested();
         var now = _clock.GetUtcNow();
+        // In recovery mode, treat the natural expiry jobs of all guests
+        // registered before the out-of-band cutoff as immediately due.
+        // This is safe only under a maintenance gate during cutover; newly
+        // issued guests after the cutoff always have an expiry beyond this
+        // fixed 8h window. Redis scores alone are not trusted: the sealed
+        // due timestamp is validated below before any cleanup.
+        var dueCeiling = _recoveryDueCeilingUtc is { } recovery &&
+            recovery > now ? recovery : now;
         var members = (RedisResult[]?)await _database.ScriptEvaluateAsync(
             RotateDueWindowScript, [_key, _cursorKey],
-            [CeilingUnixMilliseconds(now), BatchSize, (long)CursorLifetime.TotalSeconds])
+            [CeilingUnixMilliseconds(dueCeiling), BatchSize,
+             (long)CursorLifetime.TotalSeconds])
             ?? throw new InvalidDataException("Invalid guest expiry window.");
         if (members.Length > BatchSize)
             throw new InvalidDataException("Invalid guest expiry window size.");
@@ -150,8 +172,9 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             }
 
             var expiry = new DateTimeOffset(ticks, TimeSpan.Zero);
-            if (expiry > now)
-                continue; // defend against timestamp/score mismatch and clock skew
+            if (expiry > now &&
+                (_recoveryDueCeilingUtc is not { } ceiling || expiry > ceiling))
+                continue; // Never trust the mutable Redis score over the protected time.
             result.Add(new DueGuestExpiry(member.ToString(), payload[(separator + 1)..]));
         }
         return result;
