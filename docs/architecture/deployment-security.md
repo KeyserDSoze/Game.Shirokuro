@@ -981,3 +981,50 @@ when data loss or rollback is possible. These deployment controls
 and true automatic failover remain #21.
 
 Verified by [Main CI #43055949194](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43055949194): both Production backend and frontend builds, 363 standard xUnit, five Redis TLS cases, one RDB rollback case, **one real Redis TLS replica promotion case**, 106 Vitest, 24 Playwright and 35 Python tests succeeded. The CI fixture remains a non-production manual promotion demonstration.
+
+## Redis Production readiness must require a writable primary (#53)
+
+The public `/api/health` endpoint is still **process liveness** and does
+not depend on Redis. The bounded, coalesced `/api/ready` endpoint is
+**traffic admission** and must distinguish a writable primary from a
+reachable, TLS-authenticated but **read-only replica**. A Redis `PING`
+and a guest cache `GET` alone cannot establish that new guest sessions,
+revocations, lobby CAS and fencing can succeed.
+
+Outside Development, each fresh three-second readiness probe now performs:
+- An actual `SET` with a ten-second TTL against the independent lobby
+  `IConnectionMultiplexer` connection.
+- A `SetAsync` with a ten-second absolute TTL **followed by a GetAsync**
+  that verifies the value against the independently configured Microsoft
+  `IDistributedCache` guest-session connection.
+- The existing Data Protection encrypted key-ring round-trip.
+
+These use **fixed, reserved technical keys** (`shirokuro:readiness:write-probe-v2`
+and `shirokuro:readiness-write-probe-v2` after the configured session
+cache prefix), a constant non-sensitive value and automatic TTL. No
+user identity, cookie, token, IP address or secret ever appears in the
+probe or its response. There is no keyspace scan, and the three-second
+cached readiness and two-second probe budget avoid a write per HTTP
+request. A missing key, failed read, failed write, lost connection or
+bad Data Protection ring yields only a `503 {"status":"unavailable"}`
+without infrastructure detail.
+
+**TLS replica integration:** the existing #52 real Redis master/replica
+CI drill now boots an extra Production API against the *replica while
+replication is healthy*. Its `/api/health` remains 200 but its
+`/api/ready` must be 503; mere TLS connection and cached reads cannot
+produce a false ready. After the original primary has been stopped and
+the replica is manually promoted, the **same** API targeting the
+replica must recover readiness once the three-second cached failure
+expires. Two new API hosts still verify cookies, lobby state, issuance
+and revocation after promotion. A unit test independently checks that
+a guest cache that permits `GET` but rejects `SET` fails readiness
+and recovers after writes return.
+
+**Limitations:** a successful technical write verifies the particular
+configured endpoints at the instant of the probe, not every Redis
+Cluster hash slot, quorum, persistence, replica lag, zero data loss,
+split-brain avoidance or Sentinel/Cluster discovery. During a role
+transition cached readiness can remain up to three seconds stale:
+edge admission must also use normal authorization/mutation
+fail-closed paths. Operational HA and automatic failover remain #21.

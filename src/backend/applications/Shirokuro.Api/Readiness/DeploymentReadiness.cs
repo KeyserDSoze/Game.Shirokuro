@@ -51,8 +51,9 @@ public sealed class DevelopmentReadiness : IDeploymentReadiness
 /// <summary>
 /// Non-Development readiness checks both independent Redis clients (room state
 /// and guest session cache) plus the configured Data Protection key ring.
-/// Probes are bounded, read-only against Redis, and coalesced for a short time
-/// so an anonymous health endpoint cannot issue a Redis command per request.
+/// Probes require real Redis write capability on BOTH connectors. Technical
+/// short-lived keys are never guest state; work is coalesced for a short time
+/// so an anonymous endpoint cannot trigger unbounded Redis writes.
 /// </summary>
 public sealed class RedisDeploymentReadiness(
     IConnectionMultiplexer redis, IDistributedCache guestSessions,
@@ -60,7 +61,10 @@ public sealed class RedisDeploymentReadiness(
 {
     public static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(2);
     public static readonly TimeSpan CachedFor = TimeSpan.FromSeconds(3);
-    private const string CacheProbeKey = "readiness-probe-v1";
+    private const string CacheProbeKey = "readiness-write-probe-v2";
+    private const string LobbyProbeKey = "shirokuro:readiness:write-probe-v2";
+    private static readonly byte[] ProbeValue = [1];
+    private static readonly TimeSpan ProbeTtl = TimeSpan.FromSeconds(10);
     private readonly SemaphoreSlim _gate = new(1, 1);
     private DateTimeOffset _nextProbeUtc = DateTimeOffset.MinValue;
     private bool _lastResult;
@@ -79,12 +83,27 @@ public sealed class RedisDeploymentReadiness(
 
             try
             {
-                // Both checks must complete: the lobby connector and the
-                // separate IDistributedCache session connector can fail
-                // independently. Neither operation modifies user state.
-                Task lobbyPing = redis.GetDatabase().PingAsync();
-                Task sessionRead = guestSessions.GetAsync(CacheProbeKey, timeout.Token);
-                await Task.WhenAll(lobbyPing, sessionRead).WaitAsync(timeout.Token);
+                // A ping / GET alone incorrectly reports replicas ready.
+                // Both independently configured Production connectors must
+                // be WRITABLE before a node can accept multiplayer traffic.
+                // The fixed probe keys contain no user data, expire rapidly,
+                // and cannot collide with the room/session/expiry keyspaces.
+                Task<bool> lobbyWrite = redis.GetDatabase().StringSetAsync(
+                    LobbyProbeKey, "1", expiry: ProbeTtl);
+                Task cacheWrite = guestSessions.SetAsync(
+                    CacheProbeKey, ProbeValue,
+                    new DistributedCacheEntryOptions
+                    {
+                        AbsoluteExpirationRelativeToNow = ProbeTtl
+                    }, timeout.Token);
+                await Task.WhenAll(lobbyWrite, cacheWrite).WaitAsync(timeout.Token);
+                if (!await lobbyWrite)
+                    throw new InvalidOperationException("Lobby probe write denied.");
+
+                var observed = await guestSessions.GetAsync(
+                    CacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
+                if (observed is null || !observed.AsSpan().SequenceEqual(ProbeValue))
+                    throw new InvalidOperationException("Session probe write unreadable.");
 
                 // A missing or unreadable persisted encrypted key ring must
                 // make a node unready even when Redis answers successfully.

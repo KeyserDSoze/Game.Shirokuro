@@ -31,10 +31,14 @@ public sealed class DeploymentReadinessTests
     private sealed class ToggleSessionStore : IDistributedCache
     {
         private int _reads;
+        private int _writes;
+        private byte[]? _stored;
         public int Reads => Volatile.Read(ref _reads);
+        public int Writes => Volatile.Read(ref _writes);
         public bool Fail { get; set; }
+        public bool FailWrites { get; set; }
 
-        public byte[]? Get(string key) => null;
+        public byte[]? Get(string key) => _stored;
         public Task<byte[]?> GetAsync(string key,
             CancellationToken token = default)
         {
@@ -42,7 +46,7 @@ public sealed class DeploymentReadinessTests
             Interlocked.Increment(ref _reads);
             if (Fail)
                 throw new IOException("sensitive guest-session Redis error");
-            return Task.FromResult<byte[]?>(null);
+            return Task.FromResult(_stored);
         }
         public void Refresh(string key) { }
         public Task RefreshAsync(string key, CancellationToken token = default) =>
@@ -50,9 +54,20 @@ public sealed class DeploymentReadinessTests
         public void Remove(string key) { }
         public Task RemoveAsync(string key, CancellationToken token = default) =>
             Task.CompletedTask;
-        public void Set(string key, byte[] value, DistributedCacheEntryOptions options) { }
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
+            _stored = value.ToArray();
         public Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options,
-            CancellationToken token = default) => Task.CompletedTask;
+            CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _writes);
+            if (FailWrites)
+                throw new IOException("sensitive guest-session write Redis error");
+            Assert.True(options.AbsoluteExpirationRelativeToNow is { } expiry &&
+                expiry > TimeSpan.Zero && expiry <= TimeSpan.FromSeconds(10));
+            _stored = value.ToArray();
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class BrokenReadinessKeys : IReadinessKeyVerifier
@@ -159,16 +174,19 @@ public sealed class DeploymentReadinessTests
                 await AssertStatus(response, HttpStatusCode.OK, "ready");
         }
         Assert.Equal(1, sessionStore.Reads);
+        Assert.Equal(1, sessionStore.Writes);
 
         sessionStore.Fail = true;
         using (var cached = await client.GetAsync("/api/ready"))
             await AssertStatus(cached, HttpStatusCode.OK, "ready");
         Assert.Equal(1, sessionStore.Reads);
+        Assert.Equal(1, sessionStore.Writes);
 
         clock.Advance(TimeSpan.FromSeconds(4));
         using (var unavailable = await client.GetAsync("/api/ready"))
             await AssertStatus(unavailable, HttpStatusCode.ServiceUnavailable, "unavailable");
         Assert.Equal(2, sessionStore.Reads);
+        Assert.Equal(2, sessionStore.Writes);
 
         using (var stillAlive = await client.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, stillAlive.StatusCode);
@@ -178,6 +196,24 @@ public sealed class DeploymentReadinessTests
         using (var recovered = await client.GetAsync("/api/ready"))
             await AssertStatus(recovered, HttpStatusCode.OK, "ready");
         Assert.Equal(3, sessionStore.Reads);
+        Assert.Equal(3, sessionStore.Writes);
+
+        // A replica or misconfigured cache endpoint may respond to GET but
+        // reject SET; that must never declare the Production node ready.
+        sessionStore.FailWrites = true;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var readOnly = await client.GetAsync("/api/ready"))
+            await AssertStatus(readOnly,
+                HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(4, sessionStore.Writes);
+        Assert.Equal(3, sessionStore.Reads); // Failed before read verification.
+
+        sessionStore.FailWrites = false;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recoveredWrite = await client.GetAsync("/api/ready"))
+            await AssertStatus(recoveredWrite, HttpStatusCode.OK, "ready");
+        Assert.Equal(5, sessionStore.Writes);
+        Assert.Equal(4, sessionStore.Reads);
     }
 
     [Fact]

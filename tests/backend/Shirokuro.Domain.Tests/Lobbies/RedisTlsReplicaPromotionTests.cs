@@ -223,6 +223,26 @@ public sealed class RedisTlsReplicaPromotionTests
         }
         Assert.True(replicated, "TLS replica never caught up with guest tokens.");
 
+        // A replica can PING and serve existing GETs, but must NOT pass
+        // readiness: both independent Production Redis connectors need a
+        // short-lived WRITE, not just liveness/read access. This host is
+        // already running BEFORE promotion and keeps its 6383 endpoint.
+        using var replicaObserver = Server(ReplicaConnection);
+        using var observerClient = Client(replicaObserver);
+        using (var replicaLiveness = await observerClient.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, replicaLiveness.StatusCode);
+        using (var replicaUnready = await observerClient.GetAsync("/api/ready"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, replicaUnready.StatusCode);
+            Assert.Equal("no-store",
+                replicaUnready.Headers.CacheControl?.ToString());
+            using var deniedPayload = JsonDocument.Parse(
+                await replicaUnready.Content.ReadAsStringAsync());
+            Assert.Equal("unavailable",
+                deniedPayload.RootElement.GetProperty("status").GetString());
+            Assert.Single(deniedPayload.RootElement.EnumerateObject());
+        }
+
         // Explicitly stop the old writable master BEFORE promoting its
         // replica. This does not model two simultaneously writable primaries.
         await DockerAsync("stop", "-t", "1", MasterContainer);
@@ -248,6 +268,12 @@ public sealed class RedisTlsReplicaPromotionTests
         var promoted = await RedisCliAsync(ReplicaContainer, "INFO", "replication");
         Assert.Contains("role:master", promoted, StringComparison.Ordinal);
         Assert.Equal("PONG", await RedisCliAsync(ReplicaContainer, "PING"));
+
+        // An API already targeting this endpoint becomes ready only AFTER
+        // writable promotion and expiry of its three-second cached 503.
+        await Task.Delay(RedisDeploymentReadiness.CachedFor +
+            TimeSpan.FromMilliseconds(300));
+        await EnsureReadyAsync(observerClient);
 
         // Manual operator redirection to the promoted server. The product
         // does not claim existing multiplexer instances discover this node:
