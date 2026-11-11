@@ -1224,3 +1224,5 @@ connections, explicit eviction, rejection of old cookies/readiness,
 and successful green logout/fence/new issuance. It does not certify
 hot rotation, RPO=0, split brain, distributed keyring changes, managed
 Redis service ACL semantics or real failure-domain HA; these remain #21.
+
+The blue/green direct Redis TLS credential-cutover integration passed in [Main CI #43079718090](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43079718090) SUCCESS: 377 standard xUnit, 5 Production Redis TLS, 2 Redis TLS ACL, **1 new Redis TLS ACL credential rotation integration**, 1 RDB recovery, 1 manual replica promotion, 1 automatic TLS Sentinel ACL failover, 106 Vitest, 24 Playwright, 35 Python, .NET/React builds. The test distinguishes ACL-off (new AUTH denied while existing connections still work) from the operator's explicit `CLIENT KILL USER`, after which blue Production hosts fail readiness/authentication and green remains fully functional. Real rolling deployment still requires operator-controlled ingress draining, rotation procedures and Redis ACL persistence; this does not test live Sentinel credential refresh.
