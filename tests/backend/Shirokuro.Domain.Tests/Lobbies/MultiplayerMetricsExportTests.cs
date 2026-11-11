@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
@@ -166,6 +167,79 @@ public sealed class MultiplayerMetricsExportTests
             Assert.DoesNotContain("password=", payload, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("guest-private", payload, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    private sealed class UnavailableCollector : HttpMessageHandler
+    {
+        public int Requests;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Requests);
+            return Task.FromResult(
+                new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+        }
+    }
+
+    [Fact]
+    public async Task ProductionCollectorOutageDoesNotBlockGuestLoginOrCreatePublicMetricsRoute()
+    {
+        var collector = new UnavailableCollector();
+        using var host = new WebApplicationFactory<Program>().WithWebHostBuilder(
+            builder =>
+            {
+                builder.UseEnvironment(Environments.Production);
+                TestDataProtectionConfiguration.Apply(builder);
+                TestGuestSessionRedisConfiguration.Apply(builder);
+                builder.UseSetting(MultiplayerMetricsExport.EnabledKey, "true");
+                builder.UseSetting(MultiplayerMetricsExport.EndpointKey,
+                    "https://metrics.example/v1/metrics");
+                builder.ConfigureAppConfiguration((_, config) =>
+                    config.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        [MultiplayerMetricsExport.EnabledKey] = "true",
+                        [MultiplayerMetricsExport.EndpointKey] =
+                            "https://metrics.example/v1/metrics",
+                        ["AllowedHosts"] = "game.example",
+                        ["Security:AllowedOrigins:0"] = "https://game.example"
+                    }));
+                builder.ConfigureTestServices(services =>
+                    services.PostConfigureAll<OtlpExporterOptions>(options =>
+                    {
+                        options.HttpClientFactory = () =>
+                            new HttpClient(collector, disposeHandler: false);
+                    }));
+            });
+        using var client = host.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://game.example"),
+            HandleCookies = false,
+            AllowAutoRedirect = false
+        });
+
+        using (var health = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var metrics = await client.GetAsync("/metrics"))
+            Assert.Equal(HttpStatusCode.NotFound, metrics.StatusCode);
+
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Post, "/api/sessions/guest"))
+        {
+            request.Headers.Add("Origin", "https://game.example");
+            request.Headers.Add("X-Shirokuro-Request", "1");
+            using var response = await client.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.True(response.Headers.Contains("Set-Cookie"));
+        }
+
+        var meter = host.Services.GetRequiredService<MeterProvider>();
+        MultiplayerMetrics.RecordReadinessProbe(true);
+        // Failing OTLP delivery must not throw into the game API pipeline.
+        _ = meter.ForceFlush(5_000);
+        Assert.True(Volatile.Read(ref collector.Requests) > 0);
+        using (var afterFailure = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, afterFailure.StatusCode);
     }
 
     [Fact]
