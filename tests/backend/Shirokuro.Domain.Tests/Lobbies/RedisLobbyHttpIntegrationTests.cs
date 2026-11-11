@@ -15,6 +15,7 @@ using Microsoft.Extensions.Options;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Api.Hubs;
 using Shirokuro.Api.Security;using Shirokuro.Api.Lobbies;
+using Shirokuro.Domain.Lobbies;
 using StackExchange.Redis;
 using Xunit;
 
@@ -347,6 +348,44 @@ public sealed class RedisLobbyHttpIntegrationTests
             Assert.Equal(3, after.Snapshot.State.Revision);
             Assert.Equal(bobId, Assert.Single(after.Snapshot.State.Participants).PlayerId);
             Assert.Equal(0, await worker.SweepOnceAsync());
+        }
+    }
+
+    [Fact]
+    public async Task ProductionNeverPublishesAnUnindexedLegacyRoom()
+    {
+        if (ConnectionString is null) return;
+        var (redisA, redisB) = await Redis();
+        using (redisA)
+        using (redisB)
+        {
+            var (sessionProvider, cache) = SharedSessions();
+            using (sessionProvider)
+            {
+                var ns = "legacy-" + Guid.NewGuid().ToString("N");
+                using var serverA = Server(cache, redisA, ns);
+                using var serverB = Server(cache, redisB, ns);
+                using var visitor = Client(serverA);
+                var (actor, cookie) = await Login(visitor);
+                var roomId = "room-" + Guid.NewGuid().ToString("N");
+                var definition = new LobbyDefinition(roomId, ["white", "black"],
+                    OriginalHeroRoster.Ids);
+                var state = LobbyState.Create(definition).Join(actor, "white", 0);
+                var lowLevel = new RedisLobbySnapshotStore(redisA.GetDatabase(),
+                    TimeProvider.System, namespaceName: ns);
+                Assert.True(await lowLevel.CreateAsync(
+                    new LobbySnapshot(state, DateTimeOffset.UtcNow, actor)));
+
+                using var authorized = Client(serverB, cookie);
+                using var response = await authorized.GetAsync(
+                    "/api/lobbies/" + roomId + "/roster");
+                Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+                using var selection = Write(HttpMethod.Patch,
+                    "/api/lobbies/" + roomId + "/hero",
+                    new { heroId = "kira", expectedRevision = 1 });
+                using var blocked = await authorized.SendAsync(selection);
+                Assert.Equal(HttpStatusCode.NotFound, blocked.StatusCode);
+            }
         }
     }
 

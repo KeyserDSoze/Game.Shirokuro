@@ -170,9 +170,13 @@ public sealed class RedisGuestLobbyRuntime(
         return Project(next);
     }
 
-    private async Task<RedisLobbySnapshotStore.Stored> Find(string roomId) =>
-        await store.ReadAsync(roomId) ??
-        throw new KeyNotFoundException("Lobby unavailable.");
+    private async Task<RedisLobbySnapshotStore.Stored> Find(string roomId)
+    {
+        var found = await store.ReadAsync(roomId);
+        if (found is null || !found.Snapshot.QuotaTracked)
+            throw new KeyNotFoundException("Lobby unavailable.");
+        return found;
+    }
 
     private DateTimeOffset NextActivity(RedisLobbySnapshotStore.Stored previous)
     {
