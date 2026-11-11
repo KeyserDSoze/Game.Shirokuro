@@ -224,7 +224,7 @@ public sealed class GuestLogoutRecoveryTests
                     Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
                     Assert.Contains("expires=", Assert.Single(
                         response.Headers.GetValues("Set-Cookie")), StringComparison.OrdinalIgnoreCase);
-                    Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+                    Assert.True(response.Headers.CacheControl?.NoStore == true);
                     Assert.DoesNotContain(alice, await response.Content.ReadAsStringAsync());
                 }
                 Assert.Equal(1, index.RevokedSchedules);

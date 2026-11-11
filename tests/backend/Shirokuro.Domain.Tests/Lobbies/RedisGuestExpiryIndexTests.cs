@@ -261,7 +261,7 @@ public sealed class RedisGuestExpiryIndexTests
         services.AddDataProtection();
         using var provider = services.BuildServiceProvider();
         var clock = new ManualClock();
-        var ns = "revoked-validation-" + Guid.NewGuid().ToString("N");
+        var ns = "rev-" + Guid.NewGuid().ToString("N");
         var index = new RedisGuestExpiryIndex(connection.GetDatabase(),
             provider.GetRequiredService<IDataProtectionProvider>(), clock, ns);
         await Assert.ThrowsAsync<ArgumentException>(
