@@ -24,8 +24,11 @@ internal sealed class MultiplayerMetricCapture : IDisposable
 {
     public sealed record Observation(
         string Name, long Value, IReadOnlyDictionary<string, string> Tags);
+    public sealed record DurationObservation(
+        string Name, double Seconds, IReadOnlyDictionary<string, string> Tags);
 
     private readonly ConcurrentQueue<Observation> _observations = new();
+    private readonly ConcurrentQueue<DurationObservation> _durations = new();
     private readonly MeterListener _listener = new();
 
     public MultiplayerMetricCapture()
@@ -42,11 +45,21 @@ internal sealed class MultiplayerMetricCapture : IDisposable
                 StringComparer.Ordinal);
             _observations.Enqueue(new Observation(instrument.Name, value, pairs));
         });
+        _listener.SetMeasurementEventCallback<double>((instrument, seconds, tags, _) =>
+        {
+            var pairs = tags.ToArray().ToDictionary(
+                tag => tag.Key, tag => tag.Value?.ToString() ?? "",
+                StringComparer.Ordinal);
+            _durations.Enqueue(new DurationObservation(instrument.Name, seconds, pairs));
+        });
         _listener.Start();
     }
 
     public Observation[] For(string name) =>
         _observations.Where(o => o.Name == name).ToArray();
+
+    public DurationObservation[] ForDurations(string name) =>
+        _durations.Where(o => o.Name == name).ToArray();
 
     public void Dispose() => _listener.Dispose();
 }
@@ -173,6 +186,16 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, MutationOutcome.Unavailable);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready: true, ReadinessProbeStage.Success, seconds: 0.001);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready: false, ReadinessProbeStage.RedisWrite, seconds: 0.25);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready: false, ReadinessProbeStage.SessionRead, seconds: 0.5);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready: false, ReadinessProbeStage.KeyRing, seconds: 0.75);
+        MultiplayerMetrics.RecordReadinessDuration(
+            ready: false, ReadinessProbeStage.Timeout, seconds: 2);
         MultiplayerMetrics.RecordUnreadableExpiryItem();
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 0);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 2);
@@ -185,6 +208,44 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, (MutationOutcome)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordExpirySweep(false, true, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordReadinessDuration(
+                false, (ReadinessProbeStage)999, seconds: 1));
+        Assert.Throws<ArgumentException>(() =>
+            MultiplayerMetrics.RecordReadinessDuration(
+                true, ReadinessProbeStage.Timeout, seconds: 2));
+        Assert.Throws<ArgumentException>(() =>
+            MultiplayerMetrics.RecordReadinessDuration(
+                false, ReadinessProbeStage.Success, seconds: 0));
+        foreach (var invalid in new[] { -1d, double.NaN,
+                     double.PositiveInfinity, double.NegativeInfinity })
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                MultiplayerMetrics.RecordReadinessDuration(
+                    true, ReadinessProbeStage.Success, invalid));
+
+        var timing = capture.ForDurations(
+            MultiplayerMetrics.ReadinessDurationSecondsName);
+        foreach (var stage in new[]
+                 { "ok", "redis-write", "session-read", "key-ring", "timeout" })
+            Assert.Contains(timing, observation =>
+                observation.Tags.TryGetValue("stage", out var value) && value == stage);
+        Assert.All(timing, observation =>
+        {
+            Assert.True(double.IsFinite(observation.Seconds) && observation.Seconds >= 0);
+            Assert.Equal(new[] { "outcome", "stage" },
+                observation.Tags.Keys.OrderBy(key => key, StringComparer.Ordinal));
+            Assert.Contains(observation.Tags["outcome"], new[] { "ready", "unavailable" });
+            Assert.Contains(observation.Tags["stage"],
+                new[] { "ok", "redis-write", "session-read", "key-ring", "timeout" });
+            Assert.Equal(observation.Tags["outcome"] == "ready",
+                observation.Tags["stage"] == "ok");
+            foreach (var tag in observation.Tags.Values)
+            {
+                Assert.DoesNotContain("password", tag, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("guest-", tag, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("private", tag, StringComparison.OrdinalIgnoreCase);
+            }
+        });
 
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
             m => m.Tags["policy"] == "session" && m.Tags["outcome"] == "limited");
@@ -348,6 +409,17 @@ public sealed class MultiplayerMetricsTests
         Assert.True(events.Count(x => x.Tags["outcome"] == "ready") >= 2);
         Assert.Contains(events, x => x.Tags["outcome"] == "unavailable");
         Assert.All(events, x => Assert.Single(x.Tags));
+
+        // These are three actual coalesced probes; the intervening cached
+        // readiness requests must NOT inflate the latency distribution.
+        var durations = capture.ForDurations(
+            MultiplayerMetrics.ReadinessDurationSecondsName);
+        Assert.Contains(durations, x => x.Tags["stage"] == "ok" &&
+            x.Tags["outcome"] == "ready");
+        Assert.Contains(durations, x => x.Tags["stage"] == "key-ring" &&
+            x.Tags["outcome"] == "unavailable");
+        Assert.True(durations.Count(x => x.Tags["stage"] == "ok") >= 2);
+        Assert.All(durations, x => Assert.True(x.Seconds >= 0));
     }
 
     [Fact]
