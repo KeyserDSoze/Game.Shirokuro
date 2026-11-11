@@ -56,8 +56,8 @@ else
     // Redis as a single authority. Never fall back to local room state.
     builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
         ConnectionMultiplexer.Connect(
-            ConfigurationOptions.Parse(builder.Configuration[
-                GuestSessionRedisConfiguration.ConnectionStringKey]!)));
+            GuestSessionRedisConfiguration.ReadTlsOptions(
+                builder.Configuration)));
     builder.Services.AddSingleton(provider => new RedisLobbySnapshotStore(
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));

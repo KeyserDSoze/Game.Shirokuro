@@ -1,0 +1,318 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Readiness;
+using Shirokuro.Api.Security;
+using StackExchange.Redis;
+using Xunit;
+
+namespace Shirokuro.Domain.Tests.Lobbies;
+
+/// <summary>
+/// Dedicated CI-only Redis TLS master, replica and three-Sentinel quorum.
+/// Unlike manual promotion (#52), both original Production hosts survive the
+/// automatic Sentinel failover and must rediscover the managed primary via
+/// independent lobby and Microsoft IDistributedCache Redis connections.
+/// </summary>
+public sealed class RedisTlsSentinelFailoverTests
+{
+    private const string OldMaster = "shirokuro-ci-sentinel-master";
+    private const string Replica = "shirokuro-ci-sentinel-replica";
+    private const string Sentinel = "shirokuro-ci-sentinel-1";
+    private static string? SentinelConnection =>
+        Environment.GetEnvironmentVariable("SHIROKURO_TEST_SENTINEL_TLS");
+
+    private static WebApplicationFactory<Program> Server(string connection) =>
+        new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Production");
+            TestDataProtectionConfiguration.Apply(builder);
+            builder.UseSetting(
+                GuestSessionRedisConfiguration.ConnectionStringKey, connection);
+            builder.ConfigureAppConfiguration((_, config) =>
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [GuestSessionRedisConfiguration.ConnectionStringKey] = connection,
+                    ["AllowedHosts"] = "game.example",
+                    ["Security:AllowedOrigins:0"] = "https://game.example"
+                }));
+            // Deliberately NO ConfigureTestServices: both independent managed
+            // Sentinel connections, cookie auth, fencing and durable workers
+            // use exactly the Production dependency injection setup.
+        });
+
+    private static HttpClient Client(WebApplicationFactory<Program> server,
+        string? cookie = null)
+    {
+        var client = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://game.example"),
+            AllowAutoRedirect = false,
+            HandleCookies = false
+        });
+        if (cookie is not null)
+            client.DefaultRequestHeaders.Add("Cookie", cookie);
+        return client;
+    }
+
+    private static HttpRequestMessage Mutation(HttpMethod method, string path,
+        object? body = null)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.Add("Origin", "https://game.example");
+        request.Headers.Add("X-Shirokuro-Request", "1");
+        if (body is not null)
+            request.Content = JsonContent.Create(body);
+        return request;
+    }
+
+    private static async Task<(string Id, string Cookie)> Login(HttpClient client)
+    {
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest");
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return (json.RootElement.GetProperty("playerId").GetString()!,
+            Assert.Single(response.Headers.GetValues("Set-Cookie")).Split(';')[0]);
+    }
+
+    private static string SessionKey(WebApplicationFactory<Program> server, string cookie)
+    {
+        var encoded = Uri.UnescapeDataString(
+            cookie[(cookie.IndexOf('=') + 1)..]);
+        var protector = server.Services
+            .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+            .Get(CookieAuthenticationDefaults.AuthenticationScheme).TicketDataFormat;
+        var ticket = protector.Unprotect(encoded)
+            ?? throw new InvalidOperationException("CI ticket could not be decrypted.");
+        var token = ticket.Principal.FindFirst(GuestSessions.SessionIdClaim)?.Value
+            ?? throw new InvalidOperationException("CI guest token missing.");
+        return "shirokuro:guest-session:" +
+            Convert.ToHexStringLower(SHA256.HashData(Encoding.ASCII.GetBytes(token)));
+    }
+
+    private static async Task<string> DockerAsync(params string[] arguments)
+    {
+        var psi = new ProcessStartInfo("docker")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in arguments)
+            psi.ArgumentList.Add(argument);
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Sentinel CI Docker fixture unavailable.");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited)
+                process.Kill();
+            throw new TimeoutException("Sentinel CI Docker operation timed out.");
+        }
+        var value = await stdout;
+        _ = await stderr;
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException("Sentinel CI Docker command failed.");
+        return value.Trim();
+    }
+
+    private static Task<string> CliAsync(string container, int port,
+        params string[] arguments)
+    {
+        if (container is not (OldMaster or Replica or Sentinel))
+            throw new ArgumentOutOfRangeException(nameof(container));
+        if (port is not (6384 or 6385 or 26380))
+            throw new ArgumentOutOfRangeException(nameof(port));
+        return DockerAsync([
+            "exec", container, "redis-cli", "--tls",
+            "--cacert", "/certs/ca.crt", "-h", "localhost",
+            "-p", port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            .. arguments
+        ]);
+    }
+
+    private static async Task<bool> ReadyAsync(HttpClient client)
+    {
+        using var response = await client.GetAsync("/api/ready");
+        Assert.True(response.StatusCode is HttpStatusCode.OK
+            or HttpStatusCode.ServiceUnavailable);
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal(response.StatusCode == HttpStatusCode.OK ? "ready" : "unavailable",
+            json.RootElement.GetProperty("status").GetString());
+        return response.StatusCode == HttpStatusCode.OK;
+    }
+
+    [Fact]
+    public async Task ThreeTlsSentinelsAutomaticallySwitchBothProductionRedisClientsWithoutRestart()
+    {
+        var connection = SentinelConnection;
+        if (string.IsNullOrWhiteSpace(connection) ||
+            Environment.GetEnvironmentVariable("SHIROKURO_TEST_SENTINEL_CHAOS") != "1")
+            return;
+
+        var config = ConfigurationOptions.Parse(connection);
+        Assert.True(config.Ssl);
+        Assert.Equal("shirokuro-main", config.ServiceName);
+        Assert.Equal(3, config.EndPoints.Count);
+
+        // These two Production TestServers are deliberately never rebuilt
+        // between creation and automatic Sentinel failover.
+        using var first = Server(connection);
+        using var second = Server(connection);
+        using var visitorA = Client(first);
+        using var visitorB = Client(second);
+        Assert.True(await ReadyAsync(visitorA));
+        Assert.True(await ReadyAsync(visitorB));
+
+        var (alice, cookieA) = await Login(visitorA);
+        var (bob, cookieB) = await Login(visitorB);
+        using var memberA = Client(first, cookieA);
+        using var memberB = Client(second, cookieB);
+
+        string room;
+        long revision;
+        using (var create = Mutation(HttpMethod.Post, "/api/lobbies",
+                   new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+        using (var response = await memberA.SendAsync(create))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            using var data = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            room = data.RootElement.GetProperty("lobbyId").GetString()!;
+            revision = data.RootElement.GetProperty("revision").GetInt64();
+        }
+        using (var join = Mutation(HttpMethod.Post, "/api/lobbies/" + room + "/join",
+                   new { teamId = "black", expectedRevision = revision }))
+        using (var response = await memberB.SendAsync(join))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using (var roster = await memberB.GetAsync("/api/lobbies/" + room + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.OK, roster.StatusCode);
+            using var data = JsonDocument.Parse(await roster.Content.ReadAsStringAsync());
+            revision = data.RootElement.GetProperty("revision").GetInt64();
+            Assert.Equal(2, data.RootElement.GetProperty("participants").GetArrayLength());
+        }
+
+        var keyA = SessionKey(first, cookieA);
+        var keyB = SessionKey(second, cookieB);
+        var roomKey = "shirokuro:lobby:{rooms}:v2:room:" +
+            Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(room)));
+        var replicated = false;
+        for (var i = 0; i < 65; i++)
+        {
+            var info = await CliAsync(Replica, 6385, "INFO", "replication");
+            var tokenA = await CliAsync(Replica, 6385, "EXISTS", keyA);
+            var tokenB = await CliAsync(Replica, 6385, "EXISTS", keyB);
+            var roomPresent = await CliAsync(Replica, 6385, "EXISTS", roomKey);
+            if (info.Contains("master_link_status:up", StringComparison.Ordinal) &&
+                tokenA == "1" && tokenB == "1" && roomPresent == "1")
+            {
+                replicated = true;
+                break;
+            }
+            await Task.Delay(200);
+        }
+        Assert.True(replicated, "Sentinel replica did not receive prior writes.");
+
+        // Stop the old primary. The Sentinels independently form quorum 2
+        // and promote the replica: this test NEVER sends REPLICAOF NO ONE.
+        await DockerAsync("stop", "-t", "1", OldMaster);
+
+        var converged = false;
+        for (var i = 0; i < 110; i++)
+        {
+            var elected = await CliAsync(Sentinel, 26380,
+                "SENTINEL", "get-master-addr-by-name", "shirokuro-main");
+            var role = await CliAsync(Replica, 6385, "INFO", "replication");
+            if (elected.Contains("6385", StringComparison.Ordinal) &&
+                role.Contains("role:master", StringComparison.Ordinal))
+            {
+                converged = true;
+                break;
+            }
+            await Task.Delay(500);
+        }
+        Assert.True(converged, "Sentinel quorum failed to promote a new primary.");
+
+        // The original API instances must eventually learn the new managed
+        // primary on BOTH connectors, not just the lobby multiplexer.
+        // During election, authorization/mutations may fail closed. Don't
+        // claim a guaranteed zero-time or zero-loss transition.
+        var admitted = false;
+        for (var i = 0; i < 90; i++)
+        {
+            try
+            {
+                if (await ReadyAsync(visitorA) && await ReadyAsync(visitorB))
+                {
+                    using var a = await memberA.GetAsync("/api/sessions/me");
+                    using var b = await memberB.GetAsync("/api/sessions/me");
+                    if (a.StatusCode == HttpStatusCode.OK &&
+                        b.StatusCode == HttpStatusCode.OK)
+                    {
+                        admitted = true;
+                        break;
+                    }
+                }
+            }
+            catch (RedisException)
+            {
+                // Election and rediscovery are bounded eventual operations.
+            }
+            await Task.Delay(500);
+        }
+        Assert.True(admitted,
+            "Original Production Redis clients did not rediscover Sentinel primary.");
+
+        using (var restored = await memberB.GetAsync("/api/lobbies/" + room + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.OK, restored.StatusCode);
+            using var data = JsonDocument.Parse(await restored.Content.ReadAsStringAsync());
+            Assert.Equal(revision, data.RootElement.GetProperty("revision").GetInt64());
+            var members = data.RootElement.GetProperty("participants").EnumerateArray()
+                .Select(x => x.GetProperty("playerId").GetString()).ToArray();
+            Assert.Equal(2, members.Length);
+            Assert.Contains(alice, members);
+            Assert.Contains(bob, members);
+        }
+        using (var logout = Mutation(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var response = await memberA.SendAsync(logout))
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using (var denied = await memberA.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            first.Services.GetRequiredService<IAsyncGuestLobby>()
+                .JoinAsync(room, alice, "white", null));
+        using (var surviving = await memberB.GetAsync("/api/lobbies/" + room + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.OK, surviving.StatusCode);
+            using var data = JsonDocument.Parse(await surviving.Content.ReadAsStringAsync());
+            Assert.Equal(bob, Assert.Single(data.RootElement
+                .GetProperty("participants").EnumerateArray())
+                .GetProperty("playerId").GetString());
+        }
+        var (_, freshCookie) = await Login(visitorA);
+        using var freshOnOtherNode = Client(second, freshCookie);
+        using var session = await freshOnOtherNode.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, session.StatusCode);
+    }
+}

@@ -211,6 +211,95 @@ jobs:
           docker rm -f shirokuro-ci-redis-ha-replica 2>/dev/null || true
           docker network rm shirokuro-ci-redis-ha 2>/dev/null || true
 
+      # Three TLS-only Sentinel instances (quorum 2) and an isolated
+      # TLS master/replica on host LOOPBACK. This runner is Linux; the
+      # separate host-network ports avoid Docker-private IPs being advertised
+      # to managed StackExchange.Redis clients outside the Docker network.
+      # All five containers have distinct names and are deleted on failure.
+      - name: Start isolated Redis TLS Sentinel quorum fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(mktemp -d /tmp/shirokuro-ci-sentinel-XXXXXX)"
+          echo "SHIROKURO_TEST_SENTINEL_DIR=$state" >> "$GITHUB_ENV"
+          for id in 1 2 3; do
+            mkdir -p "$state/sentinel-$id"
+            chmod 777 "$state/sentinel-$id"
+            port=$((26379 + id))
+            cat > "$state/sentinel-$id/sentinel.conf" <<EOF
+          port 0
+          tls-port $port
+          bind 127.0.0.1
+          protected-mode no
+          tls-cert-file /certs/server.crt
+          tls-key-file /certs/server.key
+          tls-ca-cert-file /certs/ca.crt
+          tls-auth-clients no
+          tls-replication yes
+          sentinel monitor shirokuro-main 127.0.0.1 6384 2
+          sentinel down-after-milliseconds shirokuro-main 1000
+          sentinel failover-timeout shirokuro-main 8000
+          sentinel parallel-syncs shirokuro-main 1
+          EOF
+            chmod 666 "$state/sentinel-$id/sentinel.conf"
+          done
+
+          docker run -d --name shirokuro-ci-sentinel-master --network host \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            redis:7.4-alpine redis-server \
+            --bind 127.0.0.1 --port 0 --tls-port 6384 \
+            --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no \
+            --save "" --appendonly no
+          docker run -d --name shirokuro-ci-sentinel-replica --network host \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            redis:7.4-alpine redis-server \
+            --bind 127.0.0.1 --port 0 --tls-port 6385 \
+            --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no \
+            --tls-replication yes --replicaof 127.0.0.1 6384 \
+            --save "" --appendonly no
+
+          for id in 1 2 3; do
+            docker run -d --name "shirokuro-ci-sentinel-$id" --network host \
+              -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+              -v "$state/sentinel-$id:/data" \
+              redis:7.4-alpine redis-server /data/sentinel.conf --sentinel
+          done
+          for attempt in $(seq 1 90); do
+            if docker exec shirokuro-ci-sentinel-1 redis-cli --tls \
+                --cacert /certs/ca.crt -h localhost -p 26380 \
+                SENTINEL get-master-addr-by-name shirokuro-main \
+                2>/dev/null | grep -qx 6384 &&
+               docker exec shirokuro-ci-sentinel-replica redis-cli --tls \
+                --cacert /certs/ca.crt -h localhost -p 6385 \
+                INFO replication 2>/dev/null | grep -q 'master_link_status:up'; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "Sentinel TLS quorum fixture did not synchronize."
+          exit 1
+
+      - name: Test automatic TLS Sentinel rediscovery and running API reconnect
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsSentinelFailoverTests'
+        env:
+          SHIROKURO_TEST_SENTINEL_TLS: localhost:26380,localhost:26381,localhost:26382,serviceName=shirokuro-main,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=4000,connectRetry=1
+          SHIROKURO_TEST_SENTINEL_CHAOS: '1'
+
+      - name: Destroy isolated Redis Sentinel TLS quorum fixture
+        if: always()
+        shell: bash
+        run: |
+          for id in 1 2 3; do
+            docker rm -f "shirokuro-ci-sentinel-$id" 2>/dev/null || true
+          done
+          docker rm -f shirokuro-ci-sentinel-master 2>/dev/null || true
+          docker rm -f shirokuro-ci-sentinel-replica 2>/dev/null || true
+          if [ -n "${SHIROKURO_TEST_SENTINEL_DIR:-}" ]; then
+            sudo rm -rf -- "$SHIROKURO_TEST_SENTINEL_DIR"
+          fi
+
       - name: Destroy ephemeral Redis TLS certificates and container
         if: always()
         shell: bash

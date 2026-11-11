@@ -23,6 +23,25 @@ public static class GuestSessionRedisConfiguration
         if (environment.IsDevelopment())
             return; // Local Dev continues to use the tested in-memory registry.
 
+        var parsed = ReadTlsOptions(configuration);
+
+        services.AddStackExchangeRedisCache(options =>
+        {
+            options.ConfigurationOptions = parsed;
+            options.InstanceName = "shirokuro:";
+        });
+    }
+
+    /// <summary>
+    /// Both independent Production Redis connectors must use the same
+    /// validated TLS configuration. StackExchange.Redis interprets an
+    /// optional serviceName as Sentinel managed-primary discovery and
+    /// updates the managed multiplexer on Sentinel switch events.
+    /// Never log raw connection options or expose parsing errors.
+    /// </summary>
+    public static ConfigurationOptions ReadTlsOptions(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
         var value = configuration[ConnectionStringKey];
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException(
@@ -42,10 +61,7 @@ public static class GuestSessionRedisConfiguration
                 "Guest-session Redis configuration requires a valid TLS connection.");
         }
 
-        services.AddStackExchangeRedisCache(options =>
-        {
-            options.ConfigurationOptions = parsed;
-            options.InstanceName = "shirokuro:";
-        });
+        return parsed;
     }
+
 }
