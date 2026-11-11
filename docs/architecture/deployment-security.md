@@ -553,3 +553,44 @@ lost keys or corrupted records still need operator remediation. A severe
 multi-node Redis outage, wrong certificates, missing keyring or sustained
 excess work can still delay cleanup. Redis HA/failover deployment, durable
 accounts and production alerting stay open in #21.
+
+## Production Redis TLS outage and same-process recovery simulation (#46)
+
+The isolated GitHub Actions Redis TLS fixture from #43 now optionally runs a
+**temporary service outage** test. It starts **two independent running
+Production TestServers** with the real TLS Redis-backed session cache,
+mutation limiter, lobby coordinator, Data Protection key ring, and expiry
+worker. The test creates live guest tickets and a shared room before
+suspending only the ephemeral `shirokuro-ci-redis-tls` container. The
+container is **paused, not removed**, so it retains all keys, session state
+and room revisions; the test unpauses it in a `finally` block even if an
+assertion fails.
+
+During this induced Redis outage:
+- `GET /api/health` remains process liveness (200).
+- After the documented 3-second readiness cache expires, both nodes'
+  `GET /api/ready` respond with minimal `503 {"status":"unavailable"}`
+  and `Cache-Control: no-store`, bounded by the normal 2-second probe.
+- Previously signed cookies **cannot authorize a request** while Redis
+  cannot validate their server-side token (401); an attempted new guest
+  issuance fails closed (503) without falling back to process-local state
+  or leaking session identities.
+- The TLS trust/hostname validation and strict HTTPS ingress remain
+  enforced throughout; no certificate callback or insecure connection is
+  introduced.
+
+When the same TLS Redis process resumes, **both API nodes remain running**.
+The test polls readiness with a bounded deadline, validates the **same
+original cookies** across nodes and confirms that the unchanged shared room
+still has its original revision and participants. A subsequent logout must
+revoke the original guest token and remove only that player's membership.
+This test is explicitly gated by `SHIROKURO_TEST_REDIS_CHAOS=1` in the
+dedicated CI TLS job; no production or local environment controls Docker,
+and no browser request supplies a Docker command or container name.
+
+**Important scope limit:** pausing and resuming *one* Redis instance verifies
+fail-closed behavior during a **temporary outage and reconnect**. It is
+not a Redis Sentinel/Cluster failover, leader promotion, persistent
+disaster recovery, network partition, load-balancer test, or production SLA
+measurement. Replica promotion, TLS high availability, backup/restore,
+real certificate rotation and operational monitoring/alerts remain #21.

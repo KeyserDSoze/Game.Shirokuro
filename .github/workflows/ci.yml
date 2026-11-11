@@ -97,6 +97,9 @@ jobs:
         run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsProductionTests'
         env:
           SHIROKURO_TEST_REDIS_TLS: localhost:6380,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
+          # Explicit opt-in: only the dedicated ephemeral TLS fixture may be
+          # paused, with a guaranteed unpause in the xUnit test finally block.
+          SHIROKURO_TEST_REDIS_CHAOS: '1'
 
       - name: Destroy ephemeral Redis TLS certificates and container
         if: always()
