@@ -9,6 +9,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shirokuro.Api.Readiness;
+using Shirokuro.Api.Security;
 using StackExchange.Redis;
 using Xunit;
 
@@ -168,6 +169,7 @@ public sealed class DeploymentReadinessTests
         var clock = new ManualClock();
         using var server = Production(redis, sessionStore, clock);
         using var client = Client(server);
+        using var metrics = new MultiplayerMetricCapture();
 
         // Repeated and concurrent public probes must not run an unbounded
         // number of session-cache/Redis commands.
@@ -219,6 +221,22 @@ public sealed class DeploymentReadinessTests
             await AssertStatus(recoveredWrite, HttpStatusCode.OK, "ready");
         Assert.Equal(5, sessionStore.Writes);
         Assert.Equal(4, sessionStore.Reads);
+
+        // The failure phase is finite and diagnostic-only. It must not
+        // expose which key, cookie, Redis endpoint or exception was used.
+        var durations = metrics.ForDurations(
+            MultiplayerMetrics.ReadinessDurationSecondsName);
+        Assert.Contains(durations, x => x.Tags["stage"] == "session-read" &&
+            x.Tags["outcome"] == "unavailable");
+        Assert.Contains(durations, x => x.Tags["stage"] == "redis-write" &&
+            x.Tags["outcome"] == "unavailable");
+        Assert.Contains(durations, x => x.Tags["stage"] == "ok" &&
+            x.Tags["outcome"] == "ready");
+        Assert.All(durations, x => Assert.All(x.Tags.Values, tag =>
+        {
+            Assert.DoesNotContain("sensitive", tag, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("guest-", tag, StringComparison.OrdinalIgnoreCase);
+        }));
     }
 
     [Fact]
@@ -258,8 +276,12 @@ public sealed class DeploymentReadinessTests
         using var server = Production(redis, new ToggleSessionStore(),
             new ManualClock(), brokenKeys: true);
         using var client = Client(server);
+        using var metrics = new MultiplayerMetricCapture();
         using var response = await client.GetAsync("/api/ready");
         await AssertStatus(response, HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Contains(metrics.ForDurations(MultiplayerMetrics.ReadinessDurationSecondsName),
+            x => x.Tags["stage"] == "key-ring" &&
+                x.Tags["outcome"] == "unavailable");
     }
 
     [Fact]
@@ -339,6 +361,7 @@ public sealed class DeploymentReadinessTests
         var clock = new ManualClock();
         using var server = Production(redis, store, clock);
         using var client = Client(server);
+        using var metrics = new MultiplayerMetricCapture();
 
         var responses = await Task.WhenAll(Enumerable.Range(0, 16)
             .Select(_ => client.GetAsync("/api/ready")));
@@ -357,5 +380,15 @@ public sealed class DeploymentReadinessTests
             await AssertStatus(recovered, HttpStatusCode.OK, "ready");
         Assert.Equal(2, store.Reads);
         Assert.Equal(2, store.Writes);
+
+        var durations = metrics.ForDurations(
+            MultiplayerMetrics.ReadinessDurationSecondsName);
+        Assert.Contains(durations, measurement =>
+            measurement.Tags["stage"] == "timeout" &&
+            measurement.Tags["outcome"] == "unavailable" &&
+            measurement.Seconds >= 1.8);
+        Assert.Contains(durations, measurement =>
+            measurement.Tags["stage"] == "ok" &&
+            measurement.Tags["outcome"] == "ready");
     }
 }
