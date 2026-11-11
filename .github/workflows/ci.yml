@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Only the newest commit on each ref needs a full multiplayer CI run.
+# PRs on different branches keep independent groups.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
