@@ -1,14 +1,20 @@
 using System.Net;
+using System.Security.Claims;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.SignalR;using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using Shirokuro.Api.Lobbies;
+using Microsoft.Extensions.Options;
+using Shirokuro.Application.Lobbies;
+using Shirokuro.Api.Hubs;
+using Shirokuro.Api.Security;using Shirokuro.Api.Lobbies;
 using StackExchange.Redis;
 using Xunit;
 
@@ -21,6 +27,25 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 /// </summary>
 public sealed class RedisLobbyHttpIntegrationTests
 {
+    private sealed class FakeHubContext(ClaimsPrincipal user) : HubCallerContext
+    {
+        public override string ConnectionId => "test-crossnode";
+        public override string? UserIdentifier => "spoofed-identity";
+        public override ClaimsPrincipal User => user;
+        public override IDictionary<object, object?> Items { get; } =
+            new Dictionary<object, object?>();
+        public override IFeatureCollection Features { get; } = new FeatureCollection();
+        public override CancellationToken ConnectionAborted => CancellationToken.None;
+        public override void Abort() { }
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private DateTimeOffset _now = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void Advance(TimeSpan duration) => _now = _now.Add(duration);
+    }
+
     private static string? ConnectionString =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS");
 
@@ -181,11 +206,31 @@ public sealed class RedisLobbyHttpIntegrationTests
                 using (var conflict = await bobB.SendAsync(stale))
                     Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
 
+                // Simulate an already-open SignalR method on B, using the
+                // signed principal cached before logout. Hub DI must use
+                // the same Redis coordinator as the HTTP roster endpoints.
+                var ticketFormat = serverA.Services
+                    .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+                    .Get(CookieAuthenticationDefaults.AuthenticationScheme).TicketDataFormat;
+                var principal = ticketFormat.Unprotect(aliceCookie.Split('=', 2)[1])!.Principal;
+                var hubOnB = new LobbyRosterHub(
+                    serverB.Services.GetRequiredService<LobbyRosterReader>(),
+                    serverB.Services.GetRequiredService<GuestSessionRegistry>(),
+                    serverB.Services.GetRequiredService<IAsyncGuestLobby>())
+                {
+                    Context = new FakeHubContext(principal)
+                };
+                Assert.Equal(sharedRoom, (await hubOnB.GetRoster(sharedRoom)).LobbyId);
+
                 // Logout on B revokes A's session in shared cache, then finds
                 // and removes Alice from all Redis rooms without renewing TTL.
                 using (var logout = Write(HttpMethod.Delete, "/api/sessions/guest"))
                 using (var signedOut = await aliceB.SendAsync(logout))
                     Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
+
+                Assert.Equal("Lobby unavailable.",
+                    (await Assert.ThrowsAsync<HubException>(
+                        () => hubOnB.GetRoster(sharedRoom))).Message);
 
                 using (var stolen = await aliceA.GetAsync(
                     "/api/lobbies/" + sharedRoom + "/roster"))
@@ -256,6 +301,52 @@ public sealed class RedisLobbyHttpIntegrationTests
                 Assert.Equal(2, doc.RootElement.GetProperty("revision").GetInt64());
                 Assert.Equal(2, doc.RootElement.GetProperty("participants").GetArrayLength());
             }
+        }
+    }
+
+    [Fact]
+    public async Task SessionExpiryWorkerOnAnotherNodeRemovesMemberWithoutExtendingTtl()
+    {
+        if (ConnectionString is null) return;
+        var (redisA, redisB) = await Redis();
+        using (redisA)
+        using (redisB)
+        {
+            var clock = new ManualClock();
+            var ns = "expired-" + Guid.NewGuid().ToString("N");
+            var storeA = new RedisLobbySnapshotStore(redisA.GetDatabase(), clock,
+                namespaceName: ns);
+            var storeB = new RedisLobbySnapshotStore(redisB.GetDatabase(), clock,
+                namespaceName: ns);
+            var onA = new RedisGuestLobbyRuntime(storeA, clock);
+            var onB = new RedisGuestLobbyRuntime(storeB, clock);
+            var registry = new GuestSessionRegistry(clock);
+            var aliceId = GuestSessions.NewPlayerId();
+            var bobId = GuestSessions.NewPlayerId();
+            registry.Register(aliceId, clock.GetUtcNow().AddHours(8));
+
+            // The room has recent activity shortly before the guest's
+            // absolute 8h session expiry, so it must survive cleanup.
+            clock.Advance(TimeSpan.FromMinutes(479));
+            var room = await onA.CreateAsync(aliceId,
+                ["white", "black"], "white");
+            var joined = await onB.JoinAsync(
+                room.LobbyId, bobId, "black", room.Revision);
+            var before = (await storeA.ReadAsync(room.LobbyId))!;
+            Assert.Equal(2, joined.Revision);
+
+            clock.Advance(TimeSpan.FromMinutes(2));
+            var worker = new GuestSessionExpiryWorker(registry,
+                new InMemoryLobbyCoordinator(), clock, onB);
+            Assert.Equal(1, await worker.SweepOnceAsync());
+
+            var after = (await storeA.ReadAsync(room.LobbyId))!;
+            Assert.Equal(before.Snapshot.LastActivityUtc,
+                after.Snapshot.LastActivityUtc);
+            Assert.Equal(aliceId, after.Snapshot.CreatorId);
+            Assert.Equal(3, after.Snapshot.State.Revision);
+            Assert.Equal(bobId, Assert.Single(after.Snapshot.State.Participants).PlayerId);
+            Assert.Equal(0, await worker.SweepOnceAsync());
         }
     }
 
