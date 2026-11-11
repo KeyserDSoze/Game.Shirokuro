@@ -44,18 +44,34 @@ public sealed class MultiplayerMetricsExportTests
             Uri Uri, string MediaType, byte[] Body,
             bool HasAuthorization, bool HasCookie)> Calls = new();
 
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request, CancellationToken cancellationToken)
+        private HttpResponseMessage Capture(HttpRequestMessage request, byte[] body)
         {
-            var body = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
             Calls.Enqueue((
                 request.RequestUri!,
-                request.Content.Headers.ContentType?.MediaType ?? "",
+                request.Content!.Headers.ContentType?.MediaType ?? "",
                 body,
                 request.Headers.Contains("Authorization") ||
                     request.Headers.ProxyAuthorization is not null,
                 request.Headers.Contains("Cookie")));
             return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+
+        // OTLP metric ForceFlush may use the synchronous HttpClient.Send
+        // path. A fake handler implementing SendAsync alone will silently
+        // fail export (ForceFlush=false) without exercising the collector.
+        protected override HttpResponseMessage Send(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var body = request.Content!.ReadAsByteArrayAsync(cancellationToken)
+                .GetAwaiter().GetResult();
+            return Capture(request, body);
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var body = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
+            return Capture(request, body);
         }
     }
 
@@ -187,13 +203,16 @@ public sealed class MultiplayerMetricsExportTests
     {
         public int Requests;
 
-        protected override Task<HttpResponseMessage> SendAsync(
+        protected override HttpResponseMessage Send(
             HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref Requests);
-            return Task.FromResult(
-                new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+            return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
         }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(Send(request, cancellationToken));
     }
 
     [Fact]
