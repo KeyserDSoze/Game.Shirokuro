@@ -29,9 +29,10 @@ CSRF trust. No configured origin means all guest/lobby mutations return 403,
 while health/read-only routes continue working. In Development, only a local
 loopback API same-origin or the explicit `localhost:5173` /
 `127.0.0.1:5173` Vite origins are accepted. During Development, only
-the two Vite origins allow CORS credentials (never `*`). Guest issuance
-is limited to 12 POSTs per minute per remote IP with no queue, **per
-server instance**. See [deployment-security.md](deployment-security.md).
+the two Vite origins allow CORS credentials (never `*`). Guest issuance is limited to 12 POSTs per minute per trusted remote IP
+with no queue. Since #37 this limit is **shared via Redis across all
+non-Development API instances**; local Development retains the
+process-local limiter. See [deployment-security.md](deployment-security.md).
 
 Follow-up #23 now records a **separate 128-bit random session ID** in the
 signed cookie and in a server-side registry alongside the guest's player ID
@@ -77,8 +78,10 @@ logout B revokes the credential across nodes and removes that guest from
 rooms created on A, without renewing their idle TTL. The 5-minute
 expiry worker uses the same coordinator, but notifications about naturally
 expired sessions are queued on the issuing process and may be lost if it
-crashes. Crash-proof reconciliation and per-IP distributed rate limits
-are still pending #21. Development remains completely in-memory. With #31, non-Development HTTP is denied for all API and SignalR
+crashes. Crash-proof reconciliation and full multi-IP anti-abuse hardening
+are still pending #21. Per-IP issuance and creation limits are now
+distributed on non-Development APIs (#37); Development remains
+completely in-memory. With #31, non-Development HTTP is denied for all API and SignalR
 routes (403 without redirect). Trusted proxies can report HTTPS only
 through the #29 allowlisted peer mechanism; direct clients cannot grant
 themselves HTTPS with `X-Forwarded-Proto`. A bounded 30-day HSTS header

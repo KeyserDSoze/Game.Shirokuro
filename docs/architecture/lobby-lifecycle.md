@@ -237,10 +237,47 @@ only; production configuration requires TLS as described in
 
 Shared pre-match room state and session revocation are now implemented
 outside Development, but **this is not public production readiness**.
-Per-IP rate limiting remains local to each API process; queued guest
-expiry notifications originate on the issuing node and may be lost after
+Since #37, per-IP guest issuance (12/min) and room creation (8/min)
+limits are enforced with Redis across non-Development APIs, not just
+per process. Queued guest expiry notifications originate on the issuing
+node and may be lost after
 a crash; recovery/reconciliation of stale membership, Redis TLS
 operational failover, deployment ingress/certificates, observability,
 account upgrade and multi-node soak/performance tests still need work.
 A logout racing a previously authenticated in-flight mutation needs
-further hardening. Those remain tracked under #21.
+further hardening. Redis failover, multi-IP/Sybil abuse prevention and
+observability are still tracked under #21.
+
+## Distributed per-IP mutation limits (#37)
+
+Production and Staging attach server-owned `GuestMutationRateLimit`
+metadata to exactly two POST endpoints: `/api/sessions/guest` at
+**12 requests / 60 seconds per IP** and `/api/lobbies` at
+**8 requests / 60 seconds per IP**. A middleware after trusted-proxy
+forwarding, Host/HTTPS validation and routing checks this metadata.
+It uses `RedisGuestMutationLimiter` with a single-key Redis Lua
+check/increment: a fixed 60-second TTL starting on the first request
+is never extended by later successful or rejected requests.
+Limits are shared by all application nodes through the same Redis
+connection used for guest session and room state (#33–#36).
+Redis unavailable means HTTP **503** without issuing a cookie or
+creating a room; a denied rate limit returns **429** with Retry-After.
+No fallback to per-process tokens is allowed in non-Development.
+
+The partition comes from the **trusted** connection remote IP, only
+after `TrustedProxyForwarding` has optionally consumed the
+rightmost single hop from explicitly configured peers (#29).
+Arbitrary `X-Forwarded-For` from unknown peers is ignored. IPv4 and
+IPv4-mapped IPv6 are canonicalized to the same partition; the Redis
+key contains only a SHA-256 digest of the IP bytes, alongside the
+server-controlled policy scope, not the raw address, cookie or invite.
+These technical protections are not a guarantee against multiple
+identities, NAT-sharing, rotating IP pools or distributed attacks.
+
+The backend CI checks Redis Lua races and physical expiry with two
+independent connections, and independent Production TestServers
+perform concurrent session issuance and lobby creation. Additional
+regressions check a Redis outage (503), Host/HTTPS/CSRF gates,
+trusted-proxy partitioning and untrusted header spoof attempts.
+Development retains its established in-memory .NET limiter so
+local Vite/Playwright workflows do not require Redis.

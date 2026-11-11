@@ -194,7 +194,8 @@ Since #36, non-Development lobby API mutations, member-scoped HTTP and
 SignalR roster reads, and logout/expiry membership cleanup use the
 **Redis coordinator**, not the process-local one. The same TLS Redis
 connection configuration is used for sessions and rooms, with fail-closed
-behavior on outages. Per-IP rate limits and expiry-notification queues
+behavior on outages. Since #37, the guest-session/room-creation **per-IP
+rate limits are also shared via Redis**, while expiry-notification queues
 remain local to the originating API process. Production needs Redis TLS
 network access control, durable storage/backup and tested failover.
 The xUnit integration uses **two Production TestServers, independent
@@ -214,7 +215,30 @@ writes, HSTS, ignored `X-Forwarded-Proto` from unknown peers and
 unchanged local Development HTTP behavior. The Playwright local-browser
 workflows remain unchanged.
 
+## Redis distributed API mutation throttling (#37)
+
+Only the two endpoints that create server resources consume permits:
+`POST /api/sessions/guest` is limited to **12/min/IP** and
+`POST /api/lobbies` to **8/min/IP**. In non-Development these are
+**Redis-backed, cluster-wide** fixed 60-second windows with atomic
+Lua check-and-increment, no token queue and no sliding refresh.
+Rate budget is based on ASP.NET `Connection.RemoteIpAddress` AFTER
+allowlisted proxy forwarding (#29), not arbitrary client headers.
+Policy scope and SHA-256 of the canonical IP are all that appear
+in Redis key names; no cookie, invitation ID, guest identity or raw
+IP address is put in keys or logs by this component. Redis errors
+return 503 fail-closed without issuing a new session or lobby,
+and over-budget requests return 429 with Retry-After. Development
+continues to use the .NET in-memory rate limiter.
+
+Use **exact trusted proxy addresses** and strip untrusted forwarding
+headers at the ingress. All API nodes must share the same TLS Redis
+service and credentials. A per-IP limit can affect users sharing NAT
+and cannot prevent abuse spread over multiple IP addresses.
+TestServer/CI Redis is local non-TLS and does not prove TLS availability,
+persistence after failover or operation under network partitions.
+
 This does not solve crash-proof expired session cleanup, edge TLS/network
-validation, distributed per-IP limits, Redis availability/failover or
+validation, rotating-IP/Sybil attacks, Redis availability/failover or
 durable player accounts:
 all remain open in #21.
