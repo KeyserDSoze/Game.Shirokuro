@@ -37,16 +37,21 @@ public sealed class DeploymentReadinessTests
         public int Writes => Volatile.Read(ref _writes);
         public bool Fail { get; set; }
         public bool FailWrites { get; set; }
+        public TaskCompletionSource<bool>? ReadStarted { get; set; }
+        public Task? ReadBarrier { get; set; }
 
         public byte[]? Get(string key) => _stored;
-        public Task<byte[]?> GetAsync(string key,
+        public async Task<byte[]?> GetAsync(string key,
             CancellationToken token = default)
         {
             token.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _reads);
+            ReadStarted?.TrySetResult(true);
+            if (ReadBarrier is { } barrier)
+                await barrier.WaitAsync(token);
             if (Fail)
                 throw new IOException("sensitive guest-session Redis error");
-            return Task.FromResult(_stored);
+            return _stored;
         }
         public void Refresh(string key) { }
         public Task RefreshAsync(string key, CancellationToken token = default) =>
@@ -273,4 +278,85 @@ public sealed class DeploymentReadinessTests
         using var response = await client.GetAsync("/api/ready");
         await AssertStatus(response, HttpStatusCode.OK, "ready");
     }
+
+
+    [Fact]
+    public async Task CancellingOneHttpWaiterDoesNotCancelTheSharedRedisProbe()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var store = new ToggleSessionStore();
+        var readStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRead = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        store.ReadStarted = readStarted;
+        store.ReadBarrier = releaseRead.Task;
+        var clock = new ManualClock();
+        using var server = Production(redis, store, clock);
+        using var client = Client(server);
+        using var cancelled = new CancellationTokenSource();
+
+        var firstRequest = client.GetAsync("/api/ready", cancelled.Token);
+        await readStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var survivingRequests = Enumerable.Range(0, 16)
+            .Select(_ => client.GetAsync("/api/ready"))
+            .ToArray();
+
+        // The original HTTP request disconnects while the shared session
+        // read is blocked; later callers still need the successful result.
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await firstRequest);
+        releaseRead.TrySetResult(true);
+
+        var responses = await Task.WhenAll(survivingRequests);
+        foreach (var response in responses)
+        {
+            using (response)
+                await AssertStatus(response, HttpStatusCode.OK, "ready");
+        }
+        Assert.Equal(1, store.Reads);
+        Assert.Equal(1, store.Writes);
+
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var fresh = await client.GetAsync("/api/ready"))
+            await AssertStatus(fresh, HttpStatusCode.OK, "ready");
+        Assert.Equal(2, store.Reads);
+        Assert.Equal(2, store.Writes);
+    }
+
+    [Fact]
+    public async Task TimedOutSharedProbeFailsClosedWithoutQueuingMoreRedisChecks()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var store = new ToggleSessionStore
+        {
+            ReadBarrier = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously).Task
+        };
+        var clock = new ManualClock();
+        using var server = Production(redis, store, clock);
+        using var client = Client(server);
+
+        var responses = await Task.WhenAll(Enumerable.Range(0, 16)
+            .Select(_ => client.GetAsync("/api/ready")));
+        foreach (var response in responses)
+        {
+            using (response)
+                await AssertStatus(response,
+                    HttpStatusCode.ServiceUnavailable, "unavailable");
+        }
+        Assert.Equal(1, store.Reads);
+        Assert.Equal(1, store.Writes);
+
+        store.ReadBarrier = null;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(2, store.Reads);
+        Assert.Equal(2, store.Writes);
+    }
+}
 }
