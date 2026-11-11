@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.AspNetCore.DataProtection;
 using StackExchange.Redis;
 
@@ -82,7 +84,8 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
 
     public async Task ScheduleAsync(
         string trustedPlayerId, DateTimeOffset expiresUtc,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? trustedSessionToken = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!ValidGuestId(trustedPlayerId))
@@ -91,7 +94,21 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         if (expiresUtc <= _clock.GetUtcNow())
             throw new ArgumentOutOfRangeException(nameof(expiresUtc));
 
-        await SaveAsync(trustedPlayerId, expiresUtc);
+        // The raw token never reaches Redis, not even inside the encrypted
+        // member. Its digest targets only the corresponding distributed
+        // cache key during a future, operator-gated snapshot recovery.
+        string? digest = null;
+        if (trustedSessionToken is not null)
+        {
+            if (trustedSessionToken.Length != 32 ||
+                trustedSessionToken.Any(c =>
+                    c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
+                throw new ArgumentException("Invalid trusted session token.",
+                    nameof(trustedSessionToken));
+            digest = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.ASCII.GetBytes(trustedSessionToken)));
+        }
+        await SaveAsync(trustedPlayerId, expiresUtc, digest);
     }
 
     /// <summary>
@@ -110,11 +127,15 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         return await SaveAsync(trustedPlayerId, _clock.GetUtcNow());
     }
 
-    private async Task<string> SaveAsync(string trustedPlayerId, DateTimeOffset dueUtc)
+    private async Task<string> SaveAsync(string trustedPlayerId, DateTimeOffset dueUtc,
+        string? trustedSessionDigest = null)
     {
-        // Do not persist plain guest IDs or session tokens, even as members.
+        // The sealed payload supports legacy expiry:guest and the newer
+        // expiry:guest:sha256(token). The digest is not a reusable token.
+        // Neither the guest ID nor the digest is visible as a Redis member.
         var plaintext = dueUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) +
-                        ":" + trustedPlayerId;
+                        ":" + trustedPlayerId +
+                        (trustedSessionDigest is null ? "" : ":" + trustedSessionDigest);
         var member = _protector.Protect(plaintext);
         await _database.SortedSetAddAsync(
             _key, member, CeilingUnixMilliseconds(dueUtc));
@@ -160,12 +181,20 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             }
 
             var separator = payload.IndexOf(':');
+            var digestSeparator = separator < 0 ? -1 : payload.IndexOf(':', separator + 1);
+            var playerId = digestSeparator < 0
+                ? payload[(separator + 1)..]
+                : payload[(separator + 1)..digestSeparator];
+            var tokenDigest = digestSeparator < 0 ? null : payload[(digestSeparator + 1)..];
             if (separator < 1 ||
                 !long.TryParse(payload.AsSpan(0, separator),
                     NumberStyles.None, CultureInfo.InvariantCulture, out var ticks) ||
                 ticks < DateTimeOffset.MinValue.UtcTicks ||
                 ticks > DateTimeOffset.MaxValue.UtcTicks ||
-                !ValidGuestId(payload[(separator + 1)..]))
+                !ValidGuestId(playerId) ||
+                (tokenDigest is not null && (tokenDigest.Length != 64 ||
+                    tokenDigest.Any(c =>
+                        c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))))
             {
                 result.Add(DueGuestExpiry.Unreadable(member.ToString()));
                 continue;
@@ -175,7 +204,10 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             if (expiry > now &&
                 (_recoveryDueCeilingUtc is not { } ceiling || expiry > ceiling))
                 continue; // Never trust the mutable Redis score over the protected time.
-            result.Add(new DueGuestExpiry(member.ToString(), payload[(separator + 1)..]));
+            result.Add(new DueGuestExpiry(member.ToString(), playerId,
+                SessionTokenDigest: tokenDigest,
+                IsPreCutover: _recoveryDueCeilingUtc is { } recoveryCeiling &&
+                    expiry <= recoveryCeiling));
         }
         return result;
     }

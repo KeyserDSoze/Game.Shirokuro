@@ -343,7 +343,8 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
         // If Redis rejects this write, revoke the newly registered ticket.
         if (!environment.IsDevelopment())
             await context.RequestServices.GetRequiredService<IGuestExpiryIndex>()
-                .ScheduleAsync(playerId, expires, context.RequestAborted);
+                .ScheduleAsync(playerId, expires, context.RequestAborted,
+                    trustedSessionToken: sessionId);
         await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
             principal,
             new AuthenticationProperties

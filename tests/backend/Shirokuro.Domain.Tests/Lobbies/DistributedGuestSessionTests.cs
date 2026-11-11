@@ -50,6 +50,49 @@ public sealed class DistributedGuestSessionTests
     }
 
     [Fact]
+    public async Task ProtectedDigestAllowsOnlyTargetedOutOfBandRecoveryDeletion()
+    {
+        var (cache, provider) = Cache();
+        using (provider)
+        {
+            var clock = new ManualClock();
+            var issuer = new GuestSessionRegistry(clock, cache);
+            var worker = new GuestSessionRegistry(clock, cache);
+            var oldId = GuestSessions.NewPlayerId();
+            var freshId = GuestSessions.NewPlayerId();
+            var oldToken = await issuer.RegisterAsync(
+                oldId, clock.GetUtcNow().AddHours(8));
+            var newToken = await issuer.RegisterAsync(
+                freshId, clock.GetUtcNow().AddHours(8));
+            var oldPrincipal = GuestSessions.CreatePrincipal(oldId, oldToken);
+            var freshPrincipal = GuestSessions.CreatePrincipal(freshId, newToken);
+
+            Assert.True(await worker.IsActiveAsync(oldPrincipal));
+            Assert.True(await worker.IsActiveAsync(freshPrincipal));
+
+            foreach (var malformed in new[] { "", "guest-id", "a", new string('f', 63),
+                         new string('F', 64), new string('z', 64) })
+                await Assert.ThrowsAsync<ArgumentException>(() =>
+                    worker.RemoveRestoredSessionAsync(malformed));
+            Assert.True(await issuer.IsActiveAsync(oldPrincipal));
+
+            var digest = Convert.ToHexStringLower(
+                SHA256.HashData(System.Text.Encoding.ASCII.GetBytes(oldToken)));
+            await worker.RemoveRestoredSessionAsync(digest);
+            await worker.RemoveRestoredSessionAsync(digest); // Idempotent.
+            Assert.False(await issuer.IsActiveAsync(oldPrincipal));
+            Assert.True(await issuer.IsActiveAsync(freshPrincipal));
+
+            var local = new GuestSessionRegistry(clock);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                local.RemoveRestoredSessionAsync(digest));
+            var unavailable = new GuestSessionRegistry(clock, new FailedRedis());
+            await Assert.ThrowsAsync<IOException>(() =>
+                unavailable.RemoveRestoredSessionAsync(digest));
+        }
+    }
+
+    [Fact]
     public async Task SharedStoreValidatesAndRevokesAcrossIndependentRegistries()
     {
         var (cache, provider) = Cache();

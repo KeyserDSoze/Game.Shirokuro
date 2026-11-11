@@ -4,6 +4,11 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
@@ -87,6 +92,25 @@ public sealed class RedisTlsRdbRestoreTests
         if (body is not null)
             request.Content = JsonContent.Create(body);
         return request;
+    }
+
+    private static ClaimsPrincipal TrustedTicketPrincipal(
+        WebApplicationFactory<Program> server, string signedCookie)
+    {
+        var ticket = server.Services
+            .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+            .Get(CookieAuthenticationDefaults.AuthenticationScheme)
+            .TicketDataFormat.Unprotect(signedCookie[(signedCookie.IndexOf('=') + 1)..]);
+        return ticket?.Principal
+            ?? throw new InvalidOperationException("Signed guest ticket could not be read.");
+    }
+
+    private static string SharedSessionKey(ClaimsPrincipal principal)
+    {
+        var token = principal.FindFirst(GuestSessions.SessionIdClaim)?.Value
+            ?? throw new InvalidOperationException("Missing protected guest token.");
+        return "guest-session:" + Convert.ToHexStringLower(
+            SHA256.HashData(Encoding.ASCII.GetBytes(token)));
     }
 
     private static async Task<(string Id, string Cookie)> Login(HttpClient client)
@@ -412,12 +436,24 @@ public sealed class RedisTlsRdbRestoreTests
                 .GetRequiredService<IConnectionMultiplexer>().GetDatabase();
             Assert.Equal(0, await restoredExpiry.SortedSetLengthAsync(ExpiryIndexKey));
 
+            // New-format encrypted expiry records bind a one-way digest of
+            // the server-issued token. After fencing and CAS, the recovery
+            // sweep must remove both corresponding restored session keys,
+            // not merely deny their signed cookies. No Redis keyspace scan.
+            var shared = guardedA.Services.GetRequiredService<IDistributedCache>();
+            var alicePrincipal = TrustedTicketPrincipal(guardedA, cookieAlice);
+            var bobPrincipal = TrustedTicketPrincipal(guardedA, cookieBob);
+            Assert.Null(await shared.GetAsync(SharedSessionKey(alicePrincipal)));
+            Assert.Null(await shared.GetAsync(SharedSessionKey(bobPrincipal)));
+
             // New guest sessions after the cutover remain valid across
             // independently started Production nodes on the same TLS Redis,
             // including an explicit additional recovery sweep. New lobby
             // and expiry entries must not be accidentally purged.
             using var visitor = Client(guardedA);
             var (_, freshCookie) = await Login(visitor);
+            var freshPrincipal = TrustedTicketPrincipal(guardedA, freshCookie);
+            Assert.NotNull(await shared.GetAsync(SharedSessionKey(freshPrincipal)));
             using var freshAcrossNodes = Client(guardedB, freshCookie);
             using var freshMe = await freshAcrossNodes.GetAsync("/api/sessions/me");
             Assert.Equal(HttpStatusCode.OK, freshMe.StatusCode);
@@ -431,6 +467,7 @@ public sealed class RedisTlsRdbRestoreTests
                 await maintenance.SweepOnceAsync();
                 Assert.NotNull(await restoredStorage.ReadAsync(freshRoom));
                 Assert.Equal(1, await restoredExpiry.SortedSetLengthAsync(ExpiryIndexKey));
+                Assert.NotNull(await shared.GetAsync(SharedSessionKey(freshPrincipal)));
                 using var freshRoster = await freshAcrossNodes.GetAsync(
                     "/api/lobbies/" + freshRoom + "/roster");
                 Assert.Equal(HttpStatusCode.OK, freshRoster.StatusCode);

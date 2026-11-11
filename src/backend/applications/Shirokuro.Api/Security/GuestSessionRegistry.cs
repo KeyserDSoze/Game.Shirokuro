@@ -97,6 +97,28 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
         }
     }
 
+    /// <summary>
+    /// Delete precisely the session whose SHA-256 token digest was sealed by
+    /// the server inside an authenticated expiry queue entry. Never accepts
+    /// a raw browser token, never scans Redis and never deletes by player ID.
+    /// This is called by recovery maintenance only after lobby fencing/CAS.
+    /// </summary>
+    public Task RemoveRestoredSessionAsync(
+        string trustedTokenDigest, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (sharedCache is null)
+            throw new InvalidOperationException(
+                "Distributed recovery requires the shared guest store.");
+        if (trustedTokenDigest.Length != 64 ||
+            trustedTokenDigest.Any(c =>
+                c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
+            throw new ArgumentException("Invalid trusted session digest.",
+                nameof(trustedTokenDigest));
+        return sharedCache.RemoveAsync(KeyPrefix + trustedTokenDigest,
+            cancellationToken);
+    }
+
     /// <summary>Development-only revocation. Shared revocation is async.</summary>
     public bool Revoke(ClaimsPrincipal? principal)
     {

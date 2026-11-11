@@ -87,6 +87,14 @@ public sealed class GuestSessionExpiryWorker(
                                 item.PlayerId, cancellationToken);
                         removed += await lobby.RemovePlayerFromAllRoomsAsync(
                             item.PlayerId, cancellationToken);
+                        // New-format protected work carries only a one-way
+                        // digest of the original guest session token. Under
+                        // an out-of-band recovery cutoff, remove exactly that
+                        // restored cache entry after fencing and lobby CAS.
+                        // Any failure keeps the item unacked for safe retry.
+                        if (item.IsPreCutover && item.SessionTokenDigest is { } digest)
+                            await registry.RemoveRestoredSessionAsync(
+                                digest, cancellationToken);
                         // The opaque item is acked only after cleanup.
                         await expiryIndex.AcknowledgeAsync(
                             item.ProtectedMember, cancellationToken);

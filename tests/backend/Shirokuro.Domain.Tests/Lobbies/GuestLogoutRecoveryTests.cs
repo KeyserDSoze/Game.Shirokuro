@@ -32,7 +32,8 @@ public sealed class GuestLogoutRecoveryTests
         public int Acknowledgements { get; private set; }
 
         public Task ScheduleAsync(string playerId, DateTimeOffset expiresUtc,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? trustedSessionToken = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             lock (_gate)

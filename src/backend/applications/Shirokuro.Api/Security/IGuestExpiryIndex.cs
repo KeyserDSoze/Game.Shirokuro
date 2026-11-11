@@ -6,8 +6,12 @@ namespace Shirokuro.Api.Security;
 /// </summary>
 public interface IGuestExpiryIndex
 {
+    // The optional server-issued token is never written in plaintext. Redis
+    // implementations seal its one-way digest inside the expiry work item,
+    // allowing a targeted, authenticated cleanup after an RDB rollback.
     Task ScheduleAsync(string trustedPlayerId, DateTimeOffset expiresUtc,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? trustedSessionToken = null);
 
     /// <summary>
     /// Persist an already-due cleanup AFTER an authoritative logout revokes
@@ -29,7 +33,8 @@ public interface IGuestExpiryIndex
 /// Keep its opaque member queued for operator key-ring recovery.
 /// </summary>
 public sealed record DueGuestExpiry(
-    string ProtectedMember, string PlayerId, bool IsUnreadable = false)
+    string ProtectedMember, string PlayerId, bool IsUnreadable = false,
+    string? SessionTokenDigest = null, bool IsPreCutover = false)
 {
     public static DueGuestExpiry Unreadable(string protectedMember) =>
         new(protectedMember, string.Empty, IsUnreadable: true);

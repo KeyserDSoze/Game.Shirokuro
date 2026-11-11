@@ -1,6 +1,9 @@
 using System.IO;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
+using System.Security.Cryptography;
+using System.Text;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
@@ -350,6 +353,166 @@ public sealed class RedisGuestExpiryIndexTests
         finally
         {
             try { Directory.Delete(directory, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Fact]
+    public async Task ProtectedSessionDigestRevokesOnlyRestoredPreCutoverRedisTokenAcrossNodes()
+    {
+        if (RedisAddress is null) return;
+        using var issuerRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var workerRedis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var dir = Path.Combine(Path.GetTempPath(),
+            "shirokuro-session-reconcile-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            services.AddDataProtection().SetApplicationName("Shirokuro")
+                .PersistKeysToFileSystem(new DirectoryInfo(dir));
+            services.AddStackExchangeRedisCache(options =>
+            {
+                options.Configuration = RedisAddress;
+                options.InstanceName = "shirokuro:";
+            });
+            using var provider = services.BuildServiceProvider();
+            var protection = provider.GetRequiredService<IDataProtectionProvider>();
+            var cache = provider.GetRequiredService<IDistributedCache>();
+            var clock = new ManualClock();
+            var cutoff = clock.GetUtcNow().AddMinutes(2);
+            var ns = "token-recovery-" + Guid.NewGuid().ToString("N");
+            var indexA = new RedisGuestExpiryIndex(
+                issuerRedis.GetDatabase(), protection, clock, ns);
+            var indexB = new RedisGuestExpiryIndex(
+                workerRedis.GetDatabase(), protection, clock, ns,
+                recoveryCutoffUtc: cutoff);
+            var oldId = GuestSessions.NewPlayerId();
+            var freshId = GuestSessions.NewPlayerId();
+            var issuerRegistry = new GuestSessionRegistry(clock, cache);
+            var otherNodeRegistry = new GuestSessionRegistry(clock, cache);
+            var oldExpiry = clock.GetUtcNow().AddHours(8);
+            var oldToken = await issuerRegistry.RegisterAsync(oldId, oldExpiry);
+            await indexA.ScheduleAsync(oldId, oldExpiry,
+                trustedSessionToken: oldToken);
+            var old = GuestSessions.CreatePrincipal(oldId, oldToken);
+            var oldDigest = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.ASCII.GetBytes(oldToken)));
+
+            // A guest issued after cutover MUST survive both the worker
+            // and even a future score tampering attempt.
+            clock.Advance(TimeSpan.FromMinutes(3));
+            var freshExpiry = clock.GetUtcNow().AddHours(8);
+            var freshToken = await issuerRegistry.RegisterAsync(freshId, freshExpiry);
+            await indexA.ScheduleAsync(freshId, freshExpiry,
+                trustedSessionToken: freshToken);
+            var fresh = GuestSessions.CreatePrincipal(freshId, freshToken);
+            var storage = new RedisLobbySnapshotStore(
+                workerRedis.GetDatabase(), clock, namespaceName: ns);
+            var lobby = new RedisGuestLobbyRuntime(storage, clock);
+            var room = await lobby.CreateAsync(oldId,
+                ["white", "black"], "white");
+            await lobby.JoinAsync(room.LobbyId, freshId, "black", room.Revision);
+            var before = (await storage.ReadAsync(room.LobbyId))!.Snapshot;
+
+            Assert.True(await otherNodeRegistry.IsActiveAsync(old));
+            Assert.True(await otherNodeRegistry.IsActiveAsync(fresh));
+            Assert.Empty(await indexA.ReadDueAsync());
+
+            var due = Assert.Single(await indexB.ReadDueAsync());
+            Assert.True(due.IsPreCutover);
+            Assert.Equal(oldId, due.PlayerId);
+            Assert.Equal(oldDigest, due.SessionTokenDigest);
+            Assert.DoesNotContain(oldId, due.ProtectedMember, StringComparison.Ordinal);
+            Assert.DoesNotContain(oldToken, due.ProtectedMember, StringComparison.Ordinal);
+            Assert.DoesNotContain(oldDigest, due.ProtectedMember, StringComparison.Ordinal);
+
+            using var worker = new GuestSessionExpiryWorker(
+                otherNodeRegistry, new InMemoryLobbyCoordinator(clock),
+                clock, lobby, indexB, storage);
+            Assert.Equal(1, await worker.SweepOnceAsync());
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            Assert.False(await issuerRegistry.IsActiveAsync(old));
+            Assert.True(await issuerRegistry.IsActiveAsync(fresh));
+            Assert.Null(await cache.GetAsync("guest-session:" + oldDigest));
+
+            var after = (await storage.ReadAsync(room.LobbyId))!.Snapshot;
+            Assert.Equal(before.State.Revision + 1, after.State.Revision);
+            Assert.Equal(freshId, Assert.Single(after.State.Participants).PlayerId);
+            Assert.Equal(before.LastActivityUtc, after.LastActivityUtc);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                lobby.JoinAsync(room.LobbyId, oldId, "white", null));
+
+            var pending = "shirokuro:guest-expiry:{" + ns + "}:v1:pending";
+            var remaining = Assert.Single(await issuerRedis.GetDatabase()
+                .SortedSetRangeByRankAsync(pending)).ToString();
+            await issuerRedis.GetDatabase().SortedSetAddAsync(
+                pending, remaining, cutoff.ToUnixTimeMilliseconds());
+            Assert.Empty(await indexB.ReadDueAsync());
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            Assert.True(await otherNodeRegistry.IsActiveAsync(fresh));
+            Assert.Equal(freshId, Assert.Single(
+                (await storage.ReadAsync(room.LobbyId))!.Snapshot
+                    .State.Participants).PlayerId);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Fact]
+    public async Task LegacyWorkAndMalformedSealedDigestAreNotTrustedAsRevocableTokens()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var dir = Path.Combine(Path.GetTempPath(),
+            "shirokuro-digest-legacy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var keys = KeyRing(dir);
+            var protection = keys.GetRequiredService<IDataProtectionProvider>();
+            var clock = new ManualClock();
+            var cutoff = clock.GetUtcNow().AddMinutes(2);
+            var ns = "digest-legacy-" + Guid.NewGuid().ToString("N");
+            var original = new RedisGuestExpiryIndex(
+                redis.GetDatabase(), protection, clock, ns);
+            var recovery = new RedisGuestExpiryIndex(
+                redis.GetDatabase(), protection, clock, ns,
+                recoveryCutoffUtc: cutoff);
+            var id = GuestSessions.NewPlayerId();
+            var expiry = clock.GetUtcNow().AddHours(8);
+            await original.ScheduleAsync(id, expiry); // old v1 plaintext format
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                original.ScheduleAsync(id, expiry,
+                    trustedSessionToken: "untrusted-browser-token"));
+
+            var invalid = protection
+                .CreateProtector("Shirokuro.GuestExpiryIndex.v1")
+                .Protect(expiry.UtcTicks + ":" + id + ":" + new string('Z', 64));
+            var queue = "shirokuro:guest-expiry:{" + ns + "}:v1:pending";
+            await redis.GetDatabase().SortedSetAddAsync(
+                queue, invalid, expiry.ToUnixTimeMilliseconds());
+
+            var due = await recovery.ReadDueAsync();
+            Assert.Equal(2, due.Count);
+            var legacy = Assert.Single(due.Where(x => !x.IsUnreadable));
+            Assert.True(legacy.IsPreCutover);
+            Assert.Equal(id, legacy.PlayerId);
+            Assert.Null(legacy.SessionTokenDigest); // Cannot purge without binding.
+            var malformed = Assert.Single(due.Where(x => x.IsUnreadable));
+            Assert.Empty(malformed.PlayerId);
+            Assert.Null(malformed.SessionTokenDigest);
+            Assert.Equal(invalid, malformed.ProtectedMember);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }

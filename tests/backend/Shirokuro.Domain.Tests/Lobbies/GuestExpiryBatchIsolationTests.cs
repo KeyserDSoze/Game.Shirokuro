@@ -1,6 +1,7 @@
 using System.IO;
 using System.Threading;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
@@ -29,10 +30,15 @@ public sealed class GuestExpiryBatchIsolationTests
         private int _next;
         public string? FailAckFor { get; set; }
         public bool FailRead { get; set; }
+        public string? RecoveryPlayerId { get; set; }
+        public string? RecoveryTokenDigest { get; set; }
         public int AckCount { get; private set; }
 
         public IReadOnlyList<DueGuestExpiry> Remaining =>
-            _due.Select(x => new DueGuestExpiry(x.Key, x.Value)).ToArray();
+            _due.Select(x => x.Value == RecoveryPlayerId
+                ? new DueGuestExpiry(x.Key, x.Value,
+                    SessionTokenDigest: RecoveryTokenDigest, IsPreCutover: true)
+                : new DueGuestExpiry(x.Key, x.Value)).ToArray();
 
         public Task ScheduleAsync(string id, DateTimeOffset due,
             CancellationToken cancellationToken = default)
@@ -70,6 +76,32 @@ public sealed class GuestExpiryBatchIsolationTests
             AckCount++;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class RemovalFaultCache : IDistributedCache
+    {
+        public bool FailRemove { get; set; }
+        public List<string> RemovedKeys { get; } = [];
+        public byte[]? Get(string key) => throw new NotSupportedException();
+        public Task<byte[]?> GetAsync(string key, CancellationToken token = default) =>
+            throw new NotSupportedException();
+        public void Refresh(string key) => throw new NotSupportedException();
+        public Task RefreshAsync(string key, CancellationToken token = default) =>
+            throw new NotSupportedException();
+        public void Remove(string key) => throw new NotSupportedException();
+        public Task RemoveAsync(string key, CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            if (FailRemove)
+                throw new IOException("private-redis-removal-failure");
+            RemovedKeys.Add(key);
+            return Task.CompletedTask;
+        }
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
+            throw new NotSupportedException();
+        public Task SetAsync(string key, byte[] value,
+            DistributedCacheEntryOptions options, CancellationToken token = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class Fence : IGuestRevocationFence
@@ -137,6 +169,54 @@ public sealed class GuestExpiryBatchIsolationTests
         TimeProvider clock, Index index, IAsyncGuestLobby lobby, IGuestRevocationFence fence) =>
         new(new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
             clock, lobby, index, fence);
+
+    [Fact]
+    public async Task FailedTargetedSessionDeletionLeavesEncryptedItemForRetry()
+    {
+        var clock = new ManualClock();
+        var old = GuestSessions.NewPlayerId();
+        var healthy = GuestSessions.NewPlayerId();
+        var digest = new string('a', 64);
+        var index = new Index
+        {
+            RecoveryPlayerId = old,
+            RecoveryTokenDigest = digest
+        };
+        await index.ScheduleRevokedAsync(old);
+        await index.ScheduleRevokedAsync(healthy);
+        var cache = new RemovalFaultCache { FailRemove = true };
+        var lobby = new SelectiveLobby();
+        var fence = new Fence();
+        using var worker = new GuestSessionExpiryWorker(
+            new GuestSessionRegistry(clock, cache),
+            new InMemoryLobbyCoordinator(clock), clock, lobby, index, fence);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => worker.SweepOnceAsync());
+        Assert.Equal("Guest expiry maintenance has retryable items.", failure.Message);
+        Assert.DoesNotContain("private-redis", failure.ToString(), StringComparison.Ordinal);
+        Assert.Equal([old, healthy], lobby.Calls);
+        Assert.Equal(old, Assert.Single(index.Remaining).PlayerId);
+        Assert.Equal(1, index.AckCount);
+        Assert.Empty(cache.RemovedKeys);
+
+        cache.FailRemove = false;
+        Assert.Equal(1, await worker.SweepOnceAsync());
+        Assert.Equal("guest-session:" + digest, Assert.Single(cache.RemovedKeys));
+        Assert.Empty(index.Remaining);
+        Assert.Equal(2, index.AckCount);
+        Assert.Equal([old, healthy, old], fence.Calls);
+
+        // If acknowledgement fails *after* successful token deletion, its
+        // next attempt safely removes the same one-way digest again.
+        await index.ScheduleRevokedAsync(old);
+        index.FailAckFor = old;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => worker.SweepOnceAsync());
+        index.FailAckFor = null;
+        await worker.SweepOnceAsync();
+        Assert.Equal(3, cache.RemovedKeys.Count);
+        Assert.All(cache.RemovedKeys, x => Assert.Equal("guest-session:" + digest, x));
+    }
 
     [Fact]
     public async Task FailedCleanupKeepsOnlyBadItemWhileLaterGuestsAreProcessed()

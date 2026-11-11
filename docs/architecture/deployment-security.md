@@ -872,3 +872,57 @@ coordinate deployment maintenance. The operator remains responsible
 for verifying all API nodes are guarded before opening ingress.
 Automatic full reconciliation, a persistent global epoch independent
 of snapshots and real TLS Redis Sentinel/Cluster HA are still #21.
+
+## Targeted deletion of restored pre-cutover Redis session records (#51)
+
+The recovery cutoff (#49) rejects signed cookies issued before the
+trusted UTC cutover, and the encrypted expiry queue (#50) fences and
+removes their stale pre-match lobby memberships. Until now the
+corresponding `IDistributedCache` records could remain in restored Redis
+until their natural eight-hour TTL.
+
+For **newly issued** guest sessions, Shirokuro now adds a **one-way
+SHA-256 digest of the random server-issued session token** to the
+*Data Protection-encrypted* natural expiry work payload. This payload
+is authenticated with the same `Shirokuro.GuestExpiryIndex.v1` purpose
+used previously. The Redis sorted-set member and its key reveal
+neither the raw session token nor its digest nor guest identity.
+Legacy encrypted `expiration-ticks:guest-id` work items remain valid;
+new members use
+`expiration-ticks:guest-id:lowercase-sha256-token-digest`.
+A malformed protected digest makes the whole item unreadable, so the
+worker never invokes lobby cleanup or cache deletion from it.
+
+On a recovery item whose **authenticated natural expiration** is at
+or before the configured `cutover + eight hours` and that contains
+a validated digest, the durable worker performs:
+
+1. Guest revocation fence in the lobby Redis hash slot.
+2. Idempotent administrative Redis CAS lobby cleanup, preserving
+   survivor inactivity timestamps.
+3. **Exactly targeted** removal of the associated server-side
+   `IDistributedCache` entry, `guest-session:<digest>`,
+   through the same Production Redis cache authority, *never* with
+   `SCAN`/`KEYS`, a browser-provided ID or any raw token.
+4. Acknowledge the opaque encrypted expiry member **only after** all
+   preceding operations succeed. Any cache or network failure leaves
+   the item durable for retry. The token deletion is idempotent.
+
+A healthy guest issued **after** the cutoff has a natural expiry
+after the recovery ceiling and must not be deleted, even if a Redis
+sorted-set score is altered. Normal production expiry without a
+recovery cutoff keeps its prior semantics: no extra cache removal.
+Raw token or digest data is not added to HTTP responses, metric
+attributes or logs.
+
+This improvement is **forward-compatible, not a retroactive keyspace
+sweep**. Older encrypted work items without a digest still allow
+the earlier lobby fencing and cleanup (#50), but cannot prove which
+session-cache key belongs to that guest. Such legacy records remain
+in Redis until their original absolute TTL, while their old cookies
+are denied by the out-of-band cutoff. Unreadable or missing encrypted
+work still needs key-ring restoration or an operator-maintained
+procedure. The cutover remains a maintenance-gated, consistent
+operator decision on every node; this does not provide a universal
+epoch, cross-store atomicity, production Sentinel/Cluster HA or
+automatic incident recovery (#21).
