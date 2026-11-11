@@ -594,3 +594,10 @@ not a Redis Sentinel/Cluster failover, leader promotion, persistent
 disaster recovery, network partition, load-balancer test, or production SLA
 measurement. Replica promotion, TLS high availability, backup/restore,
 real certificate rotation and operational monitoring/alerts remain #21.
+
+The frontend CI still executes every Playwright test. GitHub-hosted runners
+prefer their installed Google Chrome via Playwright's `channel=chrome` when
+available; on custom runners without Chrome, a bounded Chromium dependency
+installer retries transient mirror failures. This follows Ubuntu apt mirror
+DNS outages observed on CI #141/#142, without skipping E2E tests or reducing
+security coverage.
