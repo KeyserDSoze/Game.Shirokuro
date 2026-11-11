@@ -127,7 +127,24 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run test:unit
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      # Chromium installation depends on external package mirrors; do not
+      # let a stalled apt/download step hold the entire CI runner indefinitely.
+      # A single bounded retry can recover transient mirror/network failures.
+      - name: Install Playwright Chromium with bounded retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if timeout --signal=TERM --kill-after=5s 150s \
+                npx playwright install --with-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then
+              echo "Chromium installation failed after bounded retries."
+              exit 1
+            fi
+            sleep 3
+          done
       - run: npm run test:e2e
 
 
