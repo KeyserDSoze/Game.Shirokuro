@@ -70,6 +70,12 @@ else
             sp.GetRequiredService<TimeProvider>()));
 }
 
+// An operator-managed cutoff lives OUTSIDE Redis and therefore survives
+// rollback of an older RDB. Validate it at startup rather than accepting a
+// misformatted setting or treating restored Redis tokens as authority.
+var guestRecoveryCutoffUtc = GuestSessionRecoveryCutoff.Read(
+    builder.Configuration, builder.Environment);
+
 // The cookie may contain a server-generated, non-verified guest ID.
 // No trusted account login or client-selected player ID is supported.
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
@@ -91,6 +97,17 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             var looksLikeGuestId = playerId?.StartsWith("guest-", StringComparison.Ordinal) == true;
             if (claimsGuestKind || looksLikeGuestId)
             {
+                // IssuedUtc belongs to the signed Data Protection ticket,
+                // never to a client header or restored Redis. An older
+                // ticket cannot authenticate after an operator rotates this
+                // out-of-band cutoff during a stale snapshot recovery.
+                if (!GuestSessionRecoveryCutoff.Accepts(
+                        context.Properties.IssuedUtc, guestRecoveryCutoffUtc))
+                {
+                    context.RejectPrincipal();
+                    return;
+                }
+
                 var registry = context.HttpContext.RequestServices
                     .GetRequiredService<GuestSessionRegistry>();
                 if (!await registry.IsActiveAsync(

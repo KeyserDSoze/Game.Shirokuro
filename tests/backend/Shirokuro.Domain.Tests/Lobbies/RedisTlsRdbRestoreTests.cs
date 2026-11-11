@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
@@ -31,7 +32,8 @@ public sealed class RedisTlsRdbRestoreTests
     private static string? Connection =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_RDB");
 
-    private static WebApplicationFactory<Program> Server()
+    private static WebApplicationFactory<Program> Server(
+        DateTimeOffset? recoveryCutoffUtc = null)
     {
         var connection = Connection
             ?? throw new InvalidOperationException("Redis TLS RDB fixture required.");
@@ -40,13 +42,23 @@ public sealed class RedisTlsRdbRestoreTests
             builder.UseEnvironment("Production");
             TestDataProtectionConfiguration.Apply(builder);
             builder.UseSetting(GuestSessionRedisConfiguration.ConnectionStringKey, connection);
-            builder.ConfigureAppConfiguration((_, configuration) =>
-                configuration.AddInMemoryCollection(new Dictionary<string, string?>
-                {
-                    [GuestSessionRedisConfiguration.ConnectionStringKey] = connection,
-                    ["AllowedHosts"] = "game.example",
-                    ["Security:AllowedOrigins:0"] = "https://game.example"
-                }));
+            // Cutoff is managed outside Redis, so restoring an old RDB
+            // cannot roll it back. Every replacement node receives the same
+            // post-recovery value from its independent configuration.
+            var configuration = new Dictionary<string, string?>
+            {
+                [GuestSessionRedisConfiguration.ConnectionStringKey] = connection,
+                ["AllowedHosts"] = "game.example",
+                ["Security:AllowedOrigins:0"] = "https://game.example"
+            };
+            if (recoveryCutoffUtc is not null)
+            {
+                var value = recoveryCutoffUtc.Value.ToString("O", CultureInfo.InvariantCulture);
+                configuration[GuestSessionRecoveryCutoff.ConfigurationKey] = value;
+                builder.UseSetting(GuestSessionRecoveryCutoff.ConfigurationKey, value);
+            }
+            builder.ConfigureAppConfiguration((_, settings) =>
+                settings.AddInMemoryCollection(configuration));
             // Actual Production DI: no fake Redis cache, multiplexer, lobby,
             // guest registry, expiry index, revocation fence or key ring.
         });
@@ -347,6 +359,47 @@ public sealed class RedisTlsRdbRestoreTests
                     .EnumerateArray());
                 Assert.Equal(bob, participant.GetProperty("playerId").GetString());
             }
+
+            // SECURITY REGRESSION: Alice was revoked AFTER the RDB snapshot.
+            // Restoring that older snapshot resurrects the Redis session key
+            // (and the old membership). The signed cookie would authenticate
+            // again unless an OUT-OF-BAND issuance cutoff is deployed.
+            await DockerAsync("rm", "-f", Replacement);
+            var rollback = Path.Combine(workspace, "rollback");
+            Directory.CreateDirectory(rollback);
+            File.Copy(backup, Path.Combine(rollback, "dump.rdb"));
+            await StartReplacementAsync(rollback, certificates);
+
+            using (var unprotected = Server())
+            using (var replay = Client(unprotected, cookieAlice))
+            {
+                using var accidentallyValid = await replay.GetAsync("/api/sessions/me");
+                Assert.Equal(HttpStatusCode.OK, accidentallyValid.StatusCode);
+            }
+
+            // The operator places the environment behind a maintenance
+            // gate and rotates this trusted config value AFTER the snapshot.
+            // Redis cannot undo it by loading old keys or session tokens.
+            var cutoff = DateTimeOffset.UtcNow;
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            using var guardedA = Server(cutoff);
+            using var guardedB = Server(cutoff);
+            using var staleOnA = Client(guardedA, cookieAlice);
+            using var staleOnB = Client(guardedB, cookieAlice);
+            using var oldBob = Client(guardedA, cookieBob);
+            foreach (var stale in new[] { staleOnA, staleOnB, oldBob })
+            {
+                using var denied = await stale.GetAsync("/api/sessions/me");
+                Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+            }
+
+            // New guest sessions after the cutover remain valid across
+            // independently started Production nodes on the same TLS Redis.
+            using var visitor = Client(guardedA);
+            var (_, freshCookie) = await Login(visitor);
+            using var freshAcrossNodes = Client(guardedB, freshCookie);
+            using var freshMe = await freshAcrossNodes.GetAsync("/api/sessions/me");
+            Assert.Equal(HttpStatusCode.OK, freshMe.StatusCode);
         }
         finally
         {

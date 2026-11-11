@@ -747,3 +747,70 @@ under a real incident. The isolated CI drill is not production HA
 certification; follow-up stays tracked by #21.
 
 The drill is automated in [CI #43040819970](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43040819970), where all six Redis TLS test cases (five existing, one new RDB restore) and the complete backend/frontend/artwork suites passed on `main`.
+
+## Reject restored guest tickets after an older Redis snapshot rollback (#49)
+
+Redis session-token keys may be resurrected by an RDB snapshot taken
+**before** an operator or guest revoked them. Even a valid signed cookie
+is therefore not automatically safe after an RDB restore. Redis itself
+cannot safely store the only invalidation epoch: restoring the same
+snapshot would roll back that epoch too.
+
+In non-Development, the API now accepts an optional deployment-managed
+setting **`Security:GuestSessions:AcceptIssuedAfterUtc`**. It must be an
+**explicit UTC ISO 8601 timestamp**, for example
+`2026-11-11T15:00:00Z` or `2026-11-11T15:00:00.0000000+00:00`.
+Missing means the legacy session policy applies. A malformed, local-time,
+non-UTC or whitespace value **fails application startup** with a generic
+configuration error. Development ignores this Production recovery control.
+
+When configured, cookie authentication validates the **Data Protection
+signed** ticket's `AuthenticationProperties.IssuedUtc` **before** consulting
+the restored Redis guest-session registry. An absent issuance timestamp,
+or a time **less than or equal to** the cutoff, invalidates guest
+authentication (including legacy guest-shaped tickets) on **every HTTP
+request and SignalR authentication**. There is no per-node positive cache,
+no query parameter or endpoint for adjusting the cutoff, and no PII or
+cutoff value is returned in the HTTP denial. A guest ticket issued **after**
+the cutoff still requires the corresponding valid Redis server-side token.
+
+### Controlled stale-snapshot recovery procedure
+
+1. Stop external guest admission and all API nodes behind a maintenance
+   gate. Identify the recovered RDB's timestamp and remember that **any
+   guest session revoked after that snapshot can be resurrected**.
+2. Restore Redis and the matching encrypted Data Protection ring/PFX,
+   keeping the service inaccessible to players.
+3. Set `Security:GuestSessions:AcceptIssuedAfterUtc` to the trusted
+   **post-incident UTC cutover instant**, *not a value derived from the
+   restored Redis*, in your deployment configuration/secrets store.
+   This value must be **strictly later than** all old guest-ticket issue
+   times. Persist it in the recovery runbook and deploy **the identical
+   value** to every active and standby API node before opening ingress.
+4. Restart/roll **all** API nodes while ingress is closed, verify readiness
+   and demonstrate in a restricted staging or guarded smoke test that
+   old signed tickets receive 401 while newly issued cookies work across
+   nodes. If clocks are not synchronized, correct clock skew before
+   admission; a future cutoff can deny new sessions (safe failure).
+5. Reopen guest traffic only after confirming all nodes use the same
+   cutoff. Changing or **rolling back** this external configuration
+   while previously restored session-token keys are alive can re-enable
+   old tickets. Never remove the cutoff during their lifetime without a
+   verified migration strategy.
+
+The CI RDB drill (#48) explicitly demonstrates that a cookie revoked
+**after** the snapshot authenticates again on an unguarded host after
+rollback, then rejects that same cookie on two Production API hosts
+configured with the **same external cutoff**. A newly issued guest cookie
+remains valid across those hosts. These tests run against real TLS Redis
+and unchanged production authentication/cache/lobby DI.
+
+**Scope boundary:** the cutoff **does not delete or clean up** stale room
+memberships, restored Redis session keys or encrypted expiry queue entries.
+Those may remain until a separate authorized cleanup or natural expiry.
+It is an **operator-configured authentication barrier**, not an automatic
+revocation ledger or cross-store transaction. It does not work if
+operators restore an older **configuration** too, or leave unguarded
+nodes behind the load balancer. Automatic global recovery fencing and
+full post-restore queue/roster reconciliation, secure deployment
+coordination, Sentinel/Cluster HA and real RPO/RTO are still open in #21.
