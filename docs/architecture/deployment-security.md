@@ -601,3 +601,62 @@ available; on custom runners without Chrome, a bounded Chromium dependency
 installer retries transient mirror failures. This follows Ubuntu apt mirror
 DNS outages observed on CI #141/#142, without skipping E2E tests or reducing
 security coverage.
+
+## Encrypted Data Protection key-ring backup and restore drill (#47)
+
+Guest cookies and the protected guest-expiry work items are encrypted and
+authenticated by **ASP.NET Core Data Protection** with purpose isolation.
+Successful Redis replication **does not** make historical cookies usable if
+the Data Protection key ring or the PFX needed to unwrap it is lost. Conversely,
+having the correct cookie encryption keys **does not** authorize an old ticket
+without its server-side Redis session token. Both authorities must survive
+for continuity.
+
+The CI recovery drill tests this contract with a TLS-only Redis server and
+**real, independent Production API hosts**:
+
+1. Two nodes sharing an encrypted, persisted key ring create separate guest
+   sessions and a shared two-member pre-match lobby; a separate ciphertext
+   is protected using the actual `Shirokuro.GuestExpiryIndex.v1` purpose.
+2. After both initial API hosts terminate, the drill captures in memory
+   the encrypted `key-*.xml` bytes and their wrapping **private-key PFX**.
+   The original key-ring directory is deleted.
+3. The backup bytes are restored into a **different absolute directory**
+   with the same PFX and app discriminator `Shirokuro`; two *fresh* Production
+   hosts authenticate the same pre-backup cookies through real Redis TLS,
+   preserve the room revision/participants, unprotect the expiry-purpose
+   ciphertext, then successfully revoke/logout and remove only the
+   logged-out player.
+4. Negative controls confirm that restoring the PFX **without the old
+   `key-*.xml` files** does not validate old cookies, and that restoring
+   old XML keys with an unrelated PFX cannot decrypt the older ciphertext.
+
+All keys, PFX passwords and guest identities in this drill are freshly
+generated at runtime on the runner; the source directory is private to the
+test process, no key material is committed or uploaded, and temporary
+directories are removed after the test.
+
+**Operator backup/restore requirements (deployment-specific):** take
+consistent, access-controlled backups of *all* historical Data Protection
+`key-*.xml` files plus **every** PFX private key needed to unwrap them,
+including configured `PreviousCertificates`. Keep the certificates and
+their passwords in an independent encrypted secrets store, not next to
+unencrypted backups, and restrict write permissions to trusted operators and
+the service identity. Preserve the `Shirokuro` application discriminator
+and the same Data Protection purpose strings. Restore into a protected,
+writable shared key-ring volume **before** starting replacement API nodes;
+check certificates are valid and old decryptors still configured; test a
+sample known-purpose ciphertext in a controlled staging environment. Retain
+old keys until every cookie and durable expiry record they protect has
+expired or been migrated/processed. Never delete unknown encrypted expiry
+members to make the node appear healthy; an unreadable member remains due
+for safe operator recovery (#45).
+
+**Important limits:** this exercise preserves Redis as an already-available
+authoritative database. It is *not* a Redis RDB/AOF backup-and-restore,
+replication, Sentinel/Cluster promotion, rolling certificate rotation
+across live nodes, real deployment RPO/RTO validation or production HA
+certification. Simultaneous loss of Redis session keys and the key ring
+still invalidates active guest sessions and can strand unprocessed cleanup
+records until operator repair. These tasks and operational monitoring stay
+in #21.

@@ -93,8 +93,8 @@ jobs:
           echo "TLS Redis fixture could not become ready."
           exit 1
 
-      - name: Test real Production Redis TLS, cert hostname and plaintext denial
-        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsProductionTests'
+      - name: Test real Production Redis TLS, cert validation and keyring restore
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsProductionTests|FullyQualifiedName~RedisTlsKeyRingRestoreTests'
         env:
           SHIROKURO_TEST_REDIS_TLS: localhost:6380,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
           # Explicit opt-in: only the dedicated ephemeral TLS fixture may be
