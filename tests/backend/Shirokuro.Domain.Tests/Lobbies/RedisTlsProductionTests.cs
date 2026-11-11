@@ -22,6 +22,7 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 /// expiry index, quotas/fences, and encrypted persistent Data Protection.
 /// Neither the server certificate nor trust validation is bypassed.
 /// </summary>
+[Collection("Production Redis TLS integration")]
 public sealed class RedisTlsProductionTests
 {
     private static string? Connection =>

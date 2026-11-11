@@ -20,6 +20,7 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 /// ring plus original private-key PFX are restored to a new absolute path.
 /// Redis is deliberately left intact and uses real authenticated TLS.
 /// </summary>
+[Collection("Production Redis TLS integration")]
 public sealed class RedisTlsKeyRingRestoreTests
 {
     private static string? Connection =>
