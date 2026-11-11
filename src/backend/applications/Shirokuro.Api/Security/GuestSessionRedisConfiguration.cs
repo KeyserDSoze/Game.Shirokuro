@@ -29,6 +29,18 @@ public static class GuestSessionRedisConfiguration
         {
             options.ConfigurationOptions = parsed;
             options.InstanceName = "shirokuro:";
+            // RedisCache owns this *independent* lazily-connected multiplexer.
+            // Resolve options at connection time: TestServer and operations
+            // may replace ConfigurationOptions via later named DI overrides.
+            // Do not replace the shared authoritative cache with the lobby
+            // multiplexer; only observe the cache's own connection lifecycle.
+            options.ConnectionMultiplexerFactory = async () =>
+            {
+                var current = options.ConfigurationOptions ?? parsed;
+                var connection = await ConnectionMultiplexer.ConnectAsync(current.Clone());
+                return RedisConnectionMetrics.Observe(
+                    connection, RedisConnector.GuestSessions);
+            };
         });
     }
 

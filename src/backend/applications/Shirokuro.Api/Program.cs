@@ -59,9 +59,11 @@ else
     // All production routes, websocket roster reads and guest cleanup use
     // Redis as a single authority. Never fall back to local room state.
     builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
-        ConnectionMultiplexer.Connect(
-            GuestSessionRedisConfiguration.ReadTlsOptions(
-                builder.Configuration)));
+        RedisConnectionMetrics.Observe(
+            ConnectionMultiplexer.Connect(
+                GuestSessionRedisConfiguration.ReadTlsOptions(
+                    builder.Configuration)),
+            RedisConnector.Lobby));
     builder.Services.AddSingleton(provider => new RedisLobbySnapshotStore(
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));

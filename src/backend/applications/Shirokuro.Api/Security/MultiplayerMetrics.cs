@@ -16,6 +16,7 @@ public static class MultiplayerMetrics
     public const string MutationDecisionsName = "shirokuro.guest_mutation.decisions";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
+    public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
     public const string ExpirySweepsName = "shirokuro.guest_expiry.sweeps";
     public const string ExpiryMembershipsRemovedName = "shirokuro.guest_expiry.memberships_removed";
     public const string ExpiryUnreadableItemsName = "shirokuro.guest_expiry.unreadable_items";
@@ -30,6 +31,9 @@ public static class MultiplayerMetrics
     private static readonly Histogram<double> ReadinessDurationSeconds =
         Meter.CreateHistogram<double>(ReadinessDurationSecondsName, unit: "s",
             description: "Elapsed time of executed Redis/Data Protection readiness probes only.");
+    private static readonly Counter<long> RedisConnectionEvents =
+        Meter.CreateCounter<long>(RedisConnectionEventsName, unit: "{event}",
+            description: "Production Redis connector lifecycle events; no endpoint or identity labels.");
     private static readonly Counter<long> ExpirySweeps = Meter.CreateCounter<long>(
         ExpirySweepsName, unit: "{sweep}",
         description: "Guest-session expiry cleanup sweep outcomes.");
@@ -97,6 +101,32 @@ public static class MultiplayerMetrics
             new KeyValuePair<string, object?>("stage", stageName));
     }
 
+    /// <summary>
+    /// Physical Redis client events are NOT a health check, a primary quorum
+    /// vote or proof of successful failover. Never encode endpoint, TLS
+    /// principal, exception, client address, room or guest identifiers.
+    /// </summary>
+    public static void RecordRedisConnection(
+        RedisConnector connector, RedisConnectionTransition transition)
+    {
+        var source = connector switch
+        {
+            RedisConnector.Lobby => "lobby",
+            RedisConnector.GuestSessions => "session",
+            _ => throw new ArgumentOutOfRangeException(nameof(connector))
+        };
+        var outcome = transition switch
+        {
+            RedisConnectionTransition.Failed => "failed",
+            RedisConnectionTransition.Restored => "restored",
+            RedisConnectionTransition.ConfigurationChanged => "configuration-changed",
+            _ => throw new ArgumentOutOfRangeException(nameof(transition))
+        };
+        RedisConnectionEvents.Add(1,
+            new KeyValuePair<string, object?>("client", source),
+            new KeyValuePair<string, object?>("event", outcome));
+    }
+
     // No tags: malformed or unreadable encrypted data is never an identity,
     // an exception label or a Redis key exposed to an exporter.
     public static void RecordUnreadableExpiryItem() =>
@@ -129,3 +159,7 @@ public enum ReadinessProbeStage
     KeyRing,
     Timeout
 }
+
+public enum RedisConnector { Lobby, GuestSessions }
+
+public enum RedisConnectionTransition { Failed, Restored, ConfigurationChanged }
