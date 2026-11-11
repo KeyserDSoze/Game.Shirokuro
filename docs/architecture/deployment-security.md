@@ -1163,3 +1163,64 @@ An operator must provision **separate** ACL identities for: the game API's keysp
 The CI fixture is five TLS-only containers on the same runner, bound to loopback; the CA is ephemeral and verified. ACL files, 5 independently generated and masked passwords, and writable Sentinel configs live in temporary runner directories and are destroyed by `always()`. Two original API Production TestServers keep their cookies and lobby revision across a **real automatic** quorum failover with no forced `REPLICAOF NO ONE`; tests also check invalid/missing authentication and Redis ACL denial. This is a controlled regression test, **not** evidence of separate failure domains, cert/credential rotation, network firewall policy, RPO=0, split-brain protection, mTLS, complete least privilege or a production monitoring system. All these remain in #21.
 
 The two Production connectors now pin StackExchange.Redis **3.4.31**, which supports independent Sentinel and Redis ACL credentials (introduced in upstream 3.1.13). The CI security probe permits admin commands only in a deliberately isolated test client to prove that **Redis ACL itself** rejects destructive operations; real API connections keep the library admin switch disabled. The Sentinel 7.4 ACL deliberately omits unsupported `ECHO` even though ordinary Redis connections require it. [CI main #43073747222](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43073747222) SUCCESS: 376 xUnit standard, 5 real Redis TLS Production, 2 ACL TLS xUnit, 1 RDB recovery, 1 manual promotion, 1 automatic authenticated Sentinel quorum failover, 106 Vitest, 24 Playwright, 35 Python and .NET 10/React builds. No deployment-level HA guarantee is implied.
+
+## Redis TLS ACL blue/green credential rotation (issue #58)
+
+Redis ACL user disable is **not a live connection revocation mechanism**:
+`ACL SETUSER shirokuro-blue off` denies NEW `AUTH`, but clients that
+were already authenticated as `shirokuro-blue` retain their permissions
+until their connections are closed. An operator must intentionally drain
+old API hosts **and** execute `CLIENT KILL USER shirokuro-blue` (or
+`ACL DELUSER shirokuro-blue`, with its stronger destructive implications)
+on every relevant Redis node. Removing just the password or setting
+`off` is not equivalent to a completed rotation.
+
+Recommended ordered cutover for direct Redis TLS (operator-run, maintenance
+procedures and controls required):
+
+1. Confirm a recoverable Redis backup and external deployment settings,
+   stable Data Protection key ring/discriminator, identical Redis key
+   namespace, TLS trust chain, and current readiness. Keep old user
+   credentials available only in a secrets manager during the overlap.
+2. Use a privileged operator identity in a private control plane to
+   create a NEW scoped app user/password using `ACL SETUSER`; preserve
+   the *same* `shirokuro:*` key access and required connection/Lua
+   commands, but deny admin/destructive operations. Never expose this
+   operator identity in application configuration.
+3. Launch **new** API instances with a new TLS Redis connection string
+   using the new username/password, sharing the existing Redis data and
+   Data Protection ring. Keep both old and new users active during the
+   overlap. Wait for green `/api/ready`, then verify an existing cookie
+   and roster/revision across green nodes, including ability to write.
+   The running app does **not** hot-reload its Redis multiplexer secrets.
+4. Shift ingress traffic to green and drain/shut down the old blue API
+   instances. Do not delete or rename session/lobby keys as a shortcut:
+   session authority and logout fencing must survive the credential cutover.
+5. Disable old logins with `ACL SETUSER shirokuro-blue off`. After
+   confirming all intended healthy green hosts are connected and old
+   hosts should not serve traffic, run `CLIENT KILL USER shirokuro-blue`
+   on each Redis primary/replica that can retain old connections.
+   Verify old credentials cannot AUTH and old connections are gone.
+   Old surviving API processes must return unready/deny user auth,
+   not silently authenticate from local cache or fall back to in-memory.
+6. Reverify green readiness, cross-node guest cookies, lobby roster and
+   logout/fencing before declaring the rotation complete. Alert on failed
+   credential cutovers. Persist the intended ACL configuration through
+   the deployment's secure configuration mechanism; a transient runtime
+   `ACL SETUSER` without ACL persistence will not survive all restarts.
+
+For example, use `redis-cli --tls --cacert <trusted-ca> --user
+<operator-user>` with secrets supplied securely to `REDISCLI_AUTH`
+instead of putting passwords directly on the command line. Do not copy
+the CI password or operator ACL to production. A separate staged plan is
+required for Sentinel-to-Redis monitor, Sentinel peer and Sentinel
+discovery credential rotation; this #58 lab covers **direct TLS Redis**
+only. The fixture uses an isolated loopback-only Redis 7.4 process and
+three independent, masked runtime passwords, with the `default` account
+disabled, all files and containers cleaned by `always()`. It exercises
+two blue and two green **real Production API TestServers** with independent
+lobby and session-cache Redis connections, ACL-off versus retained old
+connections, explicit eviction, rejection of old cookies/readiness,
+and successful green logout/fence/new issuance. It does not certify
+hot rotation, RPO=0, split brain, distributed keyring changes, managed
+Redis service ACL semantics or real failure-domain HA; these remain #21.
