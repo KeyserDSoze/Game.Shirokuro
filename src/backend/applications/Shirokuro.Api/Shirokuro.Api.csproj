@@ -7,6 +7,9 @@
     <!-- #57: 3.1.13+ supports distinct SentinelUser/SentinelPassword on
          managed primary connections. Pin stable 3.4.31 for both clients. -->
     <PackageReference Include="StackExchange.Redis" Version="3.4.31" />
+    <!-- #60: opt-in private OTLP metrics only, never auto-enable HTTP metrics. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.20.1" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../business/Shirokuro.Application/Shirokuro.Application.csproj" />

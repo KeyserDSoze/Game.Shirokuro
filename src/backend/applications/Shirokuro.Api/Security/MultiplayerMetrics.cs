@@ -6,7 +6,8 @@ namespace Shirokuro.Api.Security;
 /// Aggregate security/availability metrics. Every label value comes from a
 /// closed server-defined enum; no request paths, IPs, sessions, player IDs,
 /// invitation codes or exception messages are accepted as metric attributes.
-/// Exporters are deliberately NOT registered by the web application.
+/// The OTLP exporter is disabled by default and can be opted into only
+/// with an explicit validated HTTPS collector outside Development.
 /// </summary>
 public static class MultiplayerMetrics
 {

@@ -22,6 +22,10 @@ PersistentDataProtection.Configure(
     builder.Services, builder.Configuration, builder.Environment);
 GuestSessionRedisConfiguration.Configure(
     builder.Services, builder.Configuration, builder.Environment);
+// Metrics export is OFF unless the operator explicitly enables a trusted
+// HTTPS OTLP collector. Never add an unauthenticated HTTP /metrics endpoint.
+MultiplayerMetricsExport.Configure(
+    builder.Services, builder.Configuration, builder.Environment);
 // An operator-managed cutoff lives OUTSIDE Redis and therefore survives
 // rollback of an older RDB. Validate it at startup rather than accepting a
 // misformatted setting or treating restored Redis tokens as authority.
