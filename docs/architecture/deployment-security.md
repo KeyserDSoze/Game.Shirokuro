@@ -383,6 +383,13 @@ Redis/Sentinel server health, replication lag, partitions, RPO/RTO
 and an actually deployed alert receiver still require infrastructure
 monitoring under #21.
 
+Readiness timing and failure-stage privacy checks passed in [CI main #43093799657](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43093799657) SUCCESS: 378 standard xUnit, 5 real Production Redis TLS, 2 Redis TLS ACL, 1 ACL blue/green rotation, 1 RDB, 1 replica manual promotion, 1 Sentinel TLS ACL automatic failover, 106 Vitest, 24 Playwright, 35 Python, and .NET 10/React builds.
+The tests verify that healthy/failed/recovered probes emit finite histogram
+attributes, cache/write and Data Protection failures are classified by
+**phase** only, and a stalled 2-second Redis probe emits
+`stage=timeout` while the public HTTP response remains minimal/uncached.
+The `Histogram<double>` type and `s` unit are also explicitly tested.
+
 ## Immediate durable cleanup after guest logout (#41)
 
 Guest logout previously revoked the Redis session token first, then removed
