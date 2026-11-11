@@ -113,9 +113,10 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     {
         cancellationToken.ThrowIfCancellationRequested();
         var now = _clock.GetUtcNow();
-        var members = (RedisResult[])await _database.ScriptEvaluateAsync(
+        var members = (RedisResult[]?)await _database.ScriptEvaluateAsync(
             RotateDueWindowScript, [_key, _cursorKey],
-            [CeilingUnixMilliseconds(now), BatchSize, (long)CursorLifetime.TotalSeconds]);
+            [CeilingUnixMilliseconds(now), BatchSize, (long)CursorLifetime.TotalSeconds])
+            ?? throw new InvalidDataException("Invalid guest expiry window.");
         if (members.Length > BatchSize)
             throw new InvalidDataException("Invalid guest expiry window size.");
         var result = new List<DueGuestExpiry>(members.Length);
