@@ -159,6 +159,67 @@ jobs:
             sudo rm -rf -- "$SHIROKURO_TEST_REDIS_ACL_DIR"
           fi
 
+      # Independent blue/green Redis ACL rotation drill. Never alter the
+      # regular TLS/ACL fixtures: other tests must stay order-independent.
+      - name: Start isolated Redis TLS ACL rotation fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d /tmp/shirokuro-ci-redis-rotate-XXXXXX)"
+          echo "SHIROKURO_TEST_REDIS_ROTATION_DIR=$dir" >> "$GITHUB_ENV"
+          blue="$(openssl rand -hex 24)"
+          green="$(openssl rand -hex 24)"
+          admin="$(openssl rand -hex 24)"
+          for secret in "$blue" "$green" "$admin"; do
+            echo "::add-mask::$secret"
+          done
+          cat > "$dir/users.acl" <<EOF
+          user default off
+          user shirokuro-blue on >$blue ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction -@dangerous -@admin +info +command +client +time
+          user shirokuro-operator on >$admin ~* &* +@all
+          EOF
+          chmod 755 "$dir"
+          chmod 644 "$dir/users.acl"
+          docker run -d --name shirokuro-ci-redis-rotate \
+            -p 127.0.0.1:6387:6387 \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            -v "$dir:/acl:ro" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6387 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no \
+            --aclfile /acl/users.acl \
+            --save "" --appendonly no
+
+          echo "SHIROKURO_TEST_REDIS_ROTATION_BLUE=localhost:6387,ssl=true,sslHost=localhost,user=shirokuro-blue,password=$blue,abortConnect=true,connectTimeout=1500,connectRetry=0" >> "$GITHUB_ENV"
+          echo "SHIROKURO_TEST_REDIS_ROTATION_GREEN=localhost:6387,ssl=true,sslHost=localhost,user=shirokuro-green,password=$green,abortConnect=true,connectTimeout=1500,connectRetry=0" >> "$GITHUB_ENV"
+          echo "SHIROKURO_TEST_REDIS_ROTATION_ADMIN=localhost:6387,ssl=true,sslHost=localhost,user=shirokuro-operator,password=$admin,allowAdmin=true,abortConnect=true,connectTimeout=1500,connectRetry=0" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if docker exec -e "REDISCLI_AUTH=$blue" \
+                shirokuro-ci-redis-rotate redis-cli --tls \
+                --cacert /certs/ca.crt --user shirokuro-blue \
+                -h localhost -p 6387 ping 2>/dev/null | grep -qx PONG; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "TLS Redis ACL rotation fixture did not become ready."
+          exit 1
+
+      - name: Test Production Redis TLS ACL blue-green cutover and stale-client eviction
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsCredentialRotationTests'
+
+      - name: Destroy isolated Redis ACL rotation fixture and credentials
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f shirokuro-ci-redis-rotate 2>/dev/null || true
+          if [ -n "${SHIROKURO_TEST_REDIS_ROTATION_DIR:-}" ]; then
+            sudo rm -rf -- "$SHIROKURO_TEST_REDIS_ROTATION_DIR"
+          fi
+
       # A SECOND TLS Redis fixture is deliberately isolated from the
       # 6380 session/chaos tests. It can be completely destroyed and restored
       # from an RDB file without affecting other running CI test classes.
