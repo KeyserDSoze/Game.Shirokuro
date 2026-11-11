@@ -353,7 +353,7 @@ public sealed class GuestLogoutRecoveryTests
                 server.Services.GetRequiredService<GuestSessionRegistry>(),
                 server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
                 TimeProvider.System, lobby, index, fence);
-            await Assert.ThrowsAsync<IOException>(() => worker.SweepOnceAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => worker.SweepOnceAsync());
             Assert.Equal(1, index.DueCount);
 
             fence.Fail = false;

@@ -152,7 +152,7 @@ public sealed class RedisGuestExpiryIndexTests
             var failedWorker = new GuestSessionExpiryWorker(
                 new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
                 clock, new FailingLobby(), second);
-            await Assert.ThrowsAsync<IOException>(() => failedWorker.SweepOnceAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => failedWorker.SweepOnceAsync());
             var itemA = Assert.Single(await first.ReadDueAsync());
             var itemB = Assert.Single(await second.ReadDueAsync());
             Assert.Equal(alice, itemA.PlayerId);
@@ -229,7 +229,7 @@ public sealed class RedisGuestExpiryIndexTests
             var brokenWorker = new GuestSessionExpiryWorker(
                 new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
                 clock, new FailingLobby(), issuerIndex);
-            await Assert.ThrowsAsync<IOException>(() => brokenWorker.SweepOnceAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => brokenWorker.SweepOnceAsync());
             Assert.Single(await recoveryIndex.ReadDueAsync());
 
             var recoveredWorker = new GuestSessionExpiryWorker(
