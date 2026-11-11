@@ -269,19 +269,21 @@ public sealed class RedisTlsReplicaPromotionTests
         Assert.Contains("role:master", promoted, StringComparison.Ordinal);
         Assert.Equal("PONG", await RedisCliAsync(ReplicaContainer, "PING"));
 
-        // An API already targeting this endpoint becomes ready only AFTER
-        // writable promotion and expiry of its three-second cached 503.
-        await Task.Delay(RedisDeploymentReadiness.CachedFor +
-            TimeSpan.FromMilliseconds(300));
-        await EnsureReadyAsync(observerClient);
-
+        // Do NOT infer automatic reconnection or role rediscovery for an
+        // already-running StackExchange.Redis multiplexer. It may retain the
+        // replica role even after REPLICAOF NO ONE until explicitly reconfigured
+        // or replaced. A correct readiness check must fail closed in that case.
+        // Operator redirection starts two NEW Production hosts with writable
+        // master connections and checks both independently.
         // Manual operator redirection to the promoted server. The product
         // does not claim existing multiplexer instances discover this node:
         // replacement Production hosts are explicitly configured with 6383.
         using var recoveredA = Server(ReplicaConnection);
         using var recoveredB = Server(ReplicaConnection);
         using var newVisitor = Client(recoveredA);
+        using var newVisitorB = Client(recoveredB);
         await EnsureReadyAsync(newVisitor);
+        await EnsureReadyAsync(newVisitorB);
         using var aliceOnRecoveredB = Client(recoveredB, aliceCookie);
         using var bobOnRecoveredA = Client(recoveredA, bobCookie);
         using (var meAlice = await aliceOnRecoveredB.GetAsync("/api/sessions/me"))

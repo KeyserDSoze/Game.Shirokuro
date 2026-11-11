@@ -1014,10 +1014,15 @@ CI drill now boots an extra Production API against the *replica while
 replication is healthy*. Its `/api/health` remains 200 but its
 `/api/ready` must be 503; mere TLS connection and cached reads cannot
 produce a false ready. After the original primary has been stopped and
-the replica is manually promoted, the **same** API targeting the
-replica must recover readiness once the three-second cached failure
-expires. Two new API hosts still verify cookies, lobby state, issuance
-and revocation after promotion. A unit test independently checks that
+the replica is manually promoted, **two new Production API hosts
+explicitly configured for the promoted primary** must report 200
+readiness and still verify cookies, lobby state, issuance and revocation.
+An already-running Redis multiplexer connected while the node was a
+replica **may retain stale role/topology metadata**; neither this
+readiness change nor the #52 test claims automatic client role
+rediscovery. Until clients are reconfigured/restarted, a conservative
+503 is preferable to admitting writes that would fail. A unit test
+independently checks that
 a guest cache that permits `GET` but rejects `SET` fails readiness
 and recovers after writes return.
 
