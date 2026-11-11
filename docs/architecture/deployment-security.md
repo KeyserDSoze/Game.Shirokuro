@@ -979,3 +979,5 @@ routing, explicit old-primary fencing, authoritative replication lag
 and persistent backups, plus the #49-#51 session-cutover controls
 when data loss or rollback is possible. These deployment controls
 and true automatic failover remain #21.
+
+Verified by [Main CI #43055949194](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43055949194): both Production backend and frontend builds, 363 standard xUnit, five Redis TLS cases, one RDB rollback case, **one real Redis TLS replica promotion case**, 106 Vitest, 24 Playwright and 35 Python tests succeeded. The CI fixture remains a non-production manual promotion demonstration.

@@ -372,8 +372,9 @@ public sealed class RedisTlsProductionTests
         if (Connection is null) return;
         var options = ConfigurationOptions.Parse(Connection);
         Assert.True(options.Ssl);
-        // Same reachable TLS port, but the SAN of the issued server certificate
-        // is only localhost and 127.0.0.1. Hostname verification must reject.
+        // The ephemeral certificate also covers the isolated Docker master
+        // DNS name for encrypted replication. This deliberately unrelated
+        // hostname must still be rejected by standard TLS verification.
         options.SslHost = "not-the-redis-server.invalid";
         options.ConnectRetry = 0;
         options.ConnectTimeout = 1200;
