@@ -1110,3 +1110,40 @@ TLS replica promotion, 1 Sentinel automatic promotion and live managed
 API reconnect, 106 Vitest, 24 Playwright, 35 Python and both builds
 passed. No test bypassed certificate validation or started a plaintext
 Sentinel listener.
+
+## Authenticated TLS Redis ACL preflight (#56)
+
+The Production Redis connections for guest sessions and lobby state use a
+**single validated TLS connection string**. They support the StackExchange.Redis
+`user` and `password` options for a named Redis ACL account. Put these
+credentials in an operator-managed secret store, not the repository, log
+messages, URL, HTTP headers or frontend:
+
+```sh
+Security__GuestSessions__RedisConnectionString="redis.internal.example:6380,ssl=true,user=shirokuro,password=<secret from secret manager>"
+```
+
+For CI, #56 creates an **additional isolated Redis TLS-only** process on
+127.0.0.1:6386 with the same ephemeral verified CA, a disabled Redis
+`default` account, a random per-run masked password and an ACL identity
+restricted to Redis keys matching `shirokuro:*`. The CI policy enables
+only the connection, scripting, read/write, transactional and pub/sub
+command categories needed for the application plus connection diagnostics;
+it is a test configuration, **not a reviewed production privilege matrix**.
+Two *real* Production API hosts must use the ACL account across their two
+independent Redis clients to issue and validate signed sessions, report
+readiness, create/join a shared room and perform logout with Lua revocation
+fencing. The test also rejects anonymous and wrong-password connections
+and a write outside the authorized key namespace. The ACL file and the
+container are deleted with `always()`; the password is generated at
+runtime and masked rather than printed or stored as an artifact.
+
+For a real deployment, grant Redis users only the commands and key patterns
+they need, rotate credentials and validate a separate operational Sentinel
+user when `serviceName` is configured; avoid reusing administrative Redis
+identities. Run negative AUTH/ACL tests after a credentials change. Failure
+to authorize must never fall back to Development's memory store. The CI
+single-node ACL test does **not** certify dedicated production ACL policy,
+authenticated Sentinel quorum, dynamic credentials rotation, TLS client
+certificate authentication, firewall isolation, security monitoring,
+split-brain resistance or RPO/RTO; these remain under #21.
