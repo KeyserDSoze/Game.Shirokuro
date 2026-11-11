@@ -279,9 +279,38 @@ jobs:
           set -euo pipefail
           state="$(mktemp -d /tmp/shirokuro-ci-sentinel-XXXXXX)"
           echo "SHIROKURO_TEST_SENTINEL_DIR=$state" >> "$GITHUB_ENV"
+          # Dedicated one-time ACL passwords; no default users and no
+          # credentials in the repository or uploaded artifacts.
+          app_pass="$(openssl rand -hex 24)"
+          replica_pass="$(openssl rand -hex 24)"
+          monitor_pass="$(openssl rand -hex 24)"
+          peer_pass="$(openssl rand -hex 24)"
+          sentinel_pass="$(openssl rand -hex 24)"
+          for secret in "$app_pass" "$replica_pass" "$monitor_pass" "$peer_pass" "$sentinel_pass"; do
+            echo "::add-mask::$secret"
+          done
+          mkdir -p "$state/redis-acl"
+          cat > "$state/redis-acl/users.acl" <<EOF
+          user default off
+          user shirokuro-app on >$app_pass ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction -@dangerous -@admin +info +command +client +time
+          user shirokuro-replica on >$replica_pass +psync +replconf +ping
+          user shirokuro-monitor on >$monitor_pass resetchannels &__sentinel__:hello +multi +slaveof +ping +exec +subscribe +config|rewrite +role +publish +info +client|setname +client|kill +script|kill
+          EOF
+          chmod 755 "$state" "$state/redis-acl"
+          chmod 644 "$state/redis-acl/users.acl"
+          # Separate credentials for the Redis primary and Sentinel discovery.
+          echo "SHIROKURO_TEST_SENTINEL_TLS=localhost:26380,localhost:26381,localhost:26382,serviceName=shirokuro-main,ssl=true,sslHost=localhost,user=shirokuro-app,password=$app_pass,sentinelUser=shirokuro-sentinel-client,sentinelPassword=$sentinel_pass,abortConnect=true,connectTimeout=4000,connectRetry=1" >> "$GITHUB_ENV"
+          echo "SHIROKURO_TEST_SENTINEL_REDIS_CLI_PASSWORD=$app_pass" >> "$GITHUB_ENV"
+          echo "SHIROKURO_TEST_SENTINEL_CLIENT_CLI_PASSWORD=$sentinel_pass" >> "$GITHUB_ENV"
           for id in 1 2 3; do
             mkdir -p "$state/sentinel-$id"
             chmod 777 "$state/sentinel-$id"
+            cat > "$state/sentinel-$id/users.acl" <<EOF
+          user default off
+          user shirokuro-sentinel-peer on >$peer_pass allchannels +@all
+          user shirokuro-sentinel-client on >$sentinel_pass allchannels -@all +auth +client|getname +client|id +client|setname +client|setinfo +command +hello +ping +role +info +echo +subscribe +psubscribe +sentinel|get-master-addr-by-name +sentinel|master +sentinel|myid +sentinel|replicas +sentinel|sentinels +sentinel|masters
+          EOF
+            chmod 644 "$state/sentinel-$id/users.acl"
             port=$((26379 + id))
             cat > "$state/sentinel-$id/sentinel.conf" <<EOF
           port 0
@@ -293,7 +322,12 @@ jobs:
           tls-ca-cert-file /certs/ca.crt
           tls-auth-clients no
           tls-replication yes
+          aclfile /data/users.acl
+          sentinel sentinel-user shirokuro-sentinel-peer
+          sentinel sentinel-pass $peer_pass
           sentinel monitor shirokuro-main 127.0.0.1 6384 2
+          sentinel auth-user shirokuro-main shirokuro-monitor
+          sentinel auth-pass shirokuro-main $monitor_pass
           sentinel down-after-milliseconds shirokuro-main 1000
           sentinel failover-timeout shirokuro-main 8000
           sentinel parallel-syncs shirokuro-main 1
@@ -303,18 +337,23 @@ jobs:
 
           docker run -d --name shirokuro-ci-sentinel-master --network host \
             -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            -v "$state/redis-acl:/acl:ro" \
             redis:7.4-alpine redis-server \
             --bind 127.0.0.1 --port 0 --tls-port 6384 \
             --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
             --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no \
+            --aclfile /acl/users.acl \
             --save "" --appendonly no
           docker run -d --name shirokuro-ci-sentinel-replica --network host \
             -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            -v "$state/redis-acl:/acl:ro" \
             redis:7.4-alpine redis-server \
             --bind 127.0.0.1 --port 0 --tls-port 6385 \
             --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
             --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no \
+            --aclfile /acl/users.acl \
             --tls-replication yes --replicaof 127.0.0.1 6384 \
+            --masteruser shirokuro-replica --masterauth "$replica_pass" \
             --save "" --appendonly no
 
           for id in 1 2 3; do
@@ -324,12 +363,16 @@ jobs:
               redis:7.4-alpine redis-server /data/sentinel.conf --sentinel
           done
           for attempt in $(seq 1 90); do
-            if docker exec shirokuro-ci-sentinel-1 redis-cli --tls \
-                --cacert /certs/ca.crt -h localhost -p 26380 \
+            if docker exec -e "REDISCLI_AUTH=$sentinel_pass" \
+                shirokuro-ci-sentinel-1 redis-cli --tls \
+                --cacert /certs/ca.crt --user shirokuro-sentinel-client \
+                -h localhost -p 26380 \
                 SENTINEL get-master-addr-by-name shirokuro-main \
                 2>/dev/null | grep -qx 6384 &&
-               docker exec shirokuro-ci-sentinel-replica redis-cli --tls \
-                --cacert /certs/ca.crt -h localhost -p 6385 \
+               docker exec -e "REDISCLI_AUTH=$app_pass" \
+                shirokuro-ci-sentinel-replica redis-cli --tls \
+                --cacert /certs/ca.crt --user shirokuro-app \
+                -h localhost -p 6385 \
                 INFO replication 2>/dev/null | grep -q 'master_link_status:up'; then
               exit 0
             fi
@@ -341,7 +384,6 @@ jobs:
       - name: Test automatic TLS Sentinel rediscovery and running API reconnect
         run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsSentinelFailoverTests'
         env:
-          SHIROKURO_TEST_SENTINEL_TLS: localhost:26380,localhost:26381,localhost:26382,serviceName=shirokuro-main,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=4000,connectRetry=1
           SHIROKURO_TEST_SENTINEL_CHAOS: '1'
 
       - name: Destroy isolated Redis Sentinel TLS quorum fixture

@@ -31,6 +31,35 @@ public sealed class GuestSessionRedisSentinelConfigurationTests
     }
 
     [Fact]
+    public void DistinctRedisAndSentinelAclIdentitiesAreParsedWithoutCredentialLeakage()
+    {
+        const string value =
+            "localhost:26380,localhost:26381,localhost:26382," +
+            "serviceName=shirokuro-main,ssl=true,sslHost=localhost," +
+            "user=shirokuro-app,password=never-log-app-secret," +
+            "sentinelUser=shirokuro-sentinel-client," +
+            "sentinelPassword=never-log-sentinel-secret";
+        var options = GuestSessionRedisConfiguration.ReadTlsOptions(Settings(value));
+        Assert.True(options.Ssl);
+        Assert.Equal("shirokuro-main", options.ServiceName);
+        Assert.Equal("shirokuro-app", options.User);
+        Assert.Equal("never-log-app-secret", options.Password);
+        Assert.Equal("shirokuro-sentinel-client", options.SentinelUser);
+        Assert.Equal("never-log-sentinel-secret", options.SentinelPassword);
+        Assert.NotEqual(options.Password, options.SentinelPassword);
+
+        var invalid = value.Replace("ssl=true", "ssl=false", StringComparison.Ordinal);
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            GuestSessionRedisConfiguration.ReadTlsOptions(Settings(invalid)));
+        Assert.DoesNotContain("never-log-app-secret", error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("never-log-sentinel-secret", error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("localhost:", error.ToString(),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void StandardDirectTlsRedisRemainsSupported()
     {
         var options = GuestSessionRedisConfiguration.ReadTlsOptions(

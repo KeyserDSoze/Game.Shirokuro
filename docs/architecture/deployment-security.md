@@ -1149,3 +1149,15 @@ certificate authentication, firewall isolation, security monitoring,
 split-brain resistance or RPO/RTO; these remain under #21.
 
 The scoped Redis ACL (including denial of keyless administrative commands) and real Production two-node session/lobby integration passed in [CI main #43069457198](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43069457198) SUCCESS: 375 xUnit standard, 2 real Redis TLS ACL xUnit, 5 Production TLS xUnit, 1 RDB, 1 replica promotion, 1 automatic Sentinel failover, 106 Vitest, 24 Playwright, 35 Python and .NET/React builds. This does not replace a deployment-specific access-control review.
+
+## Authenticated TLS Sentinel quorum and distinct ACL identities (issue #57)
+
+For a Production Sentinel deployment, the validated shared connection string supports **different** credentials for the Redis primary/replica data plane (`user`, `password`) and the Sentinel discovery plane (`sentinelUser`, `sentinelPassword`). Both independent client connectors (guest-session `IDistributedCache` and lobby multiplexer) use the same validated configuration, with TLS certificate verification and no memory fallback. Supply every secret from an external secrets manager, never source control:
+
+```sh
+Security__GuestSessions__RedisConnectionString="sentinel-a:26379,sentinel-b:26379,sentinel-c:26379,serviceName=shirokuro-main,ssl=true,sslHost=redis.internal.example,user=game-app,password=<redis-app-secret>,sentinelUser=sentinel-discovery,sentinelPassword=<sentinel-client-secret>"
+```
+
+An operator must provision **separate** ACL identities for: the game API's keyspace-scoped Redis operations; replica authentication to the old/new master (`masteruser`/`masterauth`); Sentinel-to-Redis monitoring/reconfiguration (`sentinel auth-user`/`sentinel auth-pass`); Sentinel-to-Sentinel peer elections (`sentinel sentinel-user`/`sentinel sentinel-pass`); and the game's minimally permitted Sentinel discovery client. These principals have **different credentials**, with `default off` on every Redis and Sentinel instance. The peer Sentinel principal is more privileged than the discovery client and must not be made available to the application. Key patterns do not restrict keyless commands: deny destructive/admin commands for the game API and test those denials.
+
+The CI fixture is five TLS-only containers on the same runner, bound to loopback; the CA is ephemeral and verified. ACL files, 5 independently generated and masked passwords, and writable Sentinel configs live in temporary runner directories and are destroyed by `always()`. Two original API Production TestServers keep their cookies and lobby revision across a **real automatic** quorum failover with no forced `REPLICAOF NO ONE`; tests also check invalid/missing authentication and Redis ACL denial. This is a controlled regression test, **not** evidence of separate failure domains, cert/credential rotation, network firewall policy, RPO=0, split-brain protection, mTLS, complete least privilege or a production monitoring system. All these remain in #21.

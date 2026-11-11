@@ -140,9 +140,19 @@ public sealed class RedisTlsSentinelFailoverTests
             throw new ArgumentOutOfRangeException(nameof(container));
         if (port is not (6384 or 6385 or 26380))
             throw new ArgumentOutOfRangeException(nameof(port));
+        var sentinel = container == Sentinel;
+        var password = Environment.GetEnvironmentVariable(
+            sentinel ? "SHIROKURO_TEST_SENTINEL_CLIENT_CLI_PASSWORD"
+                : "SHIROKURO_TEST_SENTINEL_REDIS_CLI_PASSWORD");
+        if (string.IsNullOrWhiteSpace(password))
+            throw new InvalidOperationException("Authenticated CI CLI configuration missing.");
+        // The password is masked in the runner and passed to redis-cli as
+        // an environment variable, never appended to the CLI output.
         return DockerAsync([
-            "exec", container, "redis-cli", "--tls",
-            "--cacert", "/certs/ca.crt", "-h", "localhost",
+            "exec", "-e", "REDISCLI_AUTH=" + password, container, "redis-cli", "--tls",
+            "--cacert", "/certs/ca.crt",
+            "--user", sentinel ? "shirokuro-sentinel-client" : "shirokuro-app",
+            "-h", "localhost",
             "-p", port.ToString(System.Globalization.CultureInfo.InvariantCulture),
             .. arguments
         ]);
@@ -172,6 +182,64 @@ public sealed class RedisTlsSentinelFailoverTests
         Assert.True(config.Ssl);
         Assert.Equal("shirokuro-main", config.ServiceName);
         Assert.Equal(3, config.EndPoints.Count);
+        Assert.Equal("shirokuro-app", config.User);
+        Assert.Equal("shirokuro-sentinel-client", config.SentinelUser);
+        Assert.False(string.IsNullOrEmpty(config.Password));
+        Assert.False(string.IsNullOrEmpty(config.SentinelPassword));
+        Assert.NotEqual(config.Password, config.SentinelPassword);
+
+        // A Sentinel discovery client must be isolated from Redis write
+        // authority; unauthenticated and invalid AUTH must fail closed.
+        // Explicitly connect with the same independent options used by
+        // both Production Redis clients.
+        using (var authenticated = await ConnectionMultiplexer.ConnectAsync(config))
+        {
+            var database = authenticated.GetDatabase();
+            await Assert.ThrowsAsync<RedisServerException>(() =>
+                database.StringSetAsync("outside-shirokuro-namespace", "denied"));
+            await Assert.ThrowsAsync<RedisServerException>(() =>
+                database.ExecuteAsync("FLUSHDB"));
+            await Assert.ThrowsAsync<RedisServerException>(() =>
+                database.ExecuteAsync("CONFIG", "GET", "maxmemory"));
+        }
+
+        async Task MustRejectAsync(ConfigurationOptions options)
+        {
+            options.AbortOnConnectFail = true;
+            options.ConnectRetry = 0;
+            options.ConnectTimeout = 1500;
+            options.SyncTimeout = 1500;
+            await Assert.ThrowsAnyAsync<Exception>(async () =>
+            {
+                using var connectionAttempt =
+                    await ConnectionMultiplexer.ConnectAsync(options)
+                        .WaitAsync(TimeSpan.FromSeconds(12));
+                await connectionAttempt.GetDatabase().PingAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(4));
+            });
+        }
+
+        var badSentinel = config.Clone();
+        badSentinel.SentinelPassword = "deliberately-wrong-sentinel-ci-password";
+        await MustRejectAsync(badSentinel);
+
+        var badRedis = config.Clone();
+        badRedis.Password = "deliberately-wrong-primary-ci-password";
+        await MustRejectAsync(badRedis);
+
+        // A distinct unauthenticated transport must not talk to Sentinel,
+        // even though the certificate is CA-valid and the port is reachable.
+        var unauthenticated = ConfigurationOptions.Parse(
+            "localhost:26380,ssl=true,sslHost=localhost," +
+            "abortConnect=true,connectRetry=0,connectTimeout=1500");
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            using var unauthenticatedSentinel =
+                await ConnectionMultiplexer.SentinelConnectAsync(unauthenticated)
+                    .WaitAsync(TimeSpan.FromSeconds(12));
+            await unauthenticatedSentinel.GetServer("localhost", 26380)
+                .PingAsync().WaitAsync(TimeSpan.FromSeconds(4));
+        });
 
         // These two Production TestServers are deliberately never rebuilt
         // between creation and automatic Sentinel failover.
