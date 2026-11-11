@@ -37,11 +37,10 @@ public static class GuestLobbyEndpoints
                 return Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster);
             });
         });
+        createRoom.WithMetadata(
+            new GuestMutationRateLimit(GuestMutationKind.RoomCreation));
         if (app.ServiceProvider.GetRequiredService<IHostEnvironment>().IsDevelopment())
             createRoom.RequireRateLimiting("guest-room-creation");
-        else
-            createRoom.WithMetadata(
-                new GuestMutationRateLimit(GuestMutationKind.RoomCreation));
 
         route.MapPost("/{roomId}/join", async (string roomId, JoinRoomRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>

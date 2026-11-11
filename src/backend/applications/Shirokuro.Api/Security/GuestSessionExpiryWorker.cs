@@ -20,55 +20,91 @@ public sealed class GuestSessionExpiryWorker(
     /// </summary>
     public int SweepOnce()
     {
-        var removedMemberships = 0;
-        foreach (var trustedPlayerId in registry.DrainExpiredPlayerIds())
-            removedMemberships += coordinator.RemovePlayerFromAllRooms(trustedPlayerId);
-        return removedMemberships;
+        try
+        {
+            var removedMemberships = SweepLocalCore();
+            MultiplayerMetrics.RecordExpirySweep(
+                sharedRedis: false, success: true, removedMemberships);
+            return removedMemberships;
+        }
+        catch
+        {
+            MultiplayerMetrics.RecordExpirySweep(
+                sharedRedis: false, success: false, membershipsRemoved: 0);
+            throw;
+        }
+    }
+
+    private int SweepLocalCore()
+    {
+        var removed = 0;
+        foreach (var playerId in registry.DrainExpiredPlayerIds())
+            removed += coordinator.RemovePlayerFromAllRooms(playerId);
+        return removed;
     }
 
     public async Task<int> SweepOnceAsync(CancellationToken cancellationToken = default)
     {
-        if (expiryIndex is not null)
-        {
-            // The encrypted Redis index is authoritative across restarts.
-            // Never acknowledge an item until its CAS lobby cleanup succeeds;
-            // overlapping workers can safely repeat the same removal.
-            if (lobby is null)
-                throw new InvalidOperationException("Distributed cleanup needs a lobby.");
-            var removed = 0;
-            foreach (var item in await expiryIndex.ReadDueAsync(cancellationToken))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                removed += await lobby.RemovePlayerFromAllRoomsAsync(
-                    item.PlayerId, cancellationToken);
-                await expiryIndex.AcknowledgeAsync(
-                    item.ProtectedMember, cancellationToken);
-            }
-            // Local tracking is only a bounded optimization; do not use it
-            // as the source of expired guests in non-Development.
-            registry.DrainExpiredPlayerIds();
-            return removed;
-        }
+        // The hosted worker uses this path. A failure must be visible to
+        // operations without losing the durable retry/ack semantics.
+        var sharedRedis = expiryIndex is not null;
+        if (lobby is null && !sharedRedis)
+            return SweepOnce(); // Counts a single local attempt.
 
-        if (lobby is null)
-            return SweepOnce();
-
-        var identities = registry.DrainExpiredPlayerIds();
         try
         {
-            var removed = 0;
-            foreach (var id in identities)
+            if (expiryIndex is not null)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                removed += await lobby.RemovePlayerFromAllRoomsAsync(id, cancellationToken);
+                // Shared encrypted Redis index survives an issuer-node crash.
+                // Ack only AFTER idempotent lobby cleanup has succeeded.
+                if (lobby is null)
+                    throw new InvalidOperationException("Distributed cleanup needs a lobby.");
+                var removed = 0;
+                foreach (var item in await expiryIndex.ReadDueAsync(cancellationToken))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    removed += await lobby.RemovePlayerFromAllRoomsAsync(
+                        item.PlayerId, cancellationToken);
+                    await expiryIndex.AcknowledgeAsync(
+                        item.ProtectedMember, cancellationToken);
+                }
+                registry.DrainExpiredPlayerIds();
+                MultiplayerMetrics.RecordExpirySweep(
+                    sharedRedis: true, success: true, removed);
+                return removed;
             }
-            return removed;
+
+            var identities = registry.DrainExpiredPlayerIds();
+            try
+            {
+                var removed = 0;
+                foreach (var id in identities)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    removed += await lobby!.RemovePlayerFromAllRoomsAsync(
+                        id, cancellationToken);
+                }
+                MultiplayerMetrics.RecordExpirySweep(
+                    sharedRedis: false, success: true, removed);
+                return removed;
+            }
+            catch
+            {
+                // No maintenance identity is lost on a transient local
+                // failure; the metric below records the failed attempt.
+                registry.RequeueExpiredPlayerIds(identities);
+                throw;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown is not an infrastructure failure.
+            throw;
         }
         catch
         {
-            // Best-effort retried on next sweep; a Redis outage must never
-            // permanently discard expired identities from local maintenance.
-            registry.RequeueExpiredPlayerIds(identities);
+            MultiplayerMetrics.RecordExpirySweep(
+                sharedRedis, success: false, membershipsRemoved: 0);
             throw;
         }
     }

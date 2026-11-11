@@ -309,3 +309,37 @@ one-bit readiness but should not be advertised to arbitrary external clients.
 A green local CI with plain Redis does **not** prove real Redis TLS, Sentinel/
 cluster failover, backup/restore, load-balancer configuration or durable
 accounts; these remain under #21.
+
+## Aggregate multiplayer security metrics (issue #40)
+
+The API exposes `System.Diagnostics.Metrics` instruments from meter
+**`Shirokuro.Api.Multiplayer`** (version `0.0.1`). A deployment can
+subscribe with a .NET/OpenTelemetry collector **explicitly configured and
+restricted by the operator**. The application does **not** register a public
+`/metrics` route, telemetry exporter, external collector, or any secrets
+in configuration. This code does not claim an operational monitoring backend
+has been deployed.
+
+| Counter (long) | Bounded attributes | Meaning |
+| --- | --- | --- |
+| `shirokuro.guest_mutation.decisions` | `policy=session\|lobby`, `outcome=allowed\|limited\|unavailable` | One technical rate-limiter decision for each protected POST, *not* success/failure of the later HTTP handler. Local Development and Redis deployment use the same trusted endpoint metadata. |
+| `shirokuro.readiness.probes` | `outcome=ready\|unavailable` | One **actual** readiness verification. Cached Redis readiness hits are excluded; Development has no Redis to check. |
+| `shirokuro.guest_expiry.sweeps` | `mode=local\|redis`, `outcome=success\|failure` | Completed or failed guest expiry maintenance passes. Expected host-shutdown cancellation is not a failure. |
+| `shirokuro.guest_expiry.memberships_removed` | `mode=local\|redis` | Number of stale **lobby memberships** removed after a successful sweep, not the number of accounts, sessions or rooms. |
+
+All tag values are derived from **hard-coded server enum cases / boolean
+statuses** and validated; there are no endpoint URLs, arbitrary status
+messages, IP addresses, host names, Redis keys, player IDs, room/invitation
+references, cookies, tokens, errors, or exception text. In particular, never
+add these to metric dimensions: unbounded/high-cardinality labels can become
+a privacy and memory-denial problem. No log of an individual abuse attempt is
+required by this feature. A limiter's `allowed` value means a **permit was
+granted**, not that the final endpoint produced HTTP 2xx.
+
+An operator can configure **aggregate** alerts for sustained
+`outcome=unavailable` (service dependency), `outcome=limited` (capacity/
+abuse) and failed cleanup sweeps; threshold/SLA selection is deployment
+policy, not a hard-coded gameplay rule. Counts are per process until an
+external collector aggregates nodes. Instrumentation is not an abuse
+prevention mechanism or a substitute for Redis TLS, HA/failover testing,
+controlled monitoring access or durable identity (#21).

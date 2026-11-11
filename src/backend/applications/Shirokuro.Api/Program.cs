@@ -112,6 +112,17 @@ builder.Services.AddSignalR();
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = (rejection, _) =>
+    {
+        // Only two known technical policies carry metadata. Never tag
+        // untrusted URL paths, remote IPs, principals or request headers.
+        var rule = rejection.HttpContext.GetEndpoint()?.Metadata
+            .GetMetadata<GuestMutationRateLimit>();
+        if (rule is not null)
+            MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Limited);
+        rejection.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        return ValueTask.CompletedTask;
+    };
     options.AddPolicy("guest-room-creation", context =>
         RateLimitPartition.GetFixedWindowLimiter(
             context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
@@ -216,11 +227,14 @@ if (!app.Environment.IsDevelopment())
             {
                 // Fail closed on Redis/connection/protocol outages, without
                 // printing remote IP, Redis credentials or secret identities.
+                MultiplayerMetrics.RecordMutation(
+                    rule.Kind, MutationOutcome.Unavailable);
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                 return;
             }
             if (!decision.Allowed)
             {
+                MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Limited);
                 context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
                 context.Response.Headers.RetryAfter =
                     Math.Max(1, (long)Math.Ceiling(
@@ -228,11 +242,25 @@ if (!app.Environment.IsDevelopment())
                             System.Globalization.CultureInfo.InvariantCulture);
                 return;
             }
+            MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Allowed);
         }
         await next(context);
     });
 }
 app.UseRateLimiter();
+if (app.Environment.IsDevelopment())
+{
+    // Runs only after the local rate limiter has granted a permit.
+    // Rejections are counted by OnRejected above, never twice.
+    app.Use(async (context, next) =>
+    {
+        var rule = context.GetEndpoint()?.Metadata
+            .GetMetadata<GuestMutationRateLimit>();
+        if (rule is not null)
+            MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Allowed);
+        await next(context);
+    });
+}
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }));
 
@@ -320,11 +348,11 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     }
     return Results.Ok(new { playerId, kind = "guest" });
 });
+// Metadata has only trusted enum values for both deployment modes.
+guestSessionIssuance.WithMetadata(
+    new GuestMutationRateLimit(GuestMutationKind.SessionIssuance));
 if (app.Environment.IsDevelopment())
     guestSessionIssuance.RequireRateLimiting("guest-session-issuance");
-else
-    guestSessionIssuance.WithMetadata(
-        new GuestMutationRateLimit(GuestMutationKind.SessionIssuance));
 
 app.MapGet("/api/sessions/me", (HttpContext context) =>
 {

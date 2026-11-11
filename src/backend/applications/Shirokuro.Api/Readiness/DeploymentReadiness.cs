@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
+using Shirokuro.Api.Security;
 using StackExchange.Redis;
 
 namespace Shirokuro.Api.Readiness;
@@ -42,6 +43,7 @@ public sealed class DevelopmentReadiness : IDeploymentReadiness
     public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        MultiplayerMetrics.RecordReadinessProbe(ready: true);
         return Task.FromResult(true);
     }
 }
@@ -96,6 +98,9 @@ public sealed class RedisDeploymentReadiness(
             }
 
             _nextProbeUtc = clock.GetUtcNow().Add(CachedFor);
+            // Only a fresh probe emits a measurement. Cached requests do not
+            // pretend to be independent Redis / Data Protection checks.
+            MultiplayerMetrics.RecordReadinessProbe(_lastResult);
             return _lastResult;
         }
         finally
