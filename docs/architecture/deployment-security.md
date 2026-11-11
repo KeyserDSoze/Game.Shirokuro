@@ -326,6 +326,7 @@ has been deployed.
 | `shirokuro.readiness.probes` | `outcome=ready\|unavailable` | One **actual** readiness verification. Cached Redis readiness hits are excluded; Development has no Redis to check. |
 | `shirokuro.guest_expiry.sweeps` | `mode=local\|redis`, `outcome=success\|failure` | Completed or failed guest expiry maintenance passes. Expected host-shutdown cancellation is not a failure. |
 | `shirokuro.guest_expiry.memberships_removed` | `mode=local\|redis` | Number of stale **lobby memberships** actually removed, **including successful items from a partially failed sweep**; not the number of accounts, sessions or rooms. |
+| `shirokuro.guest_expiry.unreadable_items` | *(nessuna)* | Number of observations of unauthenticatable or structurally invalid encrypted expiry members; not distinct entries, no identity and no acknowledgement. |
 
 All tag values are derived from **hard-coded server enum cases / boolean
 statuses** and validated; there are no endpoint URLs, arbitrary status
@@ -506,3 +507,49 @@ failing due items (or an unreadable encrypted item in `ReadDueAsync`)
 can still delay later entries; operators must repair the failing dependency
 or key ring. This is not a complete poison-message/dead-letter solution,
 Redis HA/failover certification or durable identity (#21).
+
+## Fair rotating Redis expiry windows and unreadable protected members (#45)
+
+The expiry index previously always read the first **128** due members of
+its Redis sorted set and aborted the whole read on an invalid encrypted
+payload. Thus 128 permanently unprocessable members, or one member whose
+Data Protection key is absent, could indefinitely prevent later, healthy
+guest cleanup even after #44's per-item error isolation.
+
+The Redis index now atomically selects up to **128** due members with a
+shared **round-robin offset** stored at
+`shirokuro:guest-expiry:{default}:v1:scan-offset`, beside the existing
+`...:pending` sorted set. One Lua command uses `ZCOUNT` and a bounded
+`ZRANGEBYSCORE` window, wrapping to the beginning when needed. It advances
+the cursor once for each scanned window, across independently started
+nodes. Cursor values contain **only an integer offset**, no guest identity,
+session token, room, invitation or encrypted payload. The cursor uses the
+same Redis hash tag as the sorted set (Redis Cluster-safe), expires after
+24 hours of inactivity and is cleared if no work is due. This does not
+change the expiry score, CAS cleanup, 8-hour session validity, remaining
+room TTL or batch size.
+
+On a member with failed Data Protection authentication or a decrypted
+payload failing strict UTC timestamp/guest-ID validation, the reader
+returns an **explicit unreadable marker with no player identity**. The
+worker never passes such a marker to the revocation fence, lobby CAS or
+acknowledgement. It continues with valid entries and reports a **single
+sanitized failed sweep**, so the unreadable work remains durable for
+operator restoration of the original keys. Real Redis read/Lua faults
+still fail closed, and host cancellation stops processing immediately.
+
+`shirokuro.guest_expiry.unreadable_items` is a monotonic .NET meter
+counter **without attributes**, measuring observations of unreadable
+members rather than distinct unique records (the same item may be seen
+again on later sweeps). `sweeps{outcome=failure}` and aggregate
+`memberships_removed` metrics remain available. No public telemetry
+endpoint is exposed.
+
+**Limitations:** a rotating numerical offset in a sorted set that changes
+through concurrent acknowledgements provides bounded progress over a
+stable due population, but does not guarantee strict fairness or an SLA
+under continuous writes/removals. Unreadable work is **not discarded**;
+lost keys or corrupted records still need operator remediation. A severe
+multi-node Redis outage, wrong certificates, missing keyring or sustained
+excess work can still delay cleanup. Redis HA/failover deployment, durable
+accounts and production alerting stay open in #21.

@@ -16,6 +16,7 @@ public static class MultiplayerMetrics
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string ExpirySweepsName = "shirokuro.guest_expiry.sweeps";
     public const string ExpiryMembershipsRemovedName = "shirokuro.guest_expiry.memberships_removed";
+    public const string ExpiryUnreadableItemsName = "shirokuro.guest_expiry.unreadable_items";
 
     private static readonly Meter Meter = new(MeterName, MeterVersion);
     private static readonly Counter<long> MutationDecisions = Meter.CreateCounter<long>(
@@ -30,6 +31,9 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> ExpiryMembershipsRemoved = Meter.CreateCounter<long>(
         ExpiryMembershipsRemovedName, unit: "{membership}",
         description: "Aggregate stale lobby memberships removed, including partial failed sweeps.");
+    private static readonly Counter<long> ExpiryUnreadableItems = Meter.CreateCounter<long>(
+        ExpiryUnreadableItemsName, unit: "{observation}",
+        description: "Unreadable guest expiry work item observations; not distinct entries.");
 
     public static void RecordMutation(GuestMutationKind policy, MutationOutcome outcome)
     {
@@ -54,6 +58,11 @@ public static class MultiplayerMetrics
     public static void RecordReadinessProbe(bool ready) =>
         ReadinessProbes.Add(1, new KeyValuePair<string, object?>(
             "outcome", ready ? "ready" : "unavailable"));
+
+    // No tags: malformed or unreadable encrypted data is never an identity,
+    // an exception label or a Redis key exposed to an exporter.
+    public static void RecordUnreadableExpiryItem() =>
+        ExpiryUnreadableItems.Add(1);
 
     public static void RecordExpirySweep(bool sharedRedis, bool success, int membershipsRemoved)
     {

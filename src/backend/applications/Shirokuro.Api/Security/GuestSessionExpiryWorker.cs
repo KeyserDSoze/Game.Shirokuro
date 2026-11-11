@@ -62,12 +62,22 @@ public sealed class GuestSessionExpiryWorker(
                     throw new InvalidOperationException("Distributed cleanup needs a lobby.");
 
                 var failedItems = 0;
-                // An unreadable batch is still fail-closed: do not skip
-                // unverifiable identities or silently acknowledge them.
+                // Read a bounded, shared rotating window. Damaged encrypted
+                // members are represented explicitly as unprocessable items,
+                // not as identities and not as a silent successful cleanup.
                 var due = await expiryIndex.ReadDueAsync(cancellationToken);
                 foreach (var item in due)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    if (item.IsUnreadable)
+                    {
+                        // Never invent an identity, fence or ack an
+                        // unauthenticated encrypted entry. Continue other
+                        // due work but report a degraded sweep at the end.
+                        failedItems++;
+                        MultiplayerMetrics.RecordUnreadableExpiryItem();
+                        continue;
+                    }
                     try
                     {
                         // Fence before removing: a stale in-flight guest

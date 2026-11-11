@@ -172,6 +172,7 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, MutationOutcome.Unavailable);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
+        MultiplayerMetrics.RecordUnreadableExpiryItem();
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 0);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 2);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: true, membershipsRemoved: 3);
@@ -194,6 +195,8 @@ public sealed class MultiplayerMetricsTests
             m => m.Tags["mode"] == "redis" && m.Tags["outcome"] == "failure");
         Assert.Contains(capture.For(MultiplayerMetrics.ExpiryMembershipsRemovedName),
             m => m.Tags["mode"] == "redis" && m.Value == 3);
+        Assert.Contains(capture.For(MultiplayerMetrics.ExpiryUnreadableItemsName),
+            m => m.Tags.Count == 0 && m.Value == 1);
         Assert.Contains(capture.For(MultiplayerMetrics.ExpiryMembershipsRemovedName),
             m => m.Tags["mode"] == "redis" && m.Value == 2);
 
@@ -204,7 +207,8 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.MutationDecisionsName,
             MultiplayerMetrics.ReadinessProbesName,
             MultiplayerMetrics.ExpirySweepsName,
-            MultiplayerMetrics.ExpiryMembershipsRemovedName
+            MultiplayerMetrics.ExpiryMembershipsRemovedName,
+            MultiplayerMetrics.ExpiryUnreadableItemsName
         })
         foreach (var measurement in capture.For(metric))
         {
@@ -214,6 +218,7 @@ public sealed class MultiplayerMetricsTests
                 MultiplayerMetrics.MutationDecisionsName => new[] { "outcome", "policy" },
                 MultiplayerMetrics.ReadinessProbesName => new[] { "outcome" },
                 MultiplayerMetrics.ExpirySweepsName => new[] { "mode", "outcome" },
+                MultiplayerMetrics.ExpiryUnreadableItemsName => [],
                 _ => new[] { "mode" }
             };
             Assert.Equal(expectedKeys,

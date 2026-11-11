@@ -14,10 +14,41 @@ namespace Shirokuro.Api.Security;
 public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
 {
     public const int BatchSize = 128;
+    public static readonly TimeSpan CursorLifetime = TimeSpan.FromDays(1);
+
+    // Atomic selection + shared round-robin offset. A permanently failing
+    // group of >=128 due entries cannot monopolize every 5-minute sweep.
+    // No user identifiers or encrypted payloads are saved in cursor state.
+    // Both keys share the same Redis Cluster hash tag.
+    private const string RotateDueWindowScript = """
+        local count = redis.call('ZCOUNT', KEYS[1], '-inf', ARGV[1])
+        if count == 0 then
+            redis.call('DEL', KEYS[2])
+            return {}
+        end
+        local wanted = math.min(count, tonumber(ARGV[2]))
+        local offset = tonumber(redis.call('GET', KEYS[2]) or '0') or 0
+        if offset < 0 then offset = 0 end
+        offset = offset % count
+        local batch = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1],
+            'LIMIT', offset, wanted)
+        if #batch < wanted then
+            local wrapped = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1],
+                'LIMIT', 0, wanted - #batch)
+            for _,member in ipairs(wrapped) do
+                batch[#batch + 1] = member
+            end
+        end
+        redis.call('SET', KEYS[2], tostring((offset + #batch) % count),
+            'EX', ARGV[3])
+        return batch
+        """;
+
     private readonly IDatabase _database;
     private readonly IDataProtector _protector;
     private readonly TimeProvider _clock;
     private readonly RedisKey _key;
+    private readonly RedisKey _cursorKey;
 
     public RedisGuestExpiryIndex(
         IDatabase database, IDataProtectionProvider protection, TimeProvider clock,
@@ -31,7 +62,9 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             name.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-'))
             throw new ArgumentException("Invalid guest expiry namespace.",
                 nameof(namespaceName));
-        _key = "shirokuro:guest-expiry:{" + name + "}:v1:pending";
+        var prefix = "shirokuro:guest-expiry:{" + name + "}:v1:";
+        _key = prefix + "pending";
+        _cursorKey = prefix + "scan-offset";
     }
 
     public async Task ScheduleAsync(
@@ -80,8 +113,11 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     {
         cancellationToken.ThrowIfCancellationRequested();
         var now = _clock.GetUtcNow();
-        var members = await _database.SortedSetRangeByScoreAsync(
-            _key, stop: CeilingUnixMilliseconds(now), take: BatchSize);
+        var members = (RedisResult[])await _database.ScriptEvaluateAsync(
+            RotateDueWindowScript, [_key, _cursorKey],
+            [CeilingUnixMilliseconds(now), BatchSize, (long)CursorLifetime.TotalSeconds]);
+        if (members.Length > BatchSize)
+            throw new InvalidDataException("Invalid guest expiry window size.");
         var result = new List<DueGuestExpiry>(members.Length);
         foreach (var member in members)
         {
@@ -91,12 +127,13 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             {
                 payload = _protector.Unprotect(member.ToString());
             }
-            catch (System.Security.Cryptography.CryptographicException ex)
+            catch (System.Security.Cryptography.CryptographicException)
             {
-                // Do not delete a damaged or unreadable entry silently: a key
-                // ring misconfiguration must be repaired to restore cleanup.
-                throw new InvalidDataException(
-                    "Unreadable encrypted guest expiry work item.", ex);
+                // Never turn an unknown or unreadable protected member into
+                // a valid player. Retain it durably for key-ring recovery,
+                // while leaving later independent members processable.
+                result.Add(DueGuestExpiry.Unreadable(member.ToString()));
+                continue;
             }
 
             var separator = payload.IndexOf(':');
@@ -106,7 +143,10 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
                 ticks < DateTimeOffset.MinValue.UtcTicks ||
                 ticks > DateTimeOffset.MaxValue.UtcTicks ||
                 !ValidGuestId(payload[(separator + 1)..]))
-                throw new InvalidDataException("Invalid guest expiry work item.");
+            {
+                result.Add(DueGuestExpiry.Unreadable(member.ToString()));
+                continue;
+            }
 
             var expiry = new DateTimeOffset(ticks, TimeSpan.Zero);
             if (expiry > now)

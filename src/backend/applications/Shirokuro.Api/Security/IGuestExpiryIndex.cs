@@ -23,4 +23,14 @@ public interface IGuestExpiryIndex
 }
 
 /// <summary>Opaque persisted work item and trusted server-side identity.</summary>
-public sealed record DueGuestExpiry(string ProtectedMember, string PlayerId);
+/// <summary>
+/// A member whose protected payload cannot be authenticated or validated
+/// must never be treated as a player, fenced, cleaned up or acknowledged.
+/// Keep its opaque member queued for operator key-ring recovery.
+/// </summary>
+public sealed record DueGuestExpiry(
+    string ProtectedMember, string PlayerId, bool IsUnreadable = false)
+{
+    public static DueGuestExpiry Unreadable(string protectedMember) =>
+        new(protectedMember, string.Empty, IsUnreadable: true);
+}
