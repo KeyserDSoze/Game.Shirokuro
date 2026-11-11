@@ -1101,3 +1101,10 @@ or guaranteed RTO. Deploy Sentinel processes on separate failure
 domains with alerting, fencing and backup/restore plans. Retain the
 out-of-band recovery cutoff (#49) for any possible data rollback;
 operational validation and true production HA remain #21.
+
+The automated 3-Sentinel/2-Redis TLS drill was verified in [CI main #43063718376](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43063718376):
+371 standard xUnit, 5 Production TLS tests, 1 RDB restore, 1 manual
+TLS replica promotion, 1 Sentinel automatic promotion and live managed
+API reconnect, 106 Vitest, 24 Playwright, 35 Python and both builds
+passed. No test bypassed certificate validation or started a plaintext
+Sentinel listener.
