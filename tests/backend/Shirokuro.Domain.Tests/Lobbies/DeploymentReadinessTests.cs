@@ -85,7 +85,11 @@ public sealed class DeploymentReadinessTests
                 if (realSessions)
                     services.AddStackExchangeRedisCache(options =>
                     {
-                        options.Configuration = RedisAddress!;
+                        // Override the earlier Production test TLS options,
+                        // not just Configuration: ConfigurationOptions takes
+                        // precedence in StackExchangeRedisCache.
+                        options.ConfigurationOptions =
+                            ConfigurationOptions.Parse(RedisAddress!);
                         options.InstanceName = "shirokuro-readiness-test:";
                     });
                 else
