@@ -39,7 +39,7 @@ public static class GuestLobbyEndpoints
         }).RequireRateLimiting("guest-room-creation");
 
         route.MapPost("/{roomId}/join", async (string roomId, JoinRoomRequest request,
-            HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
+            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
@@ -48,7 +48,7 @@ public static class GuestLobbyEndpoints
         });
 
         route.MapPatch("/{roomId}/hero", async (string roomId, ChooseHeroRequest request,
-            HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
+            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
@@ -57,7 +57,7 @@ public static class GuestLobbyEndpoints
         });
 
         route.MapPatch("/{roomId}/team", async (string roomId, ChangeTeamRequest request,
-            HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
+            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
@@ -66,7 +66,7 @@ public static class GuestLobbyEndpoints
         });
 
         route.MapDelete("/{roomId}/membership", async (string roomId, [FromBody] LeaveRoomRequest request,
-            HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
+            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
