@@ -260,8 +260,17 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     var expires = context.RequestServices.GetRequiredService<TimeProvider>()
         .GetUtcNow().AddHours(8);
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
-    var sessionId = await registry.RegisterAsync(
-        playerId, expires, context.RequestAborted);
+    string sessionId;
+    try
+    {
+        sessionId = await registry.RegisterAsync(
+            playerId, expires, context.RequestAborted);
+    }
+    catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        // Shared authority unavailable: never issue a guest ticket.
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
     var principal = GuestSessions.CreatePrincipal(playerId, sessionId);
     try
     {
@@ -279,10 +288,18 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
                 AllowRefresh = false
             });
     }
-    catch
+    catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
     {
-        await registry.RevokeAsync(principal, context.RequestAborted);
-        throw;
+        try
+        {
+            await registry.RevokeAsync(principal, context.RequestAborted);
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            // Even if rollback cannot contact Redis, no ticket is returned.
+        }
+        context.Response.Headers.Remove("Set-Cookie");
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
     return Results.Ok(new { playerId, kind = "guest" });
 });
