@@ -65,66 +65,90 @@ public sealed class RedisDeploymentReadiness(
     private const string LobbyProbeKey = "shirokuro:readiness:write-probe-v2";
     private static readonly byte[] ProbeValue = [1];
     private static readonly TimeSpan ProbeTtl = TimeSpan.FromSeconds(10);
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    // A public readiness burst shares a single bounded probe, rather than
+    // allocating one queued semaphore waiter per HTTP request.
+    private readonly object _stateGate = new();
+    private Task<bool>? _inFlight;
     private DateTimeOffset _nextProbeUtc = DateTimeOffset.MinValue;
     private bool _lastResult;
 
-    public async Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
+    public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
     {
-        await _gate.WaitAsync(cancellationToken);
-        try
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Task<bool> probe;
+        TaskCompletionSource<bool>? started = null;
+        lock (_stateGate)
         {
             if (clock.GetUtcNow() < _nextProbeUtc)
-                return _lastResult;
+                return Task.FromResult(_lastResult);
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken);
-            timeout.CancelAfter(ProbeTimeout);
-
-            try
+            if (_inFlight is null)
             {
-                // A ping / GET alone incorrectly reports replicas ready.
-                // Both independently configured Production connectors must
-                // be WRITABLE before a node can accept multiplayer traffic.
-                // The fixed probe keys contain no user data, expire rapidly,
-                // and cannot collide with the room/session/expiry keyspaces.
-                Task<bool> lobbyWrite = redis.GetDatabase().StringSetAsync(
-                    LobbyProbeKey, "1", expiry: ProbeTtl);
-                Task cacheWrite = guestSessions.SetAsync(
-                    CacheProbeKey, ProbeValue,
-                    new DistributedCacheEntryOptions
-                    {
-                        AbsoluteExpirationRelativeToNow = ProbeTtl
-                    }, timeout.Token);
-                await Task.WhenAll(lobbyWrite, cacheWrite).WaitAsync(timeout.Token);
-                if (!await lobbyWrite)
-                    throw new InvalidOperationException("Lobby probe write denied.");
-
-                var observed = await guestSessions.GetAsync(
-                    CacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
-                if (observed is null || !observed.AsSpan().SequenceEqual(ProbeValue))
-                    throw new InvalidOperationException("Session probe write unreadable.");
-
-                // A missing or unreadable persisted encrypted key ring must
-                // make a node unready even when Redis answers successfully.
-                keyVerifier.Verify();
-                _lastResult = true;
-            }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
-            {
-                // No exception text or network address is logged or emitted.
-                _lastResult = false;
+                // Publish the promise before starting any async work: an
+                // immediately completed operation must not race a new caller.
+                started = new TaskCompletionSource<bool>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                _inFlight = started.Task;
             }
 
-            _nextProbeUtc = clock.GetUtcNow().Add(CachedFor);
-            // Only a fresh probe emits a measurement. Cached requests do not
-            // pretend to be independent Redis / Data Protection checks.
-            MultiplayerMetrics.RecordReadinessProbe(_lastResult);
-            return _lastResult;
+            probe = _inFlight;
         }
-        finally
+
+        if (started is not null)
+            _ = CompleteProbeAsync(started);
+
+        // Client disconnect/cancellation affects only this waiter. The one
+        // Redis/Data Protection probe still serves the other clients.
+        return probe.WaitAsync(cancellationToken);
+    }
+
+    private async Task CompleteProbeAsync(TaskCompletionSource<bool> completion)
+    {
+        bool ready;
+        using var timeout = new CancellationTokenSource(ProbeTimeout);
+        try
         {
-            _gate.Release();
+            // PING/GET alone would incorrectly report read-only replicas
+            // ready. Both independent Production connectors must be writable.
+            // These fixed technical keys contain no user data or identifiers.
+            Task<bool> lobbyWrite = redis.GetDatabase().StringSetAsync(
+                LobbyProbeKey, "1", expiry: ProbeTtl);
+            Task cacheWrite = guestSessions.SetAsync(
+                CacheProbeKey, ProbeValue,
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = ProbeTtl
+                }, timeout.Token);
+            await Task.WhenAll(lobbyWrite, cacheWrite).WaitAsync(timeout.Token);
+            if (!await lobbyWrite)
+                throw new InvalidOperationException("Lobby probe write denied.");
+
+            var observed = await guestSessions.GetAsync(
+                CacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
+            if (observed is null || !observed.AsSpan().SequenceEqual(ProbeValue))
+                throw new InvalidOperationException("Session probe write unreadable.");
+
+            // The configured, shared encrypted key ring must be usable too.
+            keyVerifier.Verify();
+            ready = true;
         }
+        catch (Exception)
+        {
+            // Never disclose a Redis endpoint, password or key-ring path.
+            // Timeout and any dependency failure both mean not ready.
+            ready = false;
+        }
+
+        lock (_stateGate)
+        {
+            _lastResult = ready;
+            _nextProbeUtc = clock.GetUtcNow().Add(CachedFor);
+            _inFlight = null;
+        }
+
+        // Count a real probe only once, regardless of HTTP fan-out/cancel.
+        MultiplayerMetrics.RecordReadinessProbe(ready);
+        completion.TrySetResult(ready);
     }
 }
