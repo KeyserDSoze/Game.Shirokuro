@@ -87,6 +87,11 @@ public sealed class RedisLobbyHttpIntegrationTests
                 services.AddSingleton(provider => new RedisLobbySnapshotStore(
                     redis.GetDatabase(), provider.GetRequiredService<TimeProvider>(),
                     namespaceName: ns));
+                // The real-Redis HTTP suite must exercise the SAME atomic
+                // fence as the room scripts, not the test-only fake.
+                services.RemoveAll<IGuestRevocationFence>();
+                services.AddSingleton<IGuestRevocationFence>(
+                    provider => provider.GetRequiredService<RedisLobbySnapshotStore>());
                 services.RemoveAll<IAsyncGuestLobby>();
                 services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
             });

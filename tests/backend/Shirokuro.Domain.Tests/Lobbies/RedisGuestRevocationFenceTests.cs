@@ -136,7 +136,7 @@ public sealed class RedisGuestRevocationFenceTests
         if (Address is null) return;
         using var redis = await ConnectionMultiplexer.ConnectAsync(Address);
         var clock = new ManualClock();
-        var ns = "fence-validation-" + Guid.NewGuid().ToString("N");
+        var ns = "fval-" + Guid.NewGuid().ToString("N");
         var store = new RedisLobbySnapshotStore(redis.GetDatabase(), clock,
             namespaceName: ns);
         await Assert.ThrowsAsync<ArgumentException>(() =>

@@ -34,6 +34,12 @@ internal static class TestGuestSessionRedisConfiguration
             // real expiry-index integration tests use independent connections.
             services.RemoveAll<IGuestExpiryIndex>();
             services.AddSingleton<IGuestExpiryIndex, TestGuestExpiryIndex>();
+            // Isolated security TestServers do not run a real Redis. A
+            // test-only fence keeps their hosted worker deterministic;
+            // the dedicated cross-node integration suite restores the
+            // Redis-backed fence on its own namespaced snapshot store.
+            services.RemoveAll<IGuestRevocationFence>();
+            services.AddSingleton<IGuestRevocationFence, TestGuestRevocationFence>();
             if (shared is null)
                 services.AddDistributedMemoryCache();
             else
@@ -85,6 +91,19 @@ internal sealed class TestGuestMutationLimiter(TimeProvider clock) : IGuestMutat
             _windows[key] = entry;
             return Task.FromResult(new GuestMutationDecision(allowed, remaining));
         }
+    }
+}
+
+internal sealed class TestGuestRevocationFence : IGuestRevocationFence
+{
+    public Task FenceGuestAsync(string trustedGuestId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (trustedGuestId is not { Length: 38 } ||
+            !trustedGuestId.StartsWith("guest-", StringComparison.Ordinal))
+            throw new ArgumentException("Invalid test guest ID.", nameof(trustedGuestId));
+        return Task.CompletedTask;
     }
 }
 
