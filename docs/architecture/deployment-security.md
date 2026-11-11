@@ -926,3 +926,56 @@ procedure. The cutover remains a maintenance-gated, consistent
 operator decision on every node; this does not provide a universal
 epoch, cross-store atomicity, production Sentinel/Cluster HA or
 automatic incident recovery (#21).
+
+## TLS Redis replica promotion laboratory (#52)
+
+CI now creates an **isolated two-process Redis 7.4 TLS-only primary/replica
+topology** on loopback ports 6382/6383 (not the production or other test
+6379/6380/6381 fixtures). Both accept only TLS on port 6380 inside their
+containers. The replica connects to the primary using `tls-replication
+yes` and validates the CI CA-signed server certificate. The ephemeral
+certificate has SANs for localhost and the master Docker DNS name; the
+existing incorrect-hostname test remains effective. No certificate trust
+bypass, redis password disclosure, plaintext listener or checked-in
+private keys are introduced.
+
+An xUnit test uses two independent, **real Production API TestServers**
+against the initial primary. They issue two guest cookies, create a
+two-player pre-match room, and verify its revision. Before stopping
+anything, the test polls the replica to establish that **both signed
+sessions' authoritative Redis cache records and the hashed room key**
+have been replicated over the live TLS link. This precondition is
+necessary because Redis replication is asynchronous: a write accepted
+by the primary is not automatically durable on the replica.
+
+The test stops the old master *before* promotion. Both old API nodes,
+still configured to the now-unreachable 6382 primary, must report
+`/api/ready = 503` after its bounded cache and reject existing guest
+cookies (401) without fallback. The isolated replica is then promoted
+with `REPLICAOF NO ONE`; `INFO replication` must report `role:master`.
+After an **explicit operator-style change of Redis connection string
+to localhost:6383**, two *new* Production API hosts must accept the
+same original signed cookies via the shared Data Protection key ring
+and the promoted Redis state, recover the exact room revision and
+membership, and support secure logout/revocation-fence CAS and new
+guest issuance. The old primary is never restarted: the test does not
+intentionally create split-brain.
+
+CI always destroys the temporary master, replica and dedicated Docker
+network. The test controls Docker only when the dedicated
+`SHIROKURO_TEST_REDIS_HA_CHAOS=1` flag is present, uses fixed
+container names, and has bounded commands/polling. No exposed route
+can promote Redis.
+
+**Precisely what this does NOT prove:** there is no Sentinel quorum,
+automatic service discovery/reconfiguration of existing client
+multiplexers, Cluster routing, leader election, fencing of an old
+primary in a network partition, `WAIT`-based synchronous write
+durability, RPO=0, RTO/SLA, cloud replication, backup policy, load
+balancer switch or production HA certification. Redis replication
+does not by itself guarantee a recovered snapshot contains every
+accepted write. For operational recovery, use monitored cluster-aware
+routing, explicit old-primary fencing, authoritative replication lag
+and persistent backups, plus the #49-#51 session-cutover controls
+when data loss or rollback is possible. These deployment controls
+and true automatic failover remain #21.

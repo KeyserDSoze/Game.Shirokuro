@@ -55,7 +55,8 @@ jobs:
           basicConstraints=critical,CA:FALSE
           keyUsage=digitalSignature,keyEncipherment
           extendedKeyUsage=serverAuth
-          subjectAltName=DNS:localhost,IP:127.0.0.1
+          # Docker DNS is used only for TLS-authenticated replication.
+          subjectAltName=DNS:localhost,DNS:shirokuro-ci-redis-ha-master,IP:127.0.0.1
           CERT_EXT
           openssl x509 -req -in "$certdir/server.csr" \
             -CA "$certdir/ca.crt" -CAkey "$certdir/ca.key" -CAcreateserial \
@@ -151,6 +152,64 @@ jobs:
           if [ -n "${SHIROKURO_TEST_REDIS_RDB_DIR:-}" ]; then
             sudo rm -rf -- "$SHIROKURO_TEST_REDIS_RDB_DIR"
           fi
+
+      # REAL Redis TLS asynchronous replication and manual promotion,
+      # separate from the ordinary 6380 TLS and 6381 RDB fixtures. It is
+      # intentionally not a Sentinel/Cluster automatic failover test.
+      - name: Start isolated TLS Redis master and replica
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create shirokuro-ci-redis-ha
+          docker run -d --name shirokuro-ci-redis-ha-master \
+            --network shirokuro-ci-redis-ha \
+            -p 127.0.0.1:6382:6380 \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6380 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no \
+            --save "" --appendonly no
+          docker run -d --name shirokuro-ci-redis-ha-replica \
+            --network shirokuro-ci-redis-ha \
+            -p 127.0.0.1:6383:6380 \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6380 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no \
+            --tls-replication yes \
+            --replicaof shirokuro-ci-redis-ha-master 6380 \
+            --save "" --appendonly no
+          for i in $(seq 1 75); do
+            if docker exec shirokuro-ci-redis-ha-replica redis-cli \
+                --tls --cacert /certs/ca.crt -h localhost -p 6380 \
+                INFO replication 2>/dev/null | grep -q 'master_link_status:up'; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "Isolated TLS Redis replica did not synchronize."
+          exit 1
+
+      - name: Test real TLS Redis replication and manual promotion
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsReplicaPromotionTests'
+        env:
+          SHIROKURO_TEST_REDIS_HA_MASTER: localhost:6382,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
+          SHIROKURO_TEST_REDIS_HA_REPLICA: localhost:6383,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
+          SHIROKURO_TEST_REDIS_HA_CHAOS: '1'
+
+      - name: Destroy isolated TLS Redis replication fixtures
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f shirokuro-ci-redis-ha-master 2>/dev/null || true
+          docker rm -f shirokuro-ci-redis-ha-replica 2>/dev/null || true
+          docker network rm shirokuro-ci-redis-ha 2>/dev/null || true
 
       - name: Destroy ephemeral Redis TLS certificates and container
         if: always()
