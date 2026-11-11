@@ -318,8 +318,9 @@ The API exposes `System.Diagnostics.Metrics` instruments from meter
 **`Shirokuro.Api.Multiplayer`** (version `0.0.1`). A deployment can
 subscribe with a .NET/OpenTelemetry collector **explicitly configured and
 restricted by the operator**. The application does **not** register a public
-`/metrics` route, telemetry exporter, external collector, or any secrets
-in configuration. This code does not claim an operational monitoring backend
+`/metrics` route, telemetry exporter **by default**, external collector, or any secrets
+in configuration. A strictly opt-in, outbound-only HTTPS OTLP metrics exporter
+was added in #60 (below). This code does not claim an operational monitoring backend
 has been deployed.
 
 | Counter (long) | Bounded attributes | Meaning |
@@ -1269,3 +1270,63 @@ hot rotation, RPO=0, split brain, distributed keyring changes, managed
 Redis service ACL semantics or real failure-domain HA; these remain #21.
 
 The blue/green direct Redis TLS credential-cutover integration passed in [Main CI #43079718090](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43079718090) SUCCESS: 377 standard xUnit, 5 Production Redis TLS, 2 Redis TLS ACL, **1 new Redis TLS ACL credential rotation integration**, 1 RDB recovery, 1 manual replica promotion, 1 automatic TLS Sentinel ACL failover, 106 Vitest, 24 Playwright, 35 Python, .NET/React builds. The test distinguishes ACL-off (new AUTH denied while existing connections still work) from the operator's explicit `CLIENT KILL USER`, after which blue Production hosts fail readiness/authentication and green remains fully functional. Real rolling deployment still requires operator-controlled ingress draining, rotation procedures and Redis ACL persistence; this does not test live Sentinel credential refresh.
+
+## Optional private OTLP metrics export (#60)
+
+Since #59 the API reports aggregate readiness latency, rate-limit outcomes
+and expiry cleanup with **closed, low-cardinality labels**. Outside
+Development, operators may explicitly send **only**
+`Shirokuro.Api.Multiplayer` to a private collector. Export is disabled by
+default, and it does not enable logs, traces, automatic URL instrumentation or
+any incoming metrics endpoint.
+
+Configure the deployment using its external secrets/configuration manager:
+
+```sh
+Security__Monitoring__OtlpMetricsEnabled=true
+Security__Monitoring__OtlpMetricsEndpoint=https://otlp.internal.example:4318/v1/metrics
+```
+
+The **complete** signal-specific path `/v1/metrics` is mandatory. Only
+absolute `https://` URLs without embedded usernames/passwords, query
+strings, fragments, extra paths or whitespace pass startup validation.
+Missing, malformed or HTTP endpoints fail application startup with a fixed
+non-sensitive message when enabled; false/absent flags register no exporter.
+Development never registers this exporter. The SDK uses its standard
+certificate and hostname verification; no allow-untrusted CA option,
+redirecting `HttpClient` override or plaintext fallback is introduced.
+Operator-provisioned internal CA certificates must be trusted through the
+deployment operating system trust store. Package versions are pinned to
+OpenTelemetry.Extensions.Hosting and
+OpenTelemetry.Exporter.OpenTelemetryProtocol **1.20.1**.
+
+The exporter uses the **OTLP HTTP/protobuf** protocol on HTTPS, with a
+bounded 5-second transport timeout and background metric collection. It
+registers only the application's explicit meter, not HTTP route or
+identity instrumentation. It sends no application bearer token/header by
+default. Deploy a separately authenticated/isolated collector behind
+private-network policy and trusted TLS termination; **do not** expose the
+collector to the browser or public Internet. This change does not configure
+mTLS client certificates, proxy auth or API-key headers. Those protections
+need a dedicated reviewed deployment design, not embedding secrets in
+endpoint URIs or query strings.
+
+The telemetry transport is **not** used to decide Redis/session/lobby
+readiness or guest authorization. During collector outage, metric export
+may drop or retry batches, but must never be interpreted as a successful
+failover/monitoring guarantee; redis-authoritative gameplay continues to
+use its existing fail-closed behavior. An operator should validate separately
+that the collector receives the finite labels in
+`shirokuro.readiness.probes`, `shirokuro.readiness.duration`,
+`shirokuro.guest_mutation.decisions` and the expiry aggregates, then build
+per-service alerts for sustained unavailable ratios, p95/p99 latency,
+throttling and failed expiry sweeps. No production collector, receiver,
+dashboard, alert or pager is deployed by the repository.
+
+The xUnit test suite checks disabled-by-default/Development registration,
+strict HTTPS URL validation and error-message redaction, and actual
+OTLP protobuf payload generation to a **fake in-memory HTTPS transport**
+without network access or relaxed certificate checks in the Production
+implementation. Its transport fixture is **not** proof of real TLS trust,
+network segmentation, collector availability, telemetry persistence or
+alert delivery; these and Redis/Sentinel replication metrics remain #21.
