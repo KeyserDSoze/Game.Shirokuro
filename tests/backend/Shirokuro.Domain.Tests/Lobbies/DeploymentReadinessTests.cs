@@ -1,7 +1,6 @@
 using System.IO;
 using System.Net;
 using System.Text.Json;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -56,9 +55,9 @@ public sealed class DeploymentReadinessTests
             CancellationToken token = default) => Task.CompletedTask;
     }
 
-    private sealed class BrokenKeyRing : IDataProtectionProvider
+    private sealed class BrokenReadinessKeys : IReadinessKeyVerifier
     {
-        public IDataProtector CreateProtector(string purpose) =>
+        public void Verify() =>
             throw new IOException("secret certificate path and password");
     }
 
@@ -94,8 +93,8 @@ public sealed class DeploymentReadinessTests
 
                 if (brokenKeys)
                 {
-                    services.RemoveAll<IDataProtectionProvider>();
-                    services.AddSingleton<IDataProtectionProvider>(new BrokenKeyRing());
+                    services.RemoveAll<IReadinessKeyVerifier>();
+                    services.AddSingleton<IReadinessKeyVerifier>(new BrokenReadinessKeys());
                 }
             });
         });
@@ -225,6 +224,11 @@ public sealed class DeploymentReadinessTests
         using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
         using var server = Production(redis, new ToggleSessionStore(),
             new ManualClock(), realSessions: true);
+        // The production Redis cache starts a lazy independent connection.
+        // Warm it explicitly so this test verifies healthy steady-state
+        // readiness rather than timing the initial connection establishment.
+        await server.Services.GetRequiredService<IDistributedCache>()
+            .GetAsync("readiness-test-warmup");
         using var client = Client(server);
         using var response = await client.GetAsync("/api/ready");
         await AssertStatus(response, HttpStatusCode.OK, "ready");

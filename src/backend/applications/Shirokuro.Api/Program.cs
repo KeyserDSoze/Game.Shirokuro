@@ -56,6 +56,7 @@ else
         provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
         provider.GetRequiredService<TimeProvider>()));
     builder.Services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
+    builder.Services.AddSingleton<IReadinessKeyVerifier, ReadinessKeyVerifier>();
     builder.Services.AddSingleton<IDeploymentReadiness, RedisDeploymentReadiness>();
     builder.Services.AddSingleton<IGuestMutationLimiter>(sp =>
         new RedisGuestMutationLimiter(

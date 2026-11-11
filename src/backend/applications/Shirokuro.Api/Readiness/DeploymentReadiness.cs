@@ -13,6 +13,29 @@ public interface IDeploymentReadiness
     Task<bool> IsReadyAsync(CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+ /// A round-trip through the configured ASP.NET Core Data Protection key ring.
+ /// Separated from the Redis network probe so failures can be isolated in tests
+ /// without replacing cookie authentication's own cryptographic provider.
+ /// </summary>
+public interface IReadinessKeyVerifier
+{
+    void Verify();
+}
+
+public sealed class ReadinessKeyVerifier(IDataProtectionProvider dataProtection)
+    : IReadinessKeyVerifier
+{
+    public void Verify()
+    {
+        var protector = dataProtection.CreateProtector("Shirokuro.Readiness.v1");
+        var encrypted = protector.Protect("ready");
+        if (!string.Equals(protector.Unprotect(encrypted),
+                "ready", StringComparison.Ordinal))
+            throw new InvalidOperationException("Key ring round-trip failed.");
+    }
+}
+
 /// <summary>Local preview does not depend on Redis.</summary>
 public sealed class DevelopmentReadiness : IDeploymentReadiness
 {
@@ -31,7 +54,7 @@ public sealed class DevelopmentReadiness : IDeploymentReadiness
 /// </summary>
 public sealed class RedisDeploymentReadiness(
     IConnectionMultiplexer redis, IDistributedCache guestSessions,
-    IDataProtectionProvider dataProtection, TimeProvider clock) : IDeploymentReadiness
+    IReadinessKeyVerifier keyVerifier, TimeProvider clock) : IDeploymentReadiness
 {
     public static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(2);
     public static readonly TimeSpan CachedFor = TimeSpan.FromSeconds(3);
@@ -63,10 +86,8 @@ public sealed class RedisDeploymentReadiness(
 
                 // A missing or unreadable persisted encrypted key ring must
                 // make a node unready even when Redis answers successfully.
-                var protector = dataProtection.CreateProtector("Shirokuro.Readiness.v1");
-                var encrypted = protector.Protect("ready");
-                _lastResult = string.Equals(
-                    protector.Unprotect(encrypted), "ready", StringComparison.Ordinal);
+                keyVerifier.Verify();
+                _lastResult = true;
             }
             catch (Exception) when (!cancellationToken.IsCancellationRequested)
             {
