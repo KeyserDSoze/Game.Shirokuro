@@ -1033,3 +1033,9 @@ split-brain avoidance or Sentinel/Cluster discovery. During a role
 transition cached readiness can remain up to three seconds stale:
 edge admission must also use normal authorization/mutation
 fail-closed paths. Operational HA and automatic failover remain #21.
+
+The writable-readiness drill passed in [Main CI #43060005358](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43060005358), including the real
+read-only replica denial before promotion and successful readiness on
+two replacement Production hosts after promotion. All 363 standard
+xUnit, 5 TLS, 1 RDB, 1 promotion, 106 Vitest, 24 Playwright and 35
+Python tests passed, with backend/frontend builds.
