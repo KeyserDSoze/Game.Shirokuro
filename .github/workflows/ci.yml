@@ -115,7 +115,7 @@ jobs:
           echo "::add-mask::$password"
           cat > "$acldir/users.acl" <<EOF
           user default off
-          user shirokuro-ci on >$password ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction +info +command +client +time
+          user shirokuro-ci on >$password ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction -@dangerous -@admin +info +command +client +time
           EOF
           chmod 755 "$acldir"
           chmod 644 "$acldir/users.acl"

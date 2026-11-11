@@ -1129,7 +1129,7 @@ For CI, #56 creates an **additional isolated Redis TLS-only** process on
 restricted to Redis keys matching `shirokuro:*`. The CI policy enables
 only the connection, scripting, read/write, transactional and pub/sub
 command categories needed for the application plus connection diagnostics;
-it is a test configuration, **not a reviewed production privilege matrix**.
+the ACL additionally denies `@dangerous`/`@admin` commands while explicitly granting only the diagnostic commands used by this test (including Lua's `TIME`). Destructive `FLUSHDB` and administrative `CONFIG` are tested as denied. It remains a test configuration, **not a reviewed production privilege matrix**.
 Two *real* Production API hosts must use the ACL account across their two
 independent Redis clients to issue and validate signed sessions, report
 readiness, create/join a shared room and perform logout with Lua revocation

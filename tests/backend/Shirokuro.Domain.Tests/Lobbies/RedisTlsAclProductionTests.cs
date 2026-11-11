@@ -197,6 +197,12 @@ public sealed class RedisTlsAclProductionTests
         await db.KeyDeleteAsync(permittedKey);
         await Assert.ThrowsAsync<RedisServerException>(() =>
             db.StringSetAsync("outside-shirokuro-acl-test", "forbidden"));
+        // Key patterns are not sufficient if an account could execute
+        // keyless administrative/destructive commands.
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.ExecuteAsync("FLUSHDB"));
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.ExecuteAsync("CONFIG", "GET", "maxmemory"));
 
         // Redis with default user disabled denies missing or wrong AUTH.
         // A successful Connect followed by PING is NOT enough if the client
