@@ -501,11 +501,11 @@ public sealed class RedisGuestExpiryIndexTests
 
             var due = await recovery.ReadDueAsync();
             Assert.Equal(2, due.Count);
-            var legacy = Assert.Single(due.Where(x => !x.IsUnreadable));
+            var legacy = Assert.Single(due, x => !x.IsUnreadable);
             Assert.True(legacy.IsPreCutover);
             Assert.Equal(id, legacy.PlayerId);
             Assert.Null(legacy.SessionTokenDigest); // Cannot purge without binding.
-            var malformed = Assert.Single(due.Where(x => x.IsUnreadable));
+            var malformed = Assert.Single(due, x => x.IsUnreadable);
             Assert.Empty(malformed.PlayerId);
             Assert.Null(malformed.SessionTokenDigest);
             Assert.Equal(invalid, malformed.ProtectedMember);
