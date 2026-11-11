@@ -379,6 +379,17 @@ jobs:
             sleep 0.2
           done
           echo "Sentinel TLS quorum fixture did not synchronize."
+          # On CI failure only: diagnose the isolated ephemeral containers.
+          # Credentials are 48-character random hex and masked earlier;
+          # redact them again before emitting any server diagnostic lines.
+          for container in shirokuro-ci-sentinel-master shirokuro-ci-sentinel-replica \
+              shirokuro-ci-sentinel-1 shirokuro-ci-sentinel-2 shirokuro-ci-sentinel-3; do
+            docker inspect --format '{{.Name}}: {{.State.Status}} exit={{.State.ExitCode}}' "$container" || true
+            docker logs --tail 35 "$container" 2>&1 |
+              sed -E 's/[0-9a-f]{48}/[masked-credential]/g' |
+              grep -Ei 'fatal|error|fail|ready|sentinel|sync|acl|authentication|replica|master|wrong|permission|unknown' |
+              tail -20 || true
+          done
           exit 1
 
       - name: Test automatic TLS Sentinel rediscovery and running API reconnect
