@@ -245,6 +245,11 @@ public sealed class RedisTlsSentinelFailoverTests
                 .PingAsync().WaitAsync(TimeSpan.FromSeconds(4));
         });
 
+        // Capture connection telemetry BEFORE starting either API host.
+        // No Redis endpoint, password, player id or exception reaches tags;
+        // this observes the lobby and guest-cache connections independently.
+        using var connectorEvents = new MultiplayerMetricCapture();
+
         // These two Production TestServers are deliberately never rebuilt
         // between creation and automatic Sentinel failover.
         using var first = Server(connection);
@@ -386,5 +391,31 @@ public sealed class RedisTlsSentinelFailoverTests
         using var freshOnOtherNode = Client(second, freshCookie);
         using var session = await freshOnOtherNode.GetAsync("/api/sessions/me");
         Assert.Equal(HttpStatusCode.OK, session.StatusCode);
+
+        // During a real stopped-primary / quorum election at least one
+        // physical lifecycle notification must originate independently from
+        // EACH Production Redis connector. We deliberately do NOT assert an
+        // exact event count, order or one restored notification per endpoint:
+        // Sentinel is free to reconnect using a different topology.
+        var events = connectorEvents.For(MultiplayerMetrics.RedisConnectionEventsName);
+        foreach (var client in new[] { "lobby", "session" })
+            Assert.Contains(events, item =>
+                item.Tags["client"] == client &&
+                item.Tags["event"] is "failed" or "restored" or "configuration-changed");
+        Assert.All(events, item =>
+        {
+            Assert.Equal(1, item.Value);
+            Assert.Equal(new[] { "client", "event" },
+                item.Tags.Keys.OrderBy(tag => tag, StringComparer.Ordinal));
+            Assert.Contains(item.Tags["client"], new[] { "lobby", "session" });
+            Assert.Contains(item.Tags["event"],
+                new[] { "failed", "restored", "configuration-changed" });
+            foreach (var tag in item.Tags.Values)
+            {
+                Assert.DoesNotContain("password", tag, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("guest-", tag, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("localhost", tag, StringComparison.OrdinalIgnoreCase);
+            }
+        });
     }
 }
