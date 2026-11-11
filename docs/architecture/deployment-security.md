@@ -1147,3 +1147,5 @@ single-node ACL test does **not** certify dedicated production ACL policy,
 authenticated Sentinel quorum, dynamic credentials rotation, TLS client
 certificate authentication, firewall isolation, security monitoring,
 split-brain resistance or RPO/RTO; these remain under #21.
+
+The scoped Redis ACL (including denial of keyless administrative commands) and real Production two-node session/lobby integration passed in [CI main #43069457198](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43069457198) SUCCESS: 375 xUnit standard, 2 real Redis TLS ACL xUnit, 5 Production TLS xUnit, 1 RDB, 1 replica promotion, 1 automatic Sentinel failover, 106 Vitest, 24 Playwright, 35 Python and .NET/React builds. This does not replace a deployment-specific access-control review.
