@@ -41,7 +41,8 @@ public sealed class GuestExpiryBatchIsolationTests
                 : new DueGuestExpiry(x.Key, x.Value)).ToArray();
 
         public Task ScheduleAsync(string id, DateTimeOffset due,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? trustedSessionToken = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             _due.Add("opaque-" + Interlocked.Increment(ref _next), id);

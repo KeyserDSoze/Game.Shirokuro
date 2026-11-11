@@ -23,7 +23,8 @@ public sealed class GuestExpiryIssuanceTests
         public int Accepted { get; private set; }
 
         public Task ScheduleAsync(string trustedPlayerId, DateTimeOffset expiresUtc,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? trustedSessionToken = null)
         {
             if (Fail)
                 throw new IOException("simulated expiry index outage");

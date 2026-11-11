@@ -73,7 +73,8 @@ internal sealed class TestGuestMutationLimiter(TimeProvider clock) : IGuestMutat
 
     public Task<GuestMutationDecision> AcquireAsync(
         GuestMutationRateLimit policy, System.Net.IPAddress? ip,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? trustedSessionToken = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var key = RedisGuestMutationLimiter.Key(policy, ip);

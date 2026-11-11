@@ -82,7 +82,8 @@ public sealed class MultiplayerMetricsTests
         private bool _pending = true;
 
         public Task ScheduleAsync(string player, DateTimeOffset expires,
-            CancellationToken cancellationToken = default) => Task.CompletedTask;
+            CancellationToken cancellationToken = default,
+            string? trustedSessionToken = null) => Task.CompletedTask;
 
         public Task<string> ScheduleRevokedAsync(string trustedPlayerId,
             CancellationToken cancellationToken = default) =>
