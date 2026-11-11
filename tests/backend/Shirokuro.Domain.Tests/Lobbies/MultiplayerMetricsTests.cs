@@ -186,6 +186,18 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, MutationOutcome.Unavailable);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
+            RedisConnectionTransition.Failed);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
+            RedisConnectionTransition.Restored);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
+            RedisConnectionTransition.ConfigurationChanged);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.GuestSessions,
+            RedisConnectionTransition.Failed);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.GuestSessions,
+            RedisConnectionTransition.Restored);
+        MultiplayerMetrics.RecordRedisConnection(RedisConnector.GuestSessions,
+            RedisConnectionTransition.ConfigurationChanged);
         MultiplayerMetrics.RecordReadinessDuration(
             ready: true, ReadinessProbeStage.Success, seconds: 0.001);
         MultiplayerMetrics.RecordReadinessDuration(
@@ -208,6 +220,12 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, (MutationOutcome)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordExpirySweep(false, true, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordRedisConnection(
+                (RedisConnector)999, RedisConnectionTransition.Failed));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordRedisConnection(
+                RedisConnector.Lobby, (RedisConnectionTransition)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordReadinessDuration(
                 false, (ReadinessProbeStage)999, seconds: 1));
@@ -247,6 +265,27 @@ public sealed class MultiplayerMetricsTests
             }
         });
 
+        var redisEvents = capture.For(MultiplayerMetrics.RedisConnectionEventsName);
+        foreach (var client in new[] { "lobby", "session" })
+        foreach (var kind in new[] { "failed", "restored", "configuration-changed" })
+            Assert.Contains(redisEvents, x =>
+                x.Tags["client"] == client && x.Tags["event"] == kind);
+        Assert.All(redisEvents, x =>
+        {
+            Assert.Equal(1, x.Value);
+            Assert.Equal(new[] { "client", "event" },
+                x.Tags.Keys.OrderBy(key => key, StringComparer.Ordinal));
+            Assert.Contains(x.Tags["client"], new[] { "lobby", "session" });
+            Assert.Contains(x.Tags["event"],
+                new[] { "failed", "restored", "configuration-changed" });
+            foreach (var text in x.Tags.Values)
+            {
+                Assert.DoesNotContain("password", text, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("guest-", text, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("127.0.0.1", text, StringComparison.OrdinalIgnoreCase);
+            }
+        });
+
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
             m => m.Tags["policy"] == "session" && m.Tags["outcome"] == "limited");
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
@@ -268,6 +307,7 @@ public sealed class MultiplayerMetricsTests
         {
             MultiplayerMetrics.MutationDecisionsName,
             MultiplayerMetrics.ReadinessProbesName,
+            MultiplayerMetrics.RedisConnectionEventsName,
             MultiplayerMetrics.ExpirySweepsName,
             MultiplayerMetrics.ExpiryMembershipsRemovedName,
             MultiplayerMetrics.ExpiryUnreadableItemsName
@@ -279,6 +319,7 @@ public sealed class MultiplayerMetricsTests
             {
                 MultiplayerMetrics.MutationDecisionsName => new[] { "outcome", "policy" },
                 MultiplayerMetrics.ReadinessProbesName => new[] { "outcome" },
+                MultiplayerMetrics.RedisConnectionEventsName => new[] { "client", "event" },
                 MultiplayerMetrics.ExpirySweepsName => new[] { "mode", "outcome" },
                 MultiplayerMetrics.ExpiryUnreadableItemsName => [],
                 _ => new[] { "mode" }
@@ -293,6 +334,8 @@ public sealed class MultiplayerMetricsTests
                     "outcome" => value is "allowed" or "limited" or
                         "unavailable" or "ready" or "success" or "failure",
                     "mode" => value is "local" or "redis",
+                    "client" => value is "lobby" or "session",
+                    "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
                 };
                 Assert.True(valid, "Unbounded or sensitive metric label!");
