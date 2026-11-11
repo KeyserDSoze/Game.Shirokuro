@@ -325,7 +325,7 @@ has been deployed.
 | `shirokuro.guest_mutation.decisions` | `policy=session\|lobby`, `outcome=allowed\|limited\|unavailable` | One technical rate-limiter decision for each protected POST, *not* success/failure of the later HTTP handler. Local Development and Redis deployment use the same trusted endpoint metadata. |
 | `shirokuro.readiness.probes` | `outcome=ready\|unavailable` | One **actual** readiness verification. Cached Redis readiness hits are excluded; Development has no Redis to check. |
 | `shirokuro.guest_expiry.sweeps` | `mode=local\|redis`, `outcome=success\|failure` | Completed or failed guest expiry maintenance passes. Expected host-shutdown cancellation is not a failure. |
-| `shirokuro.guest_expiry.memberships_removed` | `mode=local\|redis` | Number of stale **lobby memberships** removed after a successful sweep, not the number of accounts, sessions or rooms. |
+| `shirokuro.guest_expiry.memberships_removed` | `mode=local\|redis` | Number of stale **lobby memberships** actually removed, **including successful items from a partially failed sweep**; not the number of accounts, sessions or rooms. |
 
 All tag values are derived from **hard-coded server enum cases / boolean
 statuses** and validated; there are no endpoint URLs, arbitrary status
@@ -471,3 +471,38 @@ or that the deployment is using the same trust and security configuration.
 Those are still production acceptance criteria in #21. Never configure
 `abortConnect=false`, permissive certificate callbacks or local-memory
 fallback merely to make a broken deployment appear available.
+
+## Per-item guest expiry recovery without batch head-of-line blocking (#44)
+
+The Redis guest expiry worker reads a bounded list of up to **128 due,
+encrypted work items**. A previous maintenance pass aborted on the first
+transient failure (fence, room cleanup or acknowledgement), leaving all
+independent items behind it unprocessed until the next 5-minute sweep.
+This is a pre-match stale-roster risk under partial failures even when Redis
+remains available for unrelated guests.
+
+Each due entry now has its **own** fence → administrative room CAS cleanup →
+encrypted member acknowledgement sequence. A failure on one item leaves it
+**unacknowledged** for retry by any API node, while subsequent entries in
+the same batch can still be cleaned and acknowledged. Once the batch ends,
+the worker reports a **single sanitized failure** if any entry failed, so
+maintenance is visibly degraded. No player identity, room reference, Redis
+key, exception message or invitation is included in the failure. A cancelled
+host stops the pass immediately and leaves remaining work persisted.
+
+The aggregate `shirokuro.guest_expiry.sweeps` metric reports one
+`outcome=failure` on a partial failure; aggregate
+`shirokuro.guest_expiry.memberships_removed` counts **real successful
+membership removals even in a partially failed batch** so a retry cannot
+inflate the count. No new unbounded metric dimensions are introduced.
+
+The idempotent Redis CAS cleanup still avoids extending survivor room
+inactivity TTLs; a retry after a failed acknowledgement can return zero
+additional removals while safely acknowledging the pending member.
+Development's in-memory sweep is unchanged. Errors in decrypting or reading
+the entire due batch still fail closed rather than silently dropping
+unverifiable encrypted work. **Limitation:** more than 128 permanently
+failing due items (or an unreadable encrypted item in `ReadDueAsync`)
+can still delay later entries; operators must repair the failing dependency
+or key ring. This is not a complete poison-message/dead-letter solution,
+Redis HA/failover certification or durable identity (#21).

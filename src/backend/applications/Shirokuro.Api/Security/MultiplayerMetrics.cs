@@ -29,7 +29,7 @@ public static class MultiplayerMetrics
         description: "Guest-session expiry cleanup sweep outcomes.");
     private static readonly Counter<long> ExpiryMembershipsRemoved = Meter.CreateCounter<long>(
         ExpiryMembershipsRemovedName, unit: "{membership}",
-        description: "Aggregate stale lobby memberships removed by guest expiry cleanup.");
+        description: "Aggregate stale lobby memberships removed, including partial failed sweeps.");
 
     public static void RecordMutation(GuestMutationKind policy, MutationOutcome outcome)
     {
@@ -63,7 +63,9 @@ public static class MultiplayerMetrics
         ExpirySweeps.Add(1,
             new KeyValuePair<string, object?>("mode", mode),
             new KeyValuePair<string, object?>("outcome", success ? "success" : "failure"));
-        if (success && membershipsRemoved > 0)
+        // Successful removals in a partially failed batch must also be counted.
+        // No guest identities or exception details are ever metric tags.
+        if (membershipsRemoved > 0)
             ExpiryMembershipsRemoved.Add(membershipsRemoved,
                 new KeyValuePair<string, object?>("mode", mode));
     }

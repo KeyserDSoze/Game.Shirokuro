@@ -46,37 +46,61 @@ public sealed class GuestSessionExpiryWorker(
 
     public async Task<int> SweepOnceAsync(CancellationToken cancellationToken = default)
     {
-        // The hosted worker uses this path. A failure must be visible to
-        // operations without losing the durable retry/ack semantics.
+        // A successful item is acknowledged independently. A transient
+        // failure on one guest must not block the other guests already read
+        // in this bounded, encrypted Redis batch.
         var sharedRedis = expiryIndex is not null;
         if (lobby is null && !sharedRedis)
             return SweepOnce(); // Counts a single local attempt.
 
+        var removed = 0;
         try
         {
             if (expiryIndex is not null)
             {
-                // Shared encrypted Redis index survives an issuer-node crash.
-                // Ack only AFTER idempotent lobby cleanup has succeeded.
                 if (lobby is null)
                     throw new InvalidOperationException("Distributed cleanup needs a lobby.");
-                var removed = 0;
-                foreach (var item in await expiryIndex.ReadDueAsync(cancellationToken))
+
+                var failedItems = 0;
+                // An unreadable batch is still fail-closed: do not skip
+                // unverifiable identities or silently acknowledge them.
+                var due = await expiryIndex.ReadDueAsync(cancellationToken);
+                foreach (var item in due)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    // If the guest expired or revoked while a request was
-                    // in flight, fence its future room mutations atomically
-                    // with the eventual lobby CAS cleanup. Never ack on
-                    // fence failure; other nodes can retry the durable item.
-                    if (revocationFence is not null)
-                        await revocationFence.FenceGuestAsync(
+                    try
+                    {
+                        // Fence before removing: a stale in-flight guest
+                        // request must not resurrect a removed membership.
+                        if (revocationFence is not null)
+                            await revocationFence.FenceGuestAsync(
+                                item.PlayerId, cancellationToken);
+                        removed += await lobby.RemovePlayerFromAllRoomsAsync(
                             item.PlayerId, cancellationToken);
-                    removed += await lobby.RemovePlayerFromAllRoomsAsync(
-                        item.PlayerId, cancellationToken);
-                    await expiryIndex.AcknowledgeAsync(
-                        item.ProtectedMember, cancellationToken);
+                        // The opaque item is acked only after cleanup.
+                        await expiryIndex.AcknowledgeAsync(
+                            item.ProtectedMember, cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        // Host shutdown stops the batch promptly; leave all
+                        // remaining items durable for another node.
+                        throw;
+                    }
+                    catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        // Do not log or surface the guest ID, invite, key, or
+                        // exception message. This item stays in Redis while
+                        // other independent due items can still make progress.
+                        failedItems++;
+                    }
                 }
+
                 registry.DrainExpiredPlayerIds();
+                if (failedItems > 0)
+                    throw new InvalidOperationException(
+                        "Guest expiry maintenance has retryable items.");
+
                 MultiplayerMetrics.RecordExpirySweep(
                     sharedRedis: true, success: true, removed);
                 return removed;
@@ -85,7 +109,6 @@ public sealed class GuestSessionExpiryWorker(
             var identities = registry.DrainExpiredPlayerIds();
             try
             {
-                var removed = 0;
                 foreach (var id in identities)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -98,21 +121,23 @@ public sealed class GuestSessionExpiryWorker(
             }
             catch
             {
-                // No maintenance identity is lost on a transient local
-                // failure; the metric below records the failed attempt.
+                // No local maintenance identity is lost after a transient
+                // failure. Development behaviour remains unchanged.
                 registry.RequeueExpiredPlayerIds(identities);
                 throw;
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Host shutdown is not an infrastructure failure.
+            // Host shutdown is not a failed infrastructure sweep.
             throw;
         }
         catch
         {
+            // Count the successful partial removals even on a failed sweep;
+            // the next pass will not double-count idempotent CAS cleanup.
             MultiplayerMetrics.RecordExpirySweep(
-                sharedRedis, success: false, membershipsRemoved: 0);
+                sharedRedis, success: false, membershipsRemoved: removed);
             throw;
         }
     }

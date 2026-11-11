@@ -173,6 +173,7 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 0);
+        MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: false, membershipsRemoved: 2);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: true, membershipsRemoved: 3);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: false, success: true, membershipsRemoved: 1);
 
@@ -193,6 +194,8 @@ public sealed class MultiplayerMetricsTests
             m => m.Tags["mode"] == "redis" && m.Tags["outcome"] == "failure");
         Assert.Contains(capture.For(MultiplayerMetrics.ExpiryMembershipsRemovedName),
             m => m.Tags["mode"] == "redis" && m.Value == 3);
+        Assert.Contains(capture.For(MultiplayerMetrics.ExpiryMembershipsRemovedName),
+            m => m.Tags["mode"] == "redis" && m.Value == 2);
 
         // This guard applies to measurements from other concurrently running
         // test requests too: all values must remain bounded literals.
