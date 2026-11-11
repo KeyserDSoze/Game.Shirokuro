@@ -73,8 +73,7 @@ internal sealed class TestGuestMutationLimiter(TimeProvider clock) : IGuestMutat
 
     public Task<GuestMutationDecision> AcquireAsync(
         GuestMutationRateLimit policy, System.Net.IPAddress? ip,
-        CancellationToken cancellationToken = default,
-        string? trustedSessionToken = null)
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var key = RedisGuestMutationLimiter.Key(policy, ip);
@@ -114,7 +113,8 @@ internal sealed class TestGuestExpiryIndex(TimeProvider clock) : IGuestExpiryInd
     private readonly Dictionary<string, (string PlayerId, DateTimeOffset Expires)> _pending = new();
 
     public Task ScheduleAsync(string trustedPlayerId, DateTimeOffset expiresUtc,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? trustedSessionToken = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
