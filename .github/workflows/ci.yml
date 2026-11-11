@@ -102,6 +102,63 @@ jobs:
           # paused, with a guaranteed unpause in the xUnit test finally block.
           SHIROKURO_TEST_REDIS_CHAOS: '1'
 
+      # A separate ACL test uses the same ephemeral CA but an isolated
+      # Redis TLS process, a disabled default account and keyspace-scoped
+      # credentials generated for this CI runner only. Never upload ACL files.
+      - name: Start isolated authenticated Redis TLS ACL fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          acldir="$(mktemp -d /tmp/shirokuro-ci-redis-acl-XXXXXX)"
+          echo "SHIROKURO_TEST_REDIS_ACL_DIR=$acldir" >> "$GITHUB_ENV"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          cat > "$acldir/users.acl" <<EOF
+          user default off
+          user shirokuro-ci on >$password ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction +info +command +client
+          EOF
+          chmod 755 "$acldir"
+          chmod 644 "$acldir/users.acl"
+
+          docker run -d --name shirokuro-ci-redis-acl \
+            -p 127.0.0.1:6386:6386 \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            -v "$acldir:/acl:ro" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6386 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no \
+            --aclfile /acl/users.acl \
+            --save "" --appendonly no
+
+          # The password is masked, and never printed by redis-cli or shell.
+          echo "SHIROKURO_TEST_REDIS_TLS_ACL=localhost:6386,ssl=true,sslHost=localhost,user=shirokuro-ci,password=$password,abortConnect=true,connectTimeout=3000,connectRetry=0" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if docker exec -e "REDISCLI_AUTH=$password" \
+                shirokuro-ci-redis-acl redis-cli --tls \
+                --cacert /certs/ca.crt --user shirokuro-ci \
+                -h localhost -p 6386 ping 2>/dev/null | grep -qx PONG; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "ACL-enabled TLS Redis fixture did not become ready."
+          exit 1
+
+      - name: Test authenticated Production Redis TLS ACL and namespace isolation
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsAclProductionTests'
+
+      - name: Destroy isolated Redis TLS ACL fixture and credentials
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f shirokuro-ci-redis-acl 2>/dev/null || true
+          if [ -n "${SHIROKURO_TEST_REDIS_ACL_DIR:-}" ]; then
+            sudo rm -rf -- "$SHIROKURO_TEST_REDIS_ACL_DIR"
+          fi
+
       # A SECOND TLS Redis fixture is deliberately isolated from the
       # 6380 session/chaos tests. It can be completely destroyed and restored
       # from an RDB file without affecting other running CI test classes.
