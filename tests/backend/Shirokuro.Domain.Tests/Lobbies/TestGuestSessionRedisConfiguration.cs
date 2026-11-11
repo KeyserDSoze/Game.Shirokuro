@@ -30,6 +30,10 @@ internal static class TestGuestSessionRedisConfiguration
         builder.ConfigureTestServices(services =>
         {
             services.RemoveAll<IDistributedCache>();
+            // These isolated security TestServers intentionally avoid live Redis;
+            // real expiry-index integration tests use independent connections.
+            services.RemoveAll<IGuestExpiryIndex>();
+            services.AddSingleton<IGuestExpiryIndex, TestGuestExpiryIndex>();
             if (shared is null)
                 services.AddDistributedMemoryCache();
             else
@@ -81,5 +85,40 @@ internal sealed class TestGuestMutationLimiter(TimeProvider clock) : IGuestMutat
             _windows[key] = entry;
             return Task.FromResult(new GuestMutationDecision(allowed, remaining));
         }
+    }
+}
+
+internal sealed class TestGuestExpiryIndex(TimeProvider clock) : IGuestExpiryIndex
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<string, (string PlayerId, DateTimeOffset Expires)> _pending = new();
+
+    public Task ScheduleAsync(string trustedPlayerId, DateTimeOffset expiresUtc,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+            _pending.Add(Guid.NewGuid().ToString("N"), (trustedPlayerId, expiresUtc));
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+            return Task.FromResult<IReadOnlyList<DueGuestExpiry>>(
+                _pending.Where(x => x.Value.Expires <= clock.GetUtcNow())
+                    .Take(RedisGuestExpiryIndex.BatchSize)
+                    .Select(x => new DueGuestExpiry(x.Key, x.Value.PlayerId)).ToArray());
+    }
+
+    public Task AcknowledgeAsync(string protectedMember,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+            _pending.Remove(protectedMember);
+        return Task.CompletedTask;
     }
 }

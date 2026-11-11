@@ -242,3 +242,35 @@ This does not solve crash-proof expired session cleanup, edge TLS/network
 validation, rotating-IP/Sybil attacks, Redis availability/failover or
 durable player accounts:
 all remain open in #21.
+
+## Crash-safe guest expiry maintenance (issue #38)
+
+In non-Development, a successful guest-session issuance first registers its
+server-generated session token in Redis (#33), then schedules an **encrypted**
+guest expiry item in the Redis sorted set
+`shirokuro:guest-expiry:{default}:v1:pending`, and only then signs/returns
+the HttpOnly guest cookie. A failed schedule revokes the just-created token;
+there is no intentional local-memory fallback in Production/Staging.
+Each item's sorted-set score is the fixed absolute 8-hour expiry time;
+its member is protected with the existing shared ASP.NET Core Data Protection
+key ring (purpose-isolated), never a plaintext guest ID or a session token.
+The index key itself contains no user data.
+
+Every API node runs the same maintenance worker: on startup and every five
+minutes it loads up to 128 due entries, invokes the **server-side Redis lobby
+coordinator** to remove stale memberships via revision-aware CAS, then removes
+the expiry entry only after success. After a node crash another node can
+continue the queue; an outage leaves work for later, and overlapping workers
+are idempotent. Administrative cleanup must not renew the inactivity TTL of
+surviving rooms. Local Development continues using the existing in-memory
+expiry registry without a Redis requirement.
+
+This is **eventual** cleanup, not an instantaneous presence/disconnect
+signal. A revoked guest is denied immediately by the shared ticket registry;
+logout's existing request path still removes memberships immediately on
+success. Expiry queue recovery does not provide account upgrade, verified
+identity, durable accounts, online-presence semantics, arbitrary Redis failover
+or protection against attackers controlling many IP addresses (#21).
+Operators must retain and share old Data Protection keys/certificates until
+all protected expiry items have been processed; an unreadable entry is not
+silently discarded. Real TLS Redis failover still needs deployment testing.

@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Options;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
@@ -56,6 +57,11 @@ else
     builder.Services.AddSingleton<IGuestMutationLimiter>(sp =>
         new RedisGuestMutationLimiter(
             sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase()));
+    builder.Services.AddSingleton<IGuestExpiryIndex>(sp =>
+        new RedisGuestExpiryIndex(
+            sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
+            sp.GetRequiredService<IDataProtectionProvider>(),
+            sp.GetRequiredService<TimeProvider>()));
 }
 
 // The cookie may contain a server-generated, non-verified guest ID.
@@ -259,6 +265,11 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     var principal = GuestSessions.CreatePrincipal(playerId, sessionId);
     try
     {
+        // Persist encrypted maintenance work BEFORE returning any guest cookie.
+        // If Redis rejects this write, revoke the newly registered ticket.
+        if (!environment.IsDevelopment())
+            await context.RequestServices.GetRequiredService<IGuestExpiryIndex>()
+                .ScheduleAsync(playerId, expires, context.RequestAborted);
         await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
             principal,
             new AuthenticationProperties

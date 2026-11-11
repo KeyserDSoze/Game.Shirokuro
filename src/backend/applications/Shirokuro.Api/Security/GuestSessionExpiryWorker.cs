@@ -9,7 +9,8 @@ namespace Shirokuro.Api.Security;
 /// </summary>
 public sealed class GuestSessionExpiryWorker(
     GuestSessionRegistry registry, InMemoryLobbyCoordinator coordinator,
-    TimeProvider clock, IAsyncGuestLobby? lobby = null) : BackgroundService
+    TimeProvider clock, IAsyncGuestLobby? lobby = null,
+    IGuestExpiryIndex? expiryIndex = null) : BackgroundService
 {
     public static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(5);
 
@@ -27,6 +28,28 @@ public sealed class GuestSessionExpiryWorker(
 
     public async Task<int> SweepOnceAsync(CancellationToken cancellationToken = default)
     {
+        if (expiryIndex is not null)
+        {
+            // The encrypted Redis index is authoritative across restarts.
+            // Never acknowledge an item until its CAS lobby cleanup succeeds;
+            // overlapping workers can safely repeat the same removal.
+            if (lobby is null)
+                throw new InvalidOperationException("Distributed cleanup needs a lobby.");
+            var removed = 0;
+            foreach (var item in await expiryIndex.ReadDueAsync(cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                removed += await lobby.RemovePlayerFromAllRoomsAsync(
+                    item.PlayerId, cancellationToken);
+                await expiryIndex.AcknowledgeAsync(
+                    item.ProtectedMember, cancellationToken);
+            }
+            // Local tracking is only a bounded optimization; do not use it
+            // as the source of expired guests in non-Development.
+            registry.DrainExpiredPlayerIds();
+            return removed;
+        }
+
         if (lobby is null)
             return SweepOnce();
 
@@ -55,6 +78,16 @@ public sealed class GuestSessionExpiryWorker(
         using var timer = new PeriodicTimer(SweepInterval, clock);
         try
         {
+            // A newly started node can recover work left by a crashed issuer
+            // immediately, without waiting for the first periodic tick.
+            try
+            {
+                await SweepOnceAsync(stoppingToken);
+            }
+            catch (Exception) when (!stoppingToken.IsCancellationRequested)
+            {
+                // Maintenance retries on the next tick, never logs identities.
+            }
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
                 try
