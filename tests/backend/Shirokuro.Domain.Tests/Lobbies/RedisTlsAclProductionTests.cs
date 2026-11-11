@@ -183,6 +183,10 @@ public sealed class RedisTlsAclProductionTests
     {
         if (Connection is null) return;
         var options = ConfigurationOptions.Parse(Connection);
+        // Only the negative probe bypasses the client-side admin guard;
+        // Redis ACL must itself reject keyless destructive operations.
+        // Real Production API connections always retain AllowAdmin=false.
+        options.AllowAdmin = true;
         Assert.True(options.Ssl);
         Assert.Equal("shirokuro-ci", options.User);
         Assert.NotNull(options.Password);

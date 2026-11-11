@@ -192,7 +192,11 @@ public sealed class RedisTlsSentinelFailoverTests
         // authority; unauthenticated and invalid AUTH must fail closed.
         // Explicitly connect with the same independent options used by
         // both Production Redis clients.
-        using (var authenticated = await ConnectionMultiplexer.ConnectAsync(config))
+        var aclProbe = config.Clone();
+        // Test the server ACL, not merely the library-side admin command
+        // switch. Both real API hosts below still use AllowAdmin=false.
+        aclProbe.AllowAdmin = true;
+        using (var authenticated = await ConnectionMultiplexer.ConnectAsync(aclProbe))
         {
             var database = authenticated.GetDatabase();
             await Assert.ThrowsAsync<RedisServerException>(() =>
