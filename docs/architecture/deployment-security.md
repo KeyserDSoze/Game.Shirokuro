@@ -347,6 +347,42 @@ external collector aggregates nodes. Instrumentation is not an abuse
 prevention mechanism or a substitute for Redis TLS, HA/failover testing,
 controlled monitoring access or durable identity (#21).
 
+## Readiness latency distribution and safe failure-phase telemetry (#59)
+
+Beyond the existing counter `shirokuro.readiness.probes`, each **executed
+Production Redis/Data Protection readiness probe** now records exactly one
+`Histogram<double>` from `Shirokuro.Api.Multiplayer`:
+
+| Instrument | Unit | Closed labels | Interpretation |
+| --- | --- | --- | --- |
+| `shirokuro.readiness.duration` | seconds (`s`) | `outcome=ready\|unavailable`, `stage=ok\|redis-write\|session-read\|key-ring\|timeout` | End-to-end *monotonic* wall time of the **single shared** write/read/key-ring verification. |
+
+`stage` describes only the **phase of the probe**, not proof of which
+backend is down. In particular, `redis-write` can result from **either**
+the lobby or the independent guest-cache Redis connection: those writes
+run concurrently; `session-read` is the cache round-trip readback;
+`key-ring` is Data Protection verification; and `timeout` overrides
+the phase when the 2-second budget expires. Healthy probes use `ok`.
+The 3-second result cache, concurrent HTTP callers and cancellation
+of only one waiter **do not multiply observations**. The duration is
+measured using `Stopwatch` monotonic ticks, independent of UTC clock
+adjustments. Development readiness does not perform this Redis probe,
+so it does **not** contribute timing samples.
+
+Operators may collect this meter through a separately configured,
+access-restricted OpenTelemetry exporter/collector, then construct alerts
+for sustained `unavailable` probe ratios and high histogram p95/p99
+(for example, report the fraction of unavailable probes and latency
+percentiles, split by the bounded `stage` values). Choose thresholds,
+time windows and paging policies from real deployment SLOs instead of
+guessing a game-specific guarantee. A histogram measurement never
+contains exceptions, connection strings, URLs, player IDs, IPs or
+cookies; do not add them to metric labels. **No** public `/metrics`,
+Grafana/Prometheus endpoint or exporter is enabled by this change.
+Redis/Sentinel server health, replication lag, partitions, RPO/RTO
+and an actually deployed alert receiver still require infrastructure
+monitoring under #21.
+
 ## Immediate durable cleanup after guest logout (#41)
 
 Guest logout previously revoked the Redis session token first, then removed
