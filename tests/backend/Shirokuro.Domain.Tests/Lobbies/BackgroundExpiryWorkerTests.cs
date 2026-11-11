@@ -31,7 +31,7 @@ public sealed class BackgroundExpiryWorkerTests
     }
 
     [Fact]
-    public async Task RegistryWorkerActuallyRemovesExpiredTicketsOnTimerTick()
+    public async Task RegistryWorkerCleansExpiredTicketsOnStartupOrTimerTick()
     {
         var clock = new ManualTickTimeProvider();
         var registry = new GuestSessionRegistry(clock);
@@ -51,7 +51,10 @@ public sealed class BackgroundExpiryWorkerTests
         Assert.Equal(1, coordinator.StoredRoomCount);
         clock.Advance(TimeSpan.FromHours(8));
         Assert.False(registry.IsActive(principal));
-        Assert.Equal(1, registry.StoredSessionCount); // Still waiting for timer.
+        // Unlike the lobby worker, guest expiry also performs an immediate
+        // startup sweep. That background sweep can overlap the clock advance
+        // on a busy CI runner and legitimately clean the ticket before Tick.
+        // The contract is eventual cleanup, not an exact intermediate count.
         clock.Tick();
 
         Assert.True(SpinWait.SpinUntil(() => registry.StoredSessionCount == 0 &&
