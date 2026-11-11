@@ -10,7 +10,17 @@ export default defineConfig({
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [{
+    name: 'chromium',
+    use: {
+      ...devices['Desktop Chrome'],
+      // GitHub-hosted runners often have Chrome and its native libraries
+      // preinstalled. Keep the bundled Playwright Chromium for local runs.
+      ...(process.env.SHIROKURO_PLAYWRIGHT_USE_SYSTEM_CHROME === '1'
+        ? { channel: 'chrome' as const }
+        : {}),
+    },
+  }],
   webServer: [
     {
       command: 'dotnet run --no-launch-profile --project ../../src/backend/applications/Shirokuro.Api --urls http://127.0.0.1:5186',

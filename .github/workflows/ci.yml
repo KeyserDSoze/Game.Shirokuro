@@ -127,13 +127,18 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run test:unit
       - run: npm run build
-      # Chromium installation depends on external package mirrors; do not
-      # let a stalled apt/download step hold the entire CI runner indefinitely.
-      # A single bounded retry can recover transient mirror/network failures.
-      - name: Install Playwright Chromium with bounded retry
+      # Hosted runners normally ship Google Chrome with its system libraries.
+      # Prefer that verified browser to avoid apt mirror/DNS outages. When
+      # unavailable (custom runner), retain a bounded Chromium installer.
+      - name: Select available Playwright browser, with bounded install fallback
         shell: bash
         run: |
           set -euo pipefail
+          if command -v google-chrome >/dev/null 2>&1; then
+            google-chrome --version
+            echo "SHIROKURO_PLAYWRIGHT_USE_SYSTEM_CHROME=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
           for attempt in 1 2; do
             if timeout --signal=TERM --kill-after=5s 150s \
                 npx playwright install --with-deps chromium; then
