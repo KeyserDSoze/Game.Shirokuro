@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using System.Text;
 using Shirokuro.Application.Lobbies;
 using StackExchange.Redis;
@@ -211,6 +212,37 @@ public sealed class RedisLobbySnapshotStore(
         if (!expected.RawBytes.AsSpan().SequenceEqual(
                 RedisLobbySnapshotCodec.Encode(expected.Snapshot)))
             throw new InvalidDataException("Untrusted persisted lobby version.");
+    }
+
+    /// <summary>
+    /// Server-only bounded enumeration for cross-instance session revocation.
+    /// Hashed keys are fetched internally; no invitation or roster is
+    /// returned without independent authenticated membership authorization.
+    /// </summary>
+    public async Task<IReadOnlyList<Stored>> GetIndexedRoomsAsync()
+    {
+        var members = await database.SortedSetRangeByRankAsync(GlobalIndexKey);
+        var result = new List<Stored>(members.Length);
+        foreach (var member in members)
+        {
+            var key = (RedisKey)member.ToString();
+            var raw = await database.StringGetAsync(key);
+            if (raw.IsNull)
+                continue; // Redis expiry can race this maintenance scan.
+            var bytes = (byte[])raw!;
+            using var json = JsonDocument.Parse(bytes);
+            var id = json.RootElement.GetProperty("LobbyId").GetString()
+                ?? throw new InvalidDataException("Missing persisted lobby ID.");
+            if (!string.Equals(key.ToString(), RoomKey(id).ToString(),
+                    StringComparison.Ordinal))
+                throw new InvalidDataException("Persisted lobby key mismatch.");
+            var snapshot = RedisLobbySnapshotCodec.Decode(bytes, id);
+            if (!snapshot.QuotaTracked)
+                throw new InvalidDataException("Missing lobby capacity tracking.");
+            if (Remaining(snapshot) > TimeSpan.Zero)
+                result.Add(new Stored(snapshot, bytes));
+        }
+        return result;
     }
 
     private TimeSpan Remaining(LobbySnapshot snapshot)

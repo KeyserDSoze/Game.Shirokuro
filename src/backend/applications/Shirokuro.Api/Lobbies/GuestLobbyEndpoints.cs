@@ -25,53 +25,55 @@ public static class GuestLobbyEndpoints
     {
         var route = app.MapGroup("/api/lobbies").RequireAuthorization();
 
-        route.MapPost("", (CreateRoomRequest request, HttpContext context,
-            IHostEnvironment environment, GuestLobbyCommands commands) =>
+        route.MapPost("", async (CreateRoomRequest request, HttpContext context,
+            IHostEnvironment environment, IAsyncGuestLobby lobby) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return Respond(() =>
+            return await Respond(async () =>
             {
-                var roster = commands.Create(actor!, request.TeamIds, request.TeamId);
+                var roster = await lobby.CreateAsync(actor!, request.TeamIds,
+                    request.TeamId, context.RequestAborted);
                 return Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster);
             });
         }).RequireRateLimiting("guest-room-creation");
 
-        route.MapPost("/{roomId}/join", (string roomId, JoinRoomRequest request,
+        route.MapPost("/{roomId}/join", async (string roomId, JoinRoomRequest request,
             HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return Respond(() => Results.Ok(
-                commands.Join(roomId, actor!, request.TeamId, request.ExpectedRevision)));
+            return await Respond(async () => Results.Ok(await lobby.JoinAsync(
+                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)));
         });
 
-        route.MapPatch("/{roomId}/hero", (string roomId, ChooseHeroRequest request,
+        route.MapPatch("/{roomId}/hero", async (string roomId, ChooseHeroRequest request,
             HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return Respond(() => Results.Ok(
-                commands.ChooseHero(roomId, actor!, request.HeroId, request.ExpectedRevision)));
+            return await Respond(async () => Results.Ok(await lobby.ChooseHeroAsync(
+                roomId, actor!, request.HeroId, request.ExpectedRevision, context.RequestAborted)));
         });
 
-        route.MapPatch("/{roomId}/team", (string roomId, ChangeTeamRequest request,
+        route.MapPatch("/{roomId}/team", async (string roomId, ChangeTeamRequest request,
             HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return Respond(() => Results.Ok(
-                commands.ChangeTeam(roomId, actor!, request.TeamId, request.ExpectedRevision)));
+            return await Respond(async () => Results.Ok(await lobby.ChangeTeamAsync(
+                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)));
         });
 
-        route.MapDelete("/{roomId}/membership", (string roomId, [FromBody] LeaveRoomRequest request,
+        route.MapDelete("/{roomId}/membership", async (string roomId, [FromBody] LeaveRoomRequest request,
             HttpContext context, IHostEnvironment environment, GuestLobbyCommands commands) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return Respond(() =>
+            return await Respond(async () =>
             {
-                commands.Leave(roomId, actor!, request.ExpectedRevision);
+                await lobby.LeaveAsync(roomId, actor!, request.ExpectedRevision,
+                    context.RequestAborted);
                 return Results.NoContent();
             });
         });
@@ -86,11 +88,11 @@ public static class GuestLobbyEndpoints
                playerId is not null && GuestSessions.IsGuest(context.User);
     }
 
-    private static IResult Respond(Func<IResult> execute)
+    private static async Task<IResult> Respond(Func<Task<IResult>> execute)
     {
         try
         {
-            return execute();
+            return await execute();
         }
         catch (LobbyRevisionConflictException)
         {

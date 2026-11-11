@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Shirokuro.Api.Security;
+using Shirokuro.Api.Lobbies;
 using Shirokuro.Application.Lobbies;
 
 namespace Shirokuro.Api.Hubs;
@@ -11,7 +12,8 @@ namespace Shirokuro.Api.Hubs;
 /// notifications must reauthorize every receiver before sending.
 /// </summary>
 [Authorize]
-public sealed class LobbyRosterHub(LobbyRosterReader reader, GuestSessionRegistry? sessions = null) : Hub
+public sealed class LobbyRosterHub(LobbyRosterReader reader,
+    GuestSessionRegistry? sessions = null, IAsyncGuestLobby? lobby = null) : Hub
 {
     public async Task<LobbyRosterView> GetRoster(string lobbyId)
     {
@@ -34,7 +36,10 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader, GuestSessionRegistr
 
         try
         {
-            return reader.ForMember(lobbyId, trustedPlayerId);
+            return lobby is null
+                ? reader.ForMember(lobbyId, trustedPlayerId)
+                : await lobby.ForMemberAsync(
+                    lobbyId, trustedPlayerId, Context.ConnectionAborted);
         }
         catch (Exception error) when (
             error is KeyNotFoundException or

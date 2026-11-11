@@ -10,6 +10,7 @@ using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Application.Preview;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 // Ingress forwarding stays disabled unless exact trusted proxy IPs are configured.
@@ -28,13 +29,31 @@ builder.Services.AddHsts(options =>
     options.Preload = false;
 });
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddHostedService<LobbyExpiryWorker>();
+if (builder.Environment.IsDevelopment())
+    builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<GuestSessionRegistry>();
 builder.Services.AddHostedService<GuestSessionExpiryWorker>();
 builder.Services.AddSingleton<BoardPreviewService>();
 builder.Services.AddSingleton<InMemoryLobbyCoordinator>();
 builder.Services.AddSingleton<LobbyRosterReader>();
 builder.Services.AddSingleton<GuestLobbyCommands>();
+if (builder.Environment.IsDevelopment())
+{
+    builder.Services.AddSingleton<IAsyncGuestLobby, LocalGuestLobbyRuntime>();
+}
+else
+{
+    // All production routes, websocket roster reads and guest cleanup use
+    // Redis as a single authority. Never fall back to local room state.
+    builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+        ConnectionMultiplexer.Connect(
+            ConfigurationOptions.Parse(builder.Configuration[
+                GuestSessionRedisConfiguration.ConnectionStringKey]!)));
+    builder.Services.AddSingleton(provider => new RedisLobbySnapshotStore(
+        provider.GetRequiredService<IConnectionMultiplexer>().GetDatabase(),
+        provider.GetRequiredService<TimeProvider>()));
+    builder.Services.AddSingleton<IAsyncGuestLobby, RedisGuestLobbyRuntime>();
+}
 
 // The cookie may contain a server-generated, non-verified guest ID.
 // No trusted account login or client-selected player ID is supported.
@@ -236,8 +255,8 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     // The guest can no longer authenticate. Remove their stale pre-match
     // memberships, preserving the other players' roster and room TTL.
     var playerId = AuthenticatedPlayerIdentity.FromPrincipal(context.User)!;
-    context.RequestServices.GetRequiredService<InMemoryLobbyCoordinator>()
-        .RemovePlayerFromAllRooms(playerId);
+    await context.RequestServices.GetRequiredService<IAsyncGuestLobby>()
+        .RemovePlayerFromAllRoomsAsync(playerId, context.RequestAborted);
 
     await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
     return Results.NoContent();
@@ -247,7 +266,8 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
 // Read-only authenticated roster. Never accept a playerId from the request.
 // A missing lobby and a non-member both return 404 to avoid room enumeration.
 app.MapGet("/api/lobbies/{lobbyId}/roster",
-    (string lobbyId, ClaimsPrincipal user, HttpContext context, LobbyRosterReader reader) =>
+    async (string lobbyId, ClaimsPrincipal user, HttpContext context,
+        IAsyncGuestLobby lobby) =>
     {
         context.Response.Headers.CacheControl = "no-store";
         var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(user);
@@ -258,7 +278,8 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
 
         try
         {
-            return Results.Ok(reader.ForMember(lobbyId, trustedPlayerId));
+            return Results.Ok(await lobby.ForMemberAsync(
+                lobbyId, trustedPlayerId, context.RequestAborted));
         }
         catch (Exception error) when (
             error is KeyNotFoundException or

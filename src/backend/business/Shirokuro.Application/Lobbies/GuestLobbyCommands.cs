@@ -64,7 +64,7 @@ public sealed class GuestLobbyCommands(
         coordinator.LeaveAndPrune(roomId, trustedPlayerId, expectedRevision);
     }
 
-    private static void ValidateTeams(IReadOnlyList<string>? teams)
+    public static void ValidateTeams(IReadOnlyList<string>? teams)
     {
         if (teams is null || teams.Count is < MinTeams or > MaxTeams)
             throw new ArgumentException("A preview room requires 2–4 team identifiers.");

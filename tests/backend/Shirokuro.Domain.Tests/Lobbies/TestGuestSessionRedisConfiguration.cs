@@ -4,6 +4,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Shirokuro.Api.Lobbies;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
 
@@ -32,6 +33,12 @@ internal static class TestGuestSessionRedisConfiguration
                 services.AddDistributedMemoryCache();
             else
                 services.AddSingleton(shared);
+
+            // Security-focused non-Development tests use a deterministic
+            // local room fixture, not a live Redis. Dedicated multi-instance
+            // tests explicitly replace this with the production Redis runtime.
+            services.RemoveAll<IAsyncGuestLobby>();
+            services.AddSingleton<IAsyncGuestLobby, LocalGuestLobbyRuntime>();
         });
     }
 }

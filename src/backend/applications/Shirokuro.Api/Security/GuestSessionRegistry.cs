@@ -135,6 +135,17 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
         return true;
     }
 
+    /// <summary>
+    /// Retry a trusted expiry cleanup after a temporary Redis outage.
+    /// No request or untrusted actor can enqueue maintenance identities.
+    /// </summary>
+    public void RequeueExpiredPlayerIds(IEnumerable<string> trustedPlayerIds)
+    {
+        lock (_gate)
+            foreach (var playerId in trustedPlayerIds)
+                _pendingExpiredPlayerIds.Add(playerId);
+    }
+
     public int StoredSessionCount
     {
         get
