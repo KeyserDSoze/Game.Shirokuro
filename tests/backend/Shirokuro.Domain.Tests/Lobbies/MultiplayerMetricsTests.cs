@@ -304,6 +304,29 @@ public sealed class MultiplayerMetricsTests
     }
 
     [Fact]
+    public void ReadinessDurationIsAnExplicitSecondsHistogramNotAPublicApi()
+    {
+        // The .NET meter contract is machine-readable without starting a
+        // collector, exposing an endpoint or depending on Redis availability.
+        MultiplayerMetrics.RecordReadinessDuration(
+            true, ReadinessProbeStage.Success, seconds: 0.001);
+        Instrument? published = null;
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, _) =>
+            {
+                if (instrument.Meter.Name == MultiplayerMetrics.MeterName &&
+                    instrument.Name == MultiplayerMetrics.ReadinessDurationSecondsName)
+                    published = instrument;
+            }
+        };
+        listener.Start();
+        var histogram = Assert.IsType<Histogram<double>>(published);
+        Assert.Equal("s", histogram.Unit);
+        Assert.Equal(MultiplayerMetrics.MeterVersion, histogram.Meter.Version);
+    }
+
+    [Fact]
     public async Task ProductionHttpReportsAllowedLimitedAndUnavailableByTrustedEndpointOnly()
     {
         var limiter = new Limiter { Outcome = MutationOutcome.Limited };
