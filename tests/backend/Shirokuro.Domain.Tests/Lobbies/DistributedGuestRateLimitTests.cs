@@ -1,4 +1,6 @@
 using System.Net;
+using System.IO;
+using Microsoft.AspNetCore.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -103,7 +105,8 @@ public sealed class DistributedGuestRateLimitTests
     }
 
     private static WebApplicationFactory<Program> Server(
-        IDistributedCache sessions, IConnectionMultiplexer redis) =>
+        IDistributedCache sessions, IConnectionMultiplexer redis,
+        bool trustProxy = false) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -113,7 +116,8 @@ public sealed class DistributedGuestRateLimitTests
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["AllowedHosts"] = "game.example",
-                    ["Security:AllowedOrigins:0"] = "https://game.example"
+                    ["Security:AllowedOrigins:0"] = "https://game.example",
+                    ["Security:KnownProxies:0"] = trustProxy ? "192.0.2.10" : null
                 }));
             builder.ConfigureTestServices(services =>
             {
@@ -141,6 +145,137 @@ public sealed class DistributedGuestRateLimitTests
         if (payload is not null)
             message.Content = JsonContent.Create(payload);
         return message;
+    }
+
+    private sealed class ToggleFailureLimiter : IGuestMutationLimiter
+    {
+        public bool Unavailable { get; set; }
+        public Task<GuestMutationDecision> AcquireAsync(
+            GuestMutationRateLimit policy, IPAddress? remote,
+            CancellationToken cancellationToken = default)
+        {
+            if (Unavailable)
+                throw new IOException("Fake outage, no secrets.");
+            return Task.FromResult(new GuestMutationDecision(true, 60_000));
+        }
+    }
+
+    [Fact]
+    public async Task StoreOutageNeverIssuesGuestCookieOrCreatesRoom()
+    {
+        var limiter = new ToggleFailureLimiter { Unavailable = true };
+        using var server = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseEnvironment("Production");
+                TestDataProtectionConfiguration.Apply(builder);
+                TestGuestSessionRedisConfiguration.Apply(builder);
+                builder.ConfigureAppConfiguration((_, config) =>
+                    config.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["AllowedHosts"] = "game.example",
+                        ["Security:AllowedOrigins:0"] = "https://game.example"
+                    }));
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IGuestMutationLimiter>();
+                    services.AddSingleton<IGuestMutationLimiter>(limiter);
+                });
+            });
+        using var client = Client(server);
+        using (var request = Post("/api/sessions/guest"))
+        using (var error = await client.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, error.StatusCode);
+            Assert.False(error.Headers.Contains("Set-Cookie"));
+            Assert.Equal("no-store", error.Headers.CacheControl?.ToString());
+        }
+
+        limiter.Unavailable = false;
+        string cookie;
+        using (var request = Post("/api/sessions/guest"))
+        using (var response = await client.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            cookie = Assert.Single(response.Headers.GetValues("Set-Cookie")).Split(';')[0];
+        }
+        limiter.Unavailable = true;
+        using (var request = Post("/api/lobbies",
+            new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+        {
+            request.Headers.Add("Cookie", cookie);
+            using var error = await client.SendAsync(request);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, error.StatusCode);
+            Assert.Equal("no-store", error.Headers.CacheControl?.ToString());
+        }
+
+        // Other endpoints are not accidentally rate-limited.
+        using var me = new HttpRequestMessage(HttpMethod.Get, "/api/sessions/me");
+        me.Headers.Add("Cookie", cookie);
+        using var stillValid = await client.SendAsync(me);
+        Assert.Equal(HttpStatusCode.OK, stillValid.StatusCode);
+    }
+
+    [Fact]
+    public async Task TrustedForwardedIpAndUntrustedSpoofingUseCorrectSharedPartitions()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var services = new ServiceCollection();
+            services.AddDistributedMemoryCache();
+            using var sessionProvider = services.BuildServiceProvider();
+            var cache = sessionProvider.GetRequiredService<IDistributedCache>();
+            using var serverA = Server(cache, a, trustProxy: true);
+            using var serverB = Server(cache, b, trustProxy: true);
+
+            static Task<HttpContext> Issue(WebApplicationFactory<Program> server,
+                string peer, string fakeClient)
+            {
+                return server.Server.SendAsync(context =>
+                {
+                    context.Connection.RemoteIpAddress = IPAddress.Parse(peer);
+                    context.Request.Method = "POST";
+                    context.Request.Path = "/api/sessions/guest";
+                    context.Request.Scheme = "https";
+                    context.Request.Host = new HostString("game.example");
+                    context.Request.Headers["Origin"] = "https://game.example";
+                    context.Request.Headers["X-Shirokuro-Request"] = "1";
+                    context.Request.Headers["X-Forwarded-For"] = fakeClient;
+                    context.Request.Headers["X-Forwarded-Proto"] = "https";
+                });
+            }
+
+            // Trusted proxy: the real forwarded address is shared across
+            // nodes and a second client gets a separate 12-request budget.
+            for (var i = 0; i < 12; i++)
+            {
+                var response = await Issue(i % 2 == 0 ? serverA : serverB,
+                    "192.0.2.10", "198.51.100.121");
+                Assert.Equal(200, response.Response.StatusCode);
+                Assert.Equal(IPAddress.Parse("198.51.100.121"),
+                    response.Connection.RemoteIpAddress);
+            }
+            Assert.Equal(429, (await Issue(serverB, "192.0.2.10",
+                "198.51.100.121")).Response.StatusCode);
+            Assert.Equal(200, (await Issue(serverA, "192.0.2.10",
+                "198.51.100.122")).Response.StatusCode);
+
+            // Untrusted TCP peers cannot change their partition by
+            // supplying arbitrary XFF headers.
+            for (var i = 0; i < 12; i++)
+            {
+                var response = await Issue(i % 2 == 0 ? serverA : serverB,
+                    "192.0.2.11", "203.0.113." + (i + 1));
+                Assert.Equal(200, response.Response.StatusCode);
+                Assert.Equal(IPAddress.Parse("192.0.2.11"),
+                    response.Connection.RemoteIpAddress);
+            }
+            Assert.Equal(429, (await Issue(serverA, "192.0.2.11",
+                "198.51.100.200")).Response.StatusCode);
+        }
     }
 
     [Fact]

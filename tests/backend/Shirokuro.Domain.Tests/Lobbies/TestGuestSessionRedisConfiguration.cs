@@ -50,3 +50,36 @@ internal static class TestGuestSessionRedisConfiguration
         });
     }
 }
+
+
+/// <summary>
+/// TestServer-only deterministic limiter; never registered by production DI.
+/// Used by other ingress/security tests without requiring live Redis.
+/// </summary>
+internal sealed class TestGuestMutationLimiter(TimeProvider clock) : IGuestMutationLimiter
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<string, (int Used, DateTimeOffset Started)> _windows = new();
+
+    public Task<GuestMutationDecision> AcquireAsync(
+        GuestMutationRateLimit policy, System.Net.IPAddress? ip,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = RedisGuestMutationLimiter.Key(policy, ip);
+        var now = clock.GetUtcNow();
+        lock (_gate)
+        {
+            if (!_windows.TryGetValue(key, out var entry) ||
+                now - entry.Started >= TimeSpan.FromMinutes(1))
+                entry = (0, now);
+            var remaining = Math.Max(0, (long)Math.Ceiling(
+                (entry.Started.AddMinutes(1) - now).TotalMilliseconds));
+            var allowed = entry.Used < policy.PermitLimit;
+            if (allowed)
+                entry.Used++;
+            _windows[key] = entry;
+            return Task.FromResult(new GuestMutationDecision(allowed, remaining));
+        }
+    }
+}
