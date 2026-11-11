@@ -40,7 +40,9 @@ public sealed class MultiplayerMetricsExportTests
 
     private sealed class CaptureHandler : HttpMessageHandler
     {
-        public readonly ConcurrentQueue<(Uri Uri, string MediaType, byte[] Body)> Calls = new();
+        public readonly ConcurrentQueue<(
+            Uri Uri, string MediaType, byte[] Body,
+            bool HasAuthorization, bool HasCookie)> Calls = new();
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
@@ -49,7 +51,10 @@ public sealed class MultiplayerMetricsExportTests
             Calls.Enqueue((
                 request.RequestUri!,
                 request.Content.Headers.ContentType?.MediaType ?? "",
-                body));
+                body,
+                request.Headers.Contains("Authorization") ||
+                    request.Headers.ProxyAuthorization is not null,
+                request.Headers.Contains("Cookie")));
             return new HttpResponseMessage(HttpStatusCode.OK);
         }
     }
@@ -155,12 +160,17 @@ public sealed class MultiplayerMetricsExportTests
 
         Assert.True(meter.ForceFlush(5_000));
         Assert.NotEmpty(collector.Calls);
-        foreach (var (uri, mediaType, bytes) in collector.Calls)
+        foreach (var (uri, mediaType, bytes, hasAuthorization, hasCookie)
+                 in collector.Calls)
         {
             Assert.Equal("https", uri.Scheme);
             Assert.Equal("/v1/metrics", uri.AbsolutePath);
             Assert.Equal("application/x-protobuf", mediaType);
             Assert.NotEmpty(bytes);
+            // Application guest cookies and API authentication must never
+            // become OTLP transport headers.
+            Assert.False(hasAuthorization);
+            Assert.False(hasCookie);
         }
 
         // Metric batches may be split by the SDK. Assert names across all
@@ -227,6 +237,7 @@ public sealed class MultiplayerMetricsExportTests
         using (var metrics = await client.GetAsync("/metrics"))
             Assert.Equal(HttpStatusCode.NotFound, metrics.StatusCode);
 
+        string cookie;
         using (var request = new HttpRequestMessage(
                    HttpMethod.Post, "/api/sessions/guest"))
         {
@@ -234,7 +245,27 @@ public sealed class MultiplayerMetricsExportTests
             request.Headers.Add("X-Shirokuro-Request", "1");
             using var response = await client.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.True(response.Headers.Contains("Set-Cookie"));
+            cookie = Assert.Single(response.Headers.GetValues("Set-Cookie"))
+                .Split(';')[0];
+        }
+
+        using var member = host.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://game.example"),
+            HandleCookies = false,
+            AllowAutoRedirect = false
+        });
+        member.DefaultRequestHeaders.Add("Cookie", cookie);
+        using (var session = await member.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, session.StatusCode);
+        using (var create = new HttpRequestMessage(HttpMethod.Post, "/api/lobbies"))
+        {
+            create.Headers.Add("Origin", "https://game.example");
+            create.Headers.Add("X-Shirokuro-Request", "1");
+            create.Content = System.Net.Http.Json.JsonContent.Create(
+                new { teamIds = new[] { "white", "black" }, teamId = "white" });
+            using var response = await member.SendAsync(create);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
 
         var meter = host.Services.GetRequiredService<MeterProvider>();
@@ -244,6 +275,20 @@ public sealed class MultiplayerMetricsExportTests
         Assert.True(Volatile.Read(ref collector.Requests) > 0);
         using (var afterFailure = await client.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, afterFailure.StatusCode);
+        using (var active = await member.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+
+        // Revoke on the game server, not in the telemetry pipeline.
+        using (var logout = new HttpRequestMessage(
+                   HttpMethod.Delete, "/api/sessions/guest"))
+        {
+            logout.Headers.Add("Origin", "https://game.example");
+            logout.Headers.Add("X-Shirokuro-Request", "1");
+            using var response = await member.SendAsync(logout);
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        }
+        using (var revoked = await member.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
     }
 
     [Fact]
