@@ -745,3 +745,5 @@ partitions, simultaneous Data Protection and Redis restore with live
 nodes, AOF recovery, cloud snapshot encryption, RPO/RTO or throughput
 under a real incident. The isolated CI drill is not production HA
 certification; follow-up stays tracked by #21.
+
+The drill is automated in [CI #43040819970](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43040819970), where all six Redis TLS test cases (five existing, one new RDB restore) and the complete backend/frontend/artwork suites passed on `main`.
