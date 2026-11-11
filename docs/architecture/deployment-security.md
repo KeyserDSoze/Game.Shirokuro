@@ -283,9 +283,9 @@ can serve multiplayer traffic.
 `GET /api/ready` is **node readiness** and remains unauthenticated for an
 internal load balancer. Outside Development, every fresh check requires:
 
-- a read-only Redis `PING` on the **lobby/mutation/expiry** multiplexer;
-- a read-only missing-key lookup through the **separate guest session
-  `IDistributedCache`** client (neither check writes session/lobby state);
+- a short-lived `SET` on a fixed technical key through the **lobby/mutation/expiry** Redis multiplexer, rejecting read-only replicas;
+- a short-lived write **and readback** through the **separate guest session
+  `IDistributedCache`** client (neither key contains guest data);
 - a small round-trip through the configured purpose-isolated ASP.NET Core
   **Data Protection** key ring to confirm the node can protect and unprotect.
 
@@ -293,9 +293,11 @@ All checks must pass. Responses are intentionally identical across failures:
 `200 {"status":"ready"}` or `503 {"status":"unavailable"}`, always
 `Cache-Control: no-store`. Exceptions, secret paths, Redis credentials,
 player identities and invitation details are never returned to clients or
-written to readiness logs. Each process coalesces probes behind a gate and
-caches both success and failure for **3 seconds**, with a **2-second**
-probe timeout. This is a bounded operational signal, not a full health audit.
+written to readiness logs. Each process shares a **single in-flight probe task** across concurrent
+readiness requests, and caches both success and failure for **3 seconds**,
+with a **2-second** probe timeout. Individual HTTP client cancellation stops
+only that client's wait, not the shared bounded Redis/Data Protection probe.
+No per-request semaphore queue or positive cache is kept beyond this window. This is a bounded operational signal, not a full health audit.
 For fast convergence after a failure/recovery, a load balancer must poll
 periodically instead of caching HTTP responses. Development returns ready
 without Redis, preserving local Vite/Playwright.
