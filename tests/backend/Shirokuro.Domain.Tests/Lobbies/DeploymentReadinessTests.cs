@@ -359,4 +359,3 @@ public sealed class DeploymentReadinessTests
         Assert.Equal(2, store.Writes);
     }
 }
-}
