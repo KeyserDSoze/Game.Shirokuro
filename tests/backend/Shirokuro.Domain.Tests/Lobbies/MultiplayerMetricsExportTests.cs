@@ -161,12 +161,16 @@ public sealed class MultiplayerMetricsExportTests
             Assert.Equal("/v1/metrics", uri.AbsolutePath);
             Assert.Equal("application/x-protobuf", mediaType);
             Assert.NotEmpty(bytes);
-            var payload = Encoding.UTF8.GetString(bytes);
-            Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
-            Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
-            Assert.DoesNotContain("password=", payload, StringComparison.OrdinalIgnoreCase);
-            Assert.DoesNotContain("guest-private", payload, StringComparison.OrdinalIgnoreCase);
         }
+
+        // Metric batches may be split by the SDK. Assert names across all
+        // received protobuf payloads, not an incidental packet boundary.
+        var payload = string.Concat(collector.Calls
+            .Select(call => Encoding.UTF8.GetString(call.Body)));
+        Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
+        Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
+        Assert.DoesNotContain("password=", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("guest-private", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed class UnavailableCollector : HttpMessageHandler
