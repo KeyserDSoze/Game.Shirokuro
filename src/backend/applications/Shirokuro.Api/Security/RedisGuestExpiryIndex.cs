@@ -49,10 +49,8 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         var plaintext = expiresUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) +
                         ":" + trustedPlayerId;
         var member = _protector.Protect(plaintext);
-        var deadline = expiresUtc.ToUnixTimeMilliseconds();
-        if (expiresUtc.UtcTicks % TimeSpan.TicksPerMillisecond != 0)
-            deadline++; // never clean up even one millisecond early
-        await _database.SortedSetAddAsync(_key, member, deadline);
+        await _database.SortedSetAddAsync(
+            _key, member, CeilingUnixMilliseconds(expiresUtc));
     }
 
     public async Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
@@ -61,7 +59,7 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         cancellationToken.ThrowIfCancellationRequested();
         var now = _clock.GetUtcNow();
         var members = await _database.SortedSetRangeByScoreAsync(
-            _key, stop: now.ToUnixTimeMilliseconds(), take: BatchSize);
+            _key, stop: CeilingUnixMilliseconds(now), take: BatchSize);
         var result = new List<DueGuestExpiry>(members.Length);
         foreach (var member in members)
         {
@@ -102,6 +100,16 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(protectedMember);
         await _database.SortedSetRemoveAsync(_key, protectedMember);
+    }
+
+    // The Redis score has millisecond precision, while UTC times retain
+    // ticks. Round both insert and lookup upward, then verify the exact
+    // decrypted timestamp before removing any guest.
+    private static long CeilingUnixMilliseconds(DateTimeOffset value)
+    {
+        var milliseconds = value.ToUnixTimeMilliseconds();
+        return value.UtcTicks % TimeSpan.TicksPerMillisecond == 0
+            ? milliseconds : milliseconds + 1;
     }
 
     private static bool ValidGuestId(string? value)
