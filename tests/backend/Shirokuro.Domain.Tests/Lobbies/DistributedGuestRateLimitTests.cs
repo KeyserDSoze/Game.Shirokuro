@@ -113,12 +113,16 @@ public sealed class DistributedGuestRateLimitTests
             TestDataProtectionConfiguration.Apply(builder);
             TestGuestSessionRedisConfiguration.Apply(builder, sessions);
             builder.ConfigureAppConfiguration((_, config) =>
-                config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                var settings = new Dictionary<string, string?>
                 {
                     ["AllowedHosts"] = "game.example",
-                    ["Security:AllowedOrigins:0"] = "https://game.example",
-                    ["Security:KnownProxies:0"] = trustProxy ? "192.0.2.10" : null
-                }));
+                    ["Security:AllowedOrigins:0"] = "https://game.example"
+                };
+                if (trustProxy)
+                    settings["Security:KnownProxies:0"] = "192.0.2.10";
+                config.AddInMemoryCollection(settings);
+            });
             builder.ConfigureTestServices(services =>
             {
                 services.RemoveAll<IConnectionMultiplexer>();
