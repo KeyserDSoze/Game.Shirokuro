@@ -665,3 +665,83 @@ certification. Simultaneous loss of Redis session keys and the key ring
 still invalidates active guest sessions and can strand unprocessed cleanup
 records until operator repair. These tasks and operational monitoring stay
 in #21.
+
+## Redis RDB snapshot loss-and-restore drill (#48)
+
+The Redis TLS test for #43 and the temporary outage test for #46 left
+Redis's **stored data** intact. The #47 offline drill separately tested
+backup/restore of the encrypted Data Protection XML key ring and its
+private-key PFX. The #48 drill covers the other half of multiplayer
+recovery: a **consistent Redis RDB snapshot**, including the authoritative
+guest-session token cache, lobby snapshots/revision/capacity indexes and
+Data Protection-encrypted pending guest-expiry members.
+
+The CI creates a **separate**, private TLS-only Redis 7.4 instance on
+`127.0.0.1:6381` so snapshot/destroy/restore cannot disturb the normal
+TLS fixture on 6380. It reuses only the ephemeral CI CA and SAN-valid
+server certificate; there is no plaintext Redis listener and no bypass
+of certificate validation.
+
+The test performs the following controlled sequence against genuine
+Production API dependency injection, without replacing Redis services:
+
+1. Two API hosts share the same persisted Data Protection key ring and
+   private TLS Redis instance. They issue guest cookies, join a
+   two-person lobby and record its exact revision and members. A third
+   session is explicitly revoked **before** the snapshot.
+2. The test validates that the expiry sorted set contains protected,
+   opaque members with no plaintext guest IDs. It runs a synchronous
+   Redis `SAVE` and captures `dump.rdb` in a runner-local, temporary,
+   private directory. The file must have the RDB `REDIS` signature.
+   After the test the fixture and backup file are destroyed, and
+   nothing is uploaded as a CI artifact.
+3. The original Redis process/data volume is removed. A **new, empty**
+   TLS Redis server starts at the same endpoint. Node readiness returns
+   `200` (the empty datastore is reachable), but an original signed
+   guest cookie is rejected as `401`: Redis's server-side session
+   record, not just the signed cookie, is required for authentication.
+4. After that disposable instance is removed, the backed-up RDB is
+   copied to a **different** writable data volume. A new Redis process
+   loads that snapshot. Two newly started Production API hosts accept
+   the original *active-at-backup* guest cookies, preserve the room
+   revision/participants and the exact encrypted pending expiry members,
+   while the cookie revoked before backup remains invalid.
+5. An ordinary logout against the restored Redis revokes the active
+   ticket, installs the lobby mutation fence, removes only that player's
+   membership and leaves the other player authorized.
+
+**Production restoration contract:** Redis RDB/AOF files and backup
+copies may contain player identifiers, lobby membership data, hashed
+session record keys and other sensitive game state. **Redis persistence
+is not an encryption mechanism.** Protect all snapshots in an encrypted,
+access-controlled backup store, restrict permissions, encrypt transfer,
+avoid writing snapshots to public artifacts/logs, and verify restoration
+in a quarantined environment. Record the time/age of the backup, verify
+its integrity before restoring, and separately preserve the entire
+Data Protection key ring with all required private PFX keys and
+`PreviousCertificates` as described in #47. A Redis restore without the
+matching cryptographic ring can leave encrypted expiry entries
+unreadable, even if room records are intact. Restore Redis before
+admitting traffic, validate `/api/ready` and test a known sample
+in a restricted staging environment.
+
+**CRITICAL SECURITY LIMITATION: snapshot rollback can resurrect
+previously revoked session records and lobby memberships.** This
+test proves revocations completed *before* the RDB snapshot survive.
+It does **not** prove revocations completed *after* the snapshot remain
+effective when older Redis state is restored. During a real incident,
+treat older Redis snapshots as potentially replayable, put the service
+behind a maintenance gate, and **invalidate all pre-restore guest
+sessions** before reopening guest traffic unless an independently
+preserved authoritative revocation ledger is available and replayed.
+Preserve audit/security evidence and plan explicit logout/re-authentication
+rather than silently treating restored cookies as safe. This project
+does not yet ship an atomic cross-store global session epoch or a
+transactional revocation log, so the forced-invalidation procedure and
+its automated tests remain an open requirement in #21.
+
+**Not covered:** Redis Sentinel/Cluster replica promotion, TLS HA under
+partitions, simultaneous Data Protection and Redis restore with live
+nodes, AOF recovery, cloud snapshot encryption, RPO/RTO or throughput
+under a real incident. The isolated CI drill is not production HA
+certification; follow-up stays tracked by #21.

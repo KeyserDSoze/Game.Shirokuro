@@ -101,6 +101,57 @@ jobs:
           # paused, with a guaranteed unpause in the xUnit test finally block.
           SHIROKURO_TEST_REDIS_CHAOS: '1'
 
+      # A SECOND TLS Redis fixture is deliberately isolated from the
+      # 6380 session/chaos tests. It can be completely destroyed and restored
+      # from an RDB file without affecting other running CI test classes.
+      - name: Start isolated TLS-only Redis RDB disaster-recovery fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          rdbdir="$(mktemp -d /tmp/shirokuro-redis-rdb-XXXXXX)"
+          echo "SHIROKURO_TEST_REDIS_RDB_DIR=$rdbdir" >> "$GITHUB_ENV"
+          mkdir -p "$rdbdir/source" "$rdbdir/backup" "$rdbdir/empty" "$rdbdir/restore"
+          docker run -d --name shirokuro-ci-redis-rdb-source \
+            -p 127.0.0.1:6381:6380 \
+            -v "$SHIROKURO_TLS_CERT_DIR:/certs:ro" \
+            -v "$rdbdir/source:/data" \
+            redis:7.4-alpine redis-server \
+            --port 0 --tls-port 6380 \
+            --tls-cert-file /certs/server.crt \
+            --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt \
+            --tls-auth-clients no \
+            --dir /data --dbfilename dump.rdb \
+            --save "" --appendonly no
+          for i in $(seq 1 50); do
+            if docker exec shirokuro-ci-redis-rdb-source redis-cli \
+                --tls --cacert /certs/ca.crt -h localhost -p 6380 ping \
+                2>/dev/null | grep -qx PONG; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "Private TLS RDB fixture did not become ready."
+          exit 1
+
+      - name: Test Production Redis TLS loss and RDB recovery
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsRdbRestoreTests'
+        env:
+          SHIROKURO_TEST_REDIS_RDB: localhost:6381,ssl=true,sslHost=localhost,abortConnect=true,connectTimeout=3000,connectRetry=0
+          # Grants only this dedicated xUnit fixture permission to replace
+          # the fixed, disposable RDB test container. Never enabled elsewhere.
+          SHIROKURO_TEST_REDIS_RDB_CHAOS: '1'
+
+      - name: Destroy isolated TLS Redis RDB fixture and sensitive snapshots
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f shirokuro-ci-redis-rdb-source 2>/dev/null || true
+          docker rm -f shirokuro-ci-redis-rdb-replacement 2>/dev/null || true
+          if [ -n "${SHIROKURO_TEST_REDIS_RDB_DIR:-}" ]; then
+            sudo rm -rf -- "$SHIROKURO_TEST_REDIS_RDB_DIR"
+          fi
+
       - name: Destroy ephemeral Redis TLS certificates and container
         if: always()
         shell: bash
