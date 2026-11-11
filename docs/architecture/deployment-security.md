@@ -1366,3 +1366,11 @@ and independently validated alerts. The public `/api/ready` and
 `/api/health` routes remain as before, with **no** `/metrics` ingress
 exposure. Collector and alert deployment, network partition tests,
 durable account authentication and robust failure domains remain #21.
+
+The Redis client lifecycle integration passed in [CI main #43121286726](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43121286726) SUCCESS: **397 xUnit standard**, **5 Production Redis TLS**, **2 Redis TLS ACL**, **1 blue/green ACL rotation**, **1 RDB restore**, **1 manual replica promotion**, **1 real TLS Sentinel ACL automatic failover** with both Redis clients' telemetry observed, **106 Vitest, 24 Playwright, 35 Python**, .NET 10 + React builds. The
+existing two Production API processes remain alive throughout the
+authenticated Sentinel failover while both lobby and guest-cache
+Redis clients emit at least one finite-label connection event; cookie,
+roster, revision, logout fence and new issuance continue across the
+auto-promotion. This is **client event observability**, not a
+telemetry alert receiver or certification of split-brain safety or RPO=0.
