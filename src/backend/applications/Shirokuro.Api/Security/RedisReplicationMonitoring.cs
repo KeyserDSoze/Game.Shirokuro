@@ -3,15 +3,20 @@ using StackExchange.Redis;
 namespace Shirokuro.Api.Security;
 
 /// <summary>
-/// Disabled-by-default, non-Development read-only replication probe. Uses
-/// existing authenticated TLS lobby multiplexer and never opens a new
-/// network endpoint or blocks player commands while waiting for telemetry.
+/// Disabled-by-default, non-Development read-only replication telemetry.
+/// StackExchange.Redis requires AllowAdmin=true to issue INFO. Never set it
+/// on the lobby or guest-cache connections: a distinct, least-privilege
+/// Redis ACL identity is required by startup configuration instead.
 /// </summary>
 public static class RedisReplicationMonitoring
 {
     public const string EnabledKey = "Security:Monitoring:RedisReplicationEnabled";
+    public const string ConnectionStringKey =
+        "Security:Monitoring:RedisReplicationConnectionString";
     public const string InvalidConfiguration =
         "Redis replication monitoring requires an explicit boolean setting.";
+    public const string InvalidConnection =
+        "Redis replication monitoring requires a distinct restricted TLS ACL identity.";
 
     public static bool IsEnabled(
         IConfiguration configuration, IHostEnvironment environment)
@@ -28,6 +33,41 @@ public static class RedisReplicationMonitoring
         return enabled;
     }
 
+    /// <summary>
+    /// Validate restricted credentials without granting client admin mode.
+    /// Never expose the raw config, credentials or StackExchange.Redis
+    /// parse/connection exceptions in error messages.
+    /// </summary>
+    public static ConfigurationOptions ReadRestrictedOptions(
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        try
+        {
+            var value = configuration[ConnectionStringKey];
+            if (string.IsNullOrWhiteSpace(value))
+                throw new InvalidOperationException();
+            var game = GuestSessionRedisConfiguration.ReadTlsOptions(configuration);
+            var options = ConfigurationOptions.Parse(value);
+            if (!options.Ssl || options.EndPoints.Count == 0 ||
+                options.AllowAdmin || string.IsNullOrWhiteSpace(options.User) ||
+                string.Equals(options.User, "default", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(options.Password) ||
+                string.Equals(options.User, game.User, StringComparison.Ordinal) ||
+                string.Equals(options.Password, game.Password, StringComparison.Ordinal) ||
+                !string.Equals(options.ServiceName, game.ServiceName, StringComparison.Ordinal) ||
+                (options.ServiceName is not null &&
+                    (string.IsNullOrWhiteSpace(options.SentinelUser) ||
+                     string.IsNullOrWhiteSpace(options.SentinelPassword))))
+                throw new InvalidOperationException();
+            return options;
+        }
+        catch (Exception)
+        {
+            throw new InvalidOperationException(InvalidConnection);
+        }
+    }
+
     public static void Configure(
         IServiceCollection services, IConfiguration configuration,
         IHostEnvironment environment)
@@ -35,14 +75,43 @@ public static class RedisReplicationMonitoring
         ArgumentNullException.ThrowIfNull(services);
         if (!IsEnabled(configuration, environment))
             return;
-        services.AddSingleton<RedisReplicationSampler>();
+        var restricted = ReadRestrictedOptions(configuration);
+
+        // AllowAdmin is ONLY a StackExchange.Redis client-side INFO guard.
+        // The server ACL MUST restrict the observer to INFO + handshake,
+        // deny all game keys and destructive/admin commands. Never expose
+        // the observer's mux as IConnectionMultiplexer in application DI.
+        // This separate connection is owned/disposed with its sampler.
+        services.AddSingleton(_ =>
+        {
+            var monitorOptions = restricted.Clone();
+            monitorOptions.AllowAdmin = true;
+            return new RedisReplicationSampler(
+                ConnectionMultiplexer.Connect(monitorOptions),
+                ownsConnection: true);
+        });
         services.AddHostedService<RedisReplicationMonitoringWorker>();
     }
 }
 
-public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
+public sealed class RedisReplicationSampler : IDisposable
 {
+    private readonly IConnectionMultiplexer _redis;
+    private readonly bool _ownsConnection;
     public static readonly TimeSpan Timeout = TimeSpan.FromSeconds(2);
+
+    public RedisReplicationSampler(
+        IConnectionMultiplexer redis, bool ownsConnection = false)
+    {
+        _redis = redis ?? throw new ArgumentNullException(nameof(redis));
+        _ownsConnection = ownsConnection;
+    }
+
+    public void Dispose()
+    {
+        if (_ownsConnection)
+            _redis.Dispose();
+    }
 
     public async Task SampleOnceAsync(CancellationToken cancellationToken = default)
     {
@@ -51,33 +120,30 @@ public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // INFO is a *server-level* command, not an IDatabase command.
-            // Find a connected server from the managed multiplexer, preferring
-            // its known primary. Sentinel transparently updates discovered
-            // endpoints on failover. Never display the selected endpoint.
-            // Production ACL already allows INFO; do NOT enable AllowAdmin.
-            var servers = redis.GetEndPoints(configuredOnly: false)
-                .Select(endpoint => redis.GetServer(endpoint))
+            // INFO is a server command. Select the connected primary when
+            // possible; a direct replica connection reports its own role.
+            // Never log/reveal server endpoint or raw INFO, which includes IPs.
+            var servers = _redis.GetEndPoints(configuredOnly: false)
+                .Select(endpoint => _redis.GetServer(endpoint))
                 .Where(server => server.IsConnected)
                 .ToArray();
             var current = servers.FirstOrDefault(server => !server.IsReplica)
                 ?? servers.FirstOrDefault();
             if (current is null)
-                throw new InvalidOperationException(
-                    "Redis replication metadata unavailable.");
+                throw new InvalidOperationException();
 
-            // Explicitly issue only the literal read-only subcommand.
-            // Generic ExecuteAsync can operate without enabling the
-            // administrative mode required by the typed InfoRawAsync API.
-            var raw = await current.ExecuteAsync("INFO", "replication")
+            // A distinct restricted observer uses client-side AllowAdmin,
+            // but its Redis ACL allows only INFO. The authoritative game
+            // multiplexers retain AllowAdmin=false and separate identities.
+            var raw = await current.InfoRawAsync("replication")
                 .WaitAsync(limit.Token);
-            var observation = RedisReplicationInfo.Parse(raw.ToString());
+            var observation = RedisReplicationInfo.Parse(raw);
             MultiplayerMetrics.RecordRedisReplication(
                 observation, RedisReplicationPollOutcome.Ok);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            throw; // Host shutdown is not a Redis outage.
+            throw;
         }
         catch (OperationCanceledException)
         {
@@ -91,8 +157,8 @@ public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
         }
         catch (Exception)
         {
-            // Do not log connection strings, endpoints or Redis error text.
-            // Telemetry itself is never part of guest authorization/readiness.
+            // INFO ACL/NOPERM, TLS, network and Redis exceptions must never
+            // affect API readiness, auth or expose server details in logs.
             MultiplayerMetrics.RecordRedisReplication(
                 null, RedisReplicationPollOutcome.Unavailable);
         }
@@ -106,8 +172,7 @@ public sealed class RedisReplicationMonitoringWorker(IServiceProvider services)
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Hosted service startup must not synchronously connect to Redis.
-        await Task.Yield();
+        await Task.Yield(); // No synchronous Redis connect in host startup.
         using var timer = new PeriodicTimer(Interval);
         try
         {
@@ -124,8 +189,6 @@ public sealed class RedisReplicationMonitoringWorker(IServiceProvider services)
                 }
                 catch (Exception)
                 {
-                    // A freshly resolving mux can fail before the sampler
-                    // exists. Monitoring never blocks or restarts the API.
                     MultiplayerMetrics.RecordRedisReplication(
                         null, RedisReplicationPollOutcome.Unavailable);
                 }
@@ -133,7 +196,6 @@ public sealed class RedisReplicationMonitoringWorker(IServiceProvider services)
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            // Ordinary host shutdown.
         }
     }
 }
