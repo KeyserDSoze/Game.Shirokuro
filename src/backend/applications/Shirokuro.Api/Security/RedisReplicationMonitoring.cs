@@ -57,7 +57,15 @@ public static class RedisReplicationMonitoring
                 string.Equals(options.Password, game.Password, StringComparison.Ordinal) ||
                 !string.Equals(options.ServiceName, game.ServiceName, StringComparison.Ordinal) ||
                 (options.ServiceName is not null &&
-                    (string.IsNullOrWhiteSpace(options.SentinelUser) ||
+                    // StackExchange.Redis may *fall back* to the Redis app
+                    // credentials for Sentinel auth when these aren't
+                    // explicitly specified. Require an independent explicit
+                    // discovery identity instead of accepting that fallback.
+                    (!value.Split(',').Any(part =>
+                        part.StartsWith("sentinelUser=", StringComparison.OrdinalIgnoreCase)) ||
+                     !value.Split(',').Any(part =>
+                        part.StartsWith("sentinelPassword=", StringComparison.OrdinalIgnoreCase)) ||
+                     string.IsNullOrWhiteSpace(options.SentinelUser) ||
                      string.IsNullOrWhiteSpace(options.SentinelPassword))))
                 throw new InvalidOperationException();
             return options;
