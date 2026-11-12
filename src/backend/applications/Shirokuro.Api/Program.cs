@@ -281,10 +281,17 @@ if (app.Environment.IsDevelopment())
 // Handler-level checks are intentionally retained as defense in depth.
 app.Use(async (context, next) =>
 {
-    if (context.GetEndpoint()?.Metadata.GetMetadata<WebMutationGuardRequired>()
-            is not null &&
-        !WebMutationGuard.Allows(context, app.Environment))
+    var metadata = context.GetEndpoint()?.Metadata;
+    if ((metadata?.GetMetadata<WebMutationGuardRequired>() is not null &&
+            !WebMutationGuard.Allows(context, app.Environment)) ||
+        (metadata?.GetMetadata<CookieSocketOriginGuardRequired>() is not null &&
+            context.Request.Headers.ContainsKey("Origin") &&
+            !WebMutationGuard.AllowsBrowserOrigin(context, app.Environment)))
     {
+        // The SignalR fence rejects hostile browser Origin values before
+        // even authenticating a signed guest cookie against shared Redis.
+        // Absence of Origin is allowed only for non-browser Hub callers;
+        // mutation endpoints still require both Origin and intent header.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
         return;
@@ -607,7 +614,9 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
 app.MapGuestLobbyEndpoints();
 
 // The connection is authenticated; each Hub method also checks membership.
-app.MapHub<LobbyRosterHub>("/hubs/lobbies").RequireAuthorization();
+app.MapHub<LobbyRosterHub>("/hubs/lobbies")
+    .RequireAuthorization()
+    .WithMetadata(new CookieSocketOriginGuardRequired());
 
 app.MapGet("/api/preview/board", (int? radius, BoardPreviewService board) =>
 {
