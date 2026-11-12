@@ -1497,3 +1497,27 @@ would risk double-counting and is deliberately avoided. This bounded
 admission check is separate from downstream guest/session/lobby Redis
 availability, from the read-only observer (#63), and from the real-world
 network HA/abuse controls still open in #21.
+
+## Sanitized Data Protection PFX startup failures (#66)
+
+Production and Staging Data Protection keys still require an operator-managed
+persistent key directory and a private-key-bearing PFX. A failed PFX load
+(wrong password, missing access, corrupt file) now raises a **fixed**
+`InvalidOperationException` with **no inner exception**. This applies to
+both the active encryption certificate and every configured historical
+decryption certificate. Startup or logging frameworks that serialize
+`Exception.ToString()` therefore do not inherit exception messages from
+cryptographic or filesystem loaders that might contain paths or operator
+configuration. Do not log the original PFX error as a workaround.
+
+This does **not** relax the existing path, certificate-validity, private
+key, maximum historical certificate count, encrypted key ring or
+multi-instance portability requirements. A failure is still a startup
+failure; it never silently falls back to plaintext or ephemeral keys.
+Keep the directory and PFX permissions, secure distribution, certificate
+rotation, secure alerting and real disaster-recovery validation under
+operator control (#21). New xUnit regressions exercise wrong passwords
+and corrupted PFX on **both** active and previous-certificate paths,
+with fixed error message, no `InnerException` and no secret path/password
+in `ToString()`. Valid key-ring rotation and portability tests are
+unchanged.

@@ -95,8 +95,12 @@ public static class PersistentDataProtection
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
                                   or System.Security.Cryptography.CryptographicException)
         {
+            // The underlying crypto/filesystem exception can carry a path,
+            // certificate metadata or other operator-provided details.
+            // Never retain it as InnerException: host startup loggers and
+            // crash reports commonly serialize Exception.ToString().
             throw new InvalidOperationException(
-                "Unable to load the configured Data Protection PFX certificate.", ex);
+                "Unable to load the configured Data Protection PFX certificate.");
         }
 
         if (!certificate.HasPrivateKey ||

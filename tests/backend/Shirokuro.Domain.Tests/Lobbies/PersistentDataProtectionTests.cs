@@ -129,6 +129,76 @@ public sealed class PersistentDataProtectionTests
         Assert.Throws<InvalidOperationException>(() => Provider(Config(settings)));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WrongPfxPasswordDoesNotExposeOperatorConfigurationInExceptionGraph(
+        bool previousCertificate)
+    {
+        using var ring = new KeyRingFiles();
+        var settings = ring.Settings();
+        const string untrustedPassword = "private-key-passphrase-not-for-logs";
+        if (previousCertificate)
+        {
+            settings["Security:DataProtection:PreviousCertificates:0:Path"] =
+                ring.CertificatePath;
+            settings["Security:DataProtection:PreviousCertificates:0:Password"] =
+                untrustedPassword;
+        }
+        else
+            settings["Security:DataProtection:CertificatePassword"] =
+                untrustedPassword;
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            Provider(Config(settings)));
+        Assert.Equal(
+            "Unable to load the configured Data Protection PFX certificate.",
+            error.Message);
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain(untrustedPassword, error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(ring.Password, error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(ring.Folder, error.ToString(),
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CorruptPfxHasSanitizedErrorForCurrentAndPreviousCerts(
+        bool previousCertificate)
+    {
+        using var ring = new KeyRingFiles();
+        const string secretMarker = "confidential-cert-filename-marker";
+        var damagedPath = Path.Combine(ring.Folder,
+            secretMarker + ".pfx");
+        File.WriteAllText(damagedPath, "not a PKCS12 certificate");
+        var settings = ring.Settings();
+        if (previousCertificate)
+        {
+            settings["Security:DataProtection:PreviousCertificates:0:Path"] =
+                damagedPath;
+            settings["Security:DataProtection:PreviousCertificates:0:Password"] =
+                ring.Password;
+        }
+        else
+            settings["Security:DataProtection:CertificatePath"] = damagedPath;
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            Provider(Config(settings)));
+        Assert.Equal(
+            "Unable to load the configured Data Protection PFX certificate.",
+            error.Message);
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain(secretMarker, error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(ring.Folder, error.ToString(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(ring.Password, error.ToString(),
+            StringComparison.Ordinal);
+    }
+
     [Fact]
     public void SharedEncryptedRingWorksAcrossIndependentServiceProvidersAndRestarts()
     {
