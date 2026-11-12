@@ -409,7 +409,7 @@ public sealed class GuestLobbyHttpTests
     {
         using var server = Server().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
-                services.AddSingleton<IStartupFilter, TestPeerAddressStartupFilter>()));
+                services.AddSingleton<IStartupFilter>(new TestPeerAddressStartupFilter())));
         using var client = Client(server);
         var ipv4 = IPAddress.Parse("198.51.100.92");
         var mapped = IPAddress.Parse("::ffff:198.51.100.92");
