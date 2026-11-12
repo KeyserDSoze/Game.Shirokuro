@@ -538,6 +538,14 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
         {
             return Results.NotFound();
         }
+        catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (RedisException)
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
     }).RequireAuthorization();
 
 // Server-owned guest room mutations, with CSRF and revision controls.

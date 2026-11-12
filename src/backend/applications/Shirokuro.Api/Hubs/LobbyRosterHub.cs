@@ -49,6 +49,14 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
             // Indistinguishable responses to hidden/absent lobbies and non-members.
             throw new HubException("Lobby unavailable.");
         }
+        catch (OperationCanceledException) when (!Context.ConnectionAborted.IsCancellationRequested)
+        {
+            throw new HubException("Lobby unavailable.");
+        }
+        catch (StackExchange.Redis.RedisException)
+        {
+            throw new HubException("Lobby unavailable.");
+        }
     }
 }
 

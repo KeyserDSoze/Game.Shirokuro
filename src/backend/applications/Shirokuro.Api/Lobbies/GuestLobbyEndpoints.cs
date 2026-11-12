@@ -35,7 +35,7 @@ public static class GuestLobbyEndpoints
                 var roster = await lobby.CreateAsync(actor!, request.TeamIds,
                     request.TeamId, context.RequestAborted);
                 return Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster);
-            });
+            }, context.RequestAborted);
         });
         createRoom.WithMetadata(
             new GuestMutationRateLimit(GuestMutationKind.RoomCreation));
@@ -48,7 +48,8 @@ public static class GuestLobbyEndpoints
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
             return await Respond(async () => Results.Ok(await lobby.JoinAsync(
-                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)));
+                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
+                context.RequestAborted);
         });
 
         route.MapPatch("/{roomId}/hero", async (string roomId, ChooseHeroRequest request,
@@ -57,7 +58,8 @@ public static class GuestLobbyEndpoints
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
             return await Respond(async () => Results.Ok(await lobby.ChooseHeroAsync(
-                roomId, actor!, request.HeroId, request.ExpectedRevision, context.RequestAborted)));
+                roomId, actor!, request.HeroId, request.ExpectedRevision, context.RequestAborted)),
+                context.RequestAborted);
         });
 
         route.MapPatch("/{roomId}/team", async (string roomId, ChangeTeamRequest request,
@@ -66,7 +68,8 @@ public static class GuestLobbyEndpoints
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
             return await Respond(async () => Results.Ok(await lobby.ChangeTeamAsync(
-                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)));
+                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
+                context.RequestAborted);
         });
 
         route.MapDelete("/{roomId}/membership", async (string roomId, [FromBody] LeaveRoomRequest request,
@@ -79,7 +82,7 @@ public static class GuestLobbyEndpoints
                 await lobby.LeaveAsync(roomId, actor!, request.ExpectedRevision,
                     context.RequestAborted);
                 return Results.NoContent();
-            });
+            }, context.RequestAborted);
         });
     }
 
@@ -92,7 +95,8 @@ public static class GuestLobbyEndpoints
                playerId is not null && GuestSessions.IsGuest(context.User);
     }
 
-    private static async Task<IResult> Respond(Func<Task<IResult>> execute)
+    private static async Task<IResult> Respond(
+        Func<Task<IResult>> execute, CancellationToken cancellationToken)
     {
         try
         {
@@ -117,6 +121,15 @@ public static class GuestLobbyEndpoints
         catch (InvalidOperationException)
         {
             return Results.Conflict(new { code = "lobby_state_conflict" });
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Never confirm a Redis mutation whose result is unknown.
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (StackExchange.Redis.RedisException)
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
     }
 }
