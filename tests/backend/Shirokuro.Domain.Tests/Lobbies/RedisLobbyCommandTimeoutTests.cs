@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Reflection;
+using System.Text;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -128,6 +130,123 @@ public sealed class RedisLobbyCommandTimeoutTests
 
         Assert.Equal(32, controller.Reads);
         Assert.Equal(32, controller.CasCalls);
+    }
+
+    public class CorruptSnapshotDatabase : DispatchProxy
+    {
+        public byte[] Raw { get; set; } = [];
+        private int _reads;
+        public int Reads => Volatile.Read(ref _reads);
+        public int Mutations { get; private set; }
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            if (method?.Name == "StringGetAsync")
+            {
+                Interlocked.Increment(ref _reads);
+                return Task.FromResult((RedisValue)Raw);
+            }
+            Mutations++;
+            throw new InvalidOperationException(
+                "The corrupt record must never trigger a Redis mutation.");
+        }
+    }
+
+    [Theory]
+    [InlineData("truncated")]
+    [InlineData("bad-version")]
+    [InlineData("oversized")]
+    public async Task UndecodableRedisRoomFailsClosedWithoutChangingItsSnapshot(
+        string failure)
+    {
+        var database = DispatchProxy.Create<IDatabase, CorruptSnapshotDatabase>();
+        var controller = (CorruptSnapshotDatabase)(object)database;
+        var roomId = "room-" + Guid.NewGuid().ToString("N");
+        var playerId = GuestSessions.NewPlayerId();
+        var valid = LobbyState.Create(
+            new LobbyDefinition(roomId, ["white", "black"], ["kira"]))
+            .Join(playerId, "white", 0);
+        var encoded = RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(valid, DateTimeOffset.UtcNow, playerId, true));
+
+        controller.Raw = failure switch
+        {
+            "truncated" => Encoding.UTF8.GetBytes("{\"Version\":2,\"LobbyId\":"),
+            "oversized" => new byte[RedisLobbySnapshotCodec.MaxBytes + 1],
+            "bad-version" => BadVersion(encoded),
+            _ => throw new ArgumentException("Invalid test case.", nameof(failure))
+        };
+
+        static byte[] BadVersion(byte[] bytes)
+        {
+            var json = JsonNode.Parse(Encoding.UTF8.GetString(bytes))!.AsObject();
+            json["Version"] = 999;
+            return Encoding.UTF8.GetBytes(json.ToJsonString());
+        }
+
+        var clock = TimeProvider.System;
+        var store = new RedisLobbySnapshotStore(database, clock);
+        var error = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.ReadAsync(roomId));
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain(roomId, error.Message);
+        Assert.DoesNotContain(playerId, error.Message);
+        Assert.DoesNotContain("Redis", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, controller.Reads);
+        Assert.Equal(0, controller.Mutations);
+
+        var runtime = new RedisGuestLobbyRuntime(store, clock);
+        await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => runtime.ForMemberAsync(roomId, playerId));
+        Assert.Equal(2, controller.Reads);
+        Assert.Equal(0, controller.Mutations);
+    }
+
+    [Fact]
+    public async Task CorruptedRedisRoomReturnsUncached503OnReadAndAllMutations()
+    {
+        var database = DispatchProxy.Create<IDatabase, CorruptSnapshotDatabase>();
+        var controller = (CorruptSnapshotDatabase)(object)database;
+        controller.Raw = Encoding.UTF8.GetBytes("{not valid json}");
+        using var host = Production(database);
+        using var visitor = Client(host);
+        var cookie = await Login(visitor);
+        using var guest = Client(host, cookie);
+
+        const string id = "room-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        using (var roster = await guest.GetAsync("/api/lobbies/" + id + "/roster"))
+            AssertSanitized503(roster);
+
+        foreach (var (method, suffix, body) in new[]
+                 {
+                     (HttpMethod.Post, "/join", (object)new
+                         { teamId = "white", expectedRevision = 1 }),
+                     (HttpMethod.Patch, "/hero", (object)new
+                         { heroId = "kira", expectedRevision = 1 }),
+                     (HttpMethod.Patch, "/team", (object)new
+                         { teamId = "black", expectedRevision = 1 }),
+                     (HttpMethod.Delete, "/membership", (object)new
+                         { expectedRevision = 1 })
+                 })
+        {
+            using var request = new HttpRequestMessage(
+                method, "/api/lobbies/" + id + suffix);
+            request.Headers.Add("Origin", "https://game.example");
+            request.Headers.Add("X-Shirokuro-Request", "1");
+            request.Content = JsonContent.Create(body);
+            using var response = await guest.SendAsync(request);
+            AssertSanitized503(response);
+        }
+
+        Assert.Equal(5, controller.Reads);
+        Assert.Equal(0, controller.Mutations);
+
+        static void AssertSanitized503(HttpResponseMessage response)
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+        }
     }
 
     private static (IDatabase Database, NeverRespondingDatabase Controller)
