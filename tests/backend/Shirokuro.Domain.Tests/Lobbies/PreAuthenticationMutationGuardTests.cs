@@ -8,6 +8,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shirokuro.Api.Security;
+using Shirokuro.Api.Readiness;
 using Xunit;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
@@ -84,8 +85,17 @@ public sealed class PreAuthenticationMutationGuardTests
         (HttpMethod.Delete, "/api/lobbies/room-00000000000000000000000000000000/membership")
     ];
 
+    private sealed class ReadyProbe : IDeploymentReadiness
+    {
+        public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(true);
+        }
+    }
+
     private static WebApplicationFactory<Program> Production(
-        CountingCache cache, CountingLimiter limiter) =>
+        CountingCache cache, CountingLimiter limiter, bool stubReadiness = false) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -101,6 +111,11 @@ public sealed class PreAuthenticationMutationGuardTests
             {
                 services.RemoveAll<IGuestMutationLimiter>();
                 services.AddSingleton<IGuestMutationLimiter>(limiter);
+                if (stubReadiness)
+                {
+                    services.RemoveAll<IDeploymentReadiness>();
+                    services.AddSingleton<IDeploymentReadiness, ReadyProbe>();
+                }
             });
         });
 
@@ -246,5 +261,36 @@ public sealed class PreAuthenticationMutationGuardTests
             // handler input validation/membership checks.
             Assert.NotEqual(HttpStatusCode.Forbidden, response.StatusCode);
         }
+    }
+
+    [Fact]
+    public async Task PublicProbesWithGuestCookieNeverAskUnavailableRedisForAuthentication()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter, stubReadiness: true);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        cache.Unavailable = true;
+
+        // The signed cookie is attached, but neither public probe needs
+        // to identify its visitor. Stub readiness isolates cookie auth.
+        foreach (var route in new[] { "/api/health", "/api/ready" })
+        {
+            using var probe = await guest.GetAsync(route);
+            Assert.Equal(HttpStatusCode.OK, probe.StatusCode);
+            Assert.False(probe.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls); // Only initial issuance.
+
+        // The protected API still revalidates this exact guest cookie
+        // and fails closed if authoritative Redis is down.
+        using var restricted = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, restricted.StatusCode);
+        Assert.Equal("no-store", restricted.Headers.CacheControl?.ToString());
+        Assert.False(restricted.Headers.Contains("Set-Cookie"));
+        Assert.Equal(1, cache.Reads);
     }
 }
