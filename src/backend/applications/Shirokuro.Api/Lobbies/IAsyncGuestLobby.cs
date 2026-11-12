@@ -43,3 +43,11 @@ public interface IAsyncGuestLobby
 /// </summary>
 public sealed class LobbyReadContentionException()
     : Exception("Lobby roster temporarily unavailable under contention.");
+
+/// <summary>
+/// Redis returned persisted lobby bytes that cannot be decoded as an
+/// authoritative, versioned room snapshot. Do not attach the decoder
+/// exception, key, ID or raw bytes to transport-visible diagnostics.
+/// </summary>
+public sealed class LobbySnapshotUnavailableException()
+    : Exception("Persisted lobby snapshot unavailable.");
