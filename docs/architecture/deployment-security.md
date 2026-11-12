@@ -1524,6 +1524,30 @@ attacker who owns many IPv4 addresses, multiple IPv6 /64 prefixes or a
 distributed network. Keep WAF/edge controls, proxy configuration, detection
 and account-grade identity policy under the open umbrella issue #21.
 
+## Corrupt Redis guest admission buckets fail closed (#96)
+
+An existing Redis quota bucket is persisted input, not trusted merely because
+its key has the expected SHA-256 name. The Production/Staging limiter now
+checks inside its atomic Lua script that the stored counter is a **canonical
+positive decimal integer within the policy limit** and its TTL is **strictly
+positive and at most 60 seconds**. Negative, zero, fractional, noncanonical,
+nonnumeric, over-limit, never-expiring and anomalously extended counters
+cannot grant new guest sessions or room creations. Missing keys still create
+fresh 60-second windows; healthy counters still yield normal increments or
+429 without sliding the expiry. This does not change the IPv4/IPv6 /64 key
+derivation, per-policy quota or trusted proxy configuration.
+
+A corrupted bucket returns an **opaque 503/no-store** and no new cookie or
+lobby. It is **not repaired, deleted or renewed automatically**: treating
+damage as a reset could award fresh quota to an abusive source. Operators
+should investigate Redis integrity/health and reconcile or delete only the
+affected hashed bucket using access-controlled incident procedures, or let a
+finite TTL expire. Do not log or disclose raw counter values, remote IPs,
+session IDs or hashed Redis keys. One damaged shared IPv6 /64 or IPv4 NAT
+bucket may temporarily deny legitimate guests; alerting and manual repair
+belong to operational policy. External HA, multi-network Sybil defenses and
+edge anti-bot protections remain open in #21.
+
 ## Sanitized Data Protection PFX startup failures (#66)
 
 Production and Staging Data Protection keys still require an operator-managed
