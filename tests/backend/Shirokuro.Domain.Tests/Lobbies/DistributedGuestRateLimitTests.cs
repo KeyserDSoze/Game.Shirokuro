@@ -37,6 +37,14 @@ public sealed class DistributedGuestRateLimitTests
         var ipv4 = IPAddress.Parse("192.0.2.41");
         var mapped = IPAddress.Parse("::ffff:192.0.2.41");
         var ipv6 = IPAddress.Parse("2001:db8::42");
+        var same64 = IPAddress.Parse("2001:db8::ffff:abcd:1234:5678");
+        var other64 = IPAddress.Parse("2001:db8:0:1::42");
+        Assert.Equal(RedisGuestMutationLimiter.Key(session, ipv6),
+            RedisGuestMutationLimiter.Key(session, same64));
+        Assert.NotEqual(RedisGuestMutationLimiter.Key(session, ipv6),
+            RedisGuestMutationLimiter.Key(session, other64));
+        Assert.NotEqual(RedisGuestMutationLimiter.Key(session, ipv4),
+            RedisGuestMutationLimiter.Key(session, ipv6));
         Assert.Equal(RedisGuestMutationLimiter.Key(session, ipv4),
             RedisGuestMutationLimiter.Key(session, mapped));
         Assert.NotEqual(RedisGuestMutationLimiter.Key(session, ipv4),
@@ -76,6 +84,45 @@ public sealed class DistributedGuestRateLimitTests
             Assert.True(independent.Allowed);
             var other = await two.AcquireAsync(policy, IPAddress.Parse("198.51.100.35"));
             Assert.True(other.Allowed);
+        }
+    }
+
+    [Fact]
+    public async Task NativeIpv6InterfaceRotationSharesBothRealRedisBudgetsAcrossNodes()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var fingerprint = Guid.NewGuid().ToString("N");
+            var network = $"2001:db8:{fingerprint[..4]}:{fingerprint[4..8]}";
+            var first = IPAddress.Parse(network + "::1");
+            var rotated = IPAddress.Parse(network + ":abcd:ef01::2");
+            var otherBytes = first.GetAddressBytes();
+            otherBytes[7] ^= 1; // A distinct /64, even on the boundary.
+            var other = new IPAddress(otherBytes);
+            var one = new RedisGuestMutationLimiter(a.GetDatabase());
+            var two = new RedisGuestMutationLimiter(b.GetDatabase());
+
+            foreach (var (kind, limit) in new[]
+                     {
+                         (GuestMutationKind.SessionIssuance, 12),
+                         (GuestMutationKind.RoomCreation, 8)
+                     })
+            {
+                var policy = new GuestMutationRateLimit(kind);
+                var decisions = await Task.WhenAll(
+                    Enumerable.Range(0, 32).Select(i =>
+                        (i % 2 == 0 ? one : two).AcquireAsync(
+                            policy, i % 2 == 0 ? first : rotated)));
+                Assert.Equal(limit, decisions.Count(x => x.Allowed));
+                Assert.Equal(32 - limit, decisions.Count(x => !x.Allowed));
+                Assert.All(decisions, x =>
+                    Assert.InRange(x.RetryAfterMilliseconds, 1, 60000));
+                Assert.False((await one.AcquireAsync(policy, rotated)).Allowed);
+                Assert.True((await two.AcquireAsync(policy, other)).Allowed);
+            }
         }
     }
 
@@ -266,6 +313,29 @@ public sealed class DistributedGuestRateLimitTests
                 "198.51.100.121")).Response.StatusCode);
             Assert.Equal(200, (await Issue(serverA, "192.0.2.10",
                 "198.51.100.122")).Response.StatusCode);
+
+            // A verified proxy may forward native IPv6 addresses, but
+            // rotating the /64 interface identifier cannot reset the
+            // distributed admission budget across the two API instances.
+            var fingerprint = Guid.NewGuid().ToString("N");
+            var network = $"2001:db8:{fingerprint[..4]}:{fingerprint[4..8]}";
+            var v6a = IPAddress.Parse(network + "::1");
+            var v6b = IPAddress.Parse(network + ":abcd:ef01::2");
+            var otherNetworkBytes = v6a.GetAddressBytes();
+            otherNetworkBytes[7] ^= 1;
+            var v6OtherNetwork = new IPAddress(otherNetworkBytes);
+            for (var i = 0; i < 12; i++)
+            {
+                var ip = i % 2 == 0 ? v6a : v6b;
+                var response = await Issue(i % 2 == 0 ? serverA : serverB,
+                    "192.0.2.10", ip.ToString());
+                Assert.Equal(200, response.Response.StatusCode);
+                Assert.Equal(ip, response.Connection.RemoteIpAddress);
+            }
+            Assert.Equal(429, (await Issue(serverB, "192.0.2.10",
+                v6b.ToString())).Response.StatusCode);
+            Assert.Equal(200, (await Issue(serverA, "192.0.2.10",
+                v6OtherNetwork.ToString())).Response.StatusCode);
 
             // Untrusted TCP peers cannot change their partition by
             // supplying arbitrary XFF headers.

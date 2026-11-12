@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using StackExchange.Redis;
 
@@ -88,6 +89,12 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         var canonicalIp = remoteIp?.IsIPv4MappedToIPv6 == true
             ? remoteIp.MapToIPv4() : remoteIp;
         var address = canonicalIp?.GetAddressBytes() ?? [0xff];
+        // A native IPv6 device can rotate the lower 64 interface-ID bits
+        // without changing its delegated network. Charge the stable /64
+        // instead; keep native/mapped IPv4 and missing-IP keys unchanged.
+        // Only the SHA-256 digest, never the raw prefix, enters Redis.
+        if (canonicalIp?.AddressFamily == AddressFamily.InterNetworkV6)
+            address = address[..8];
         var digest = Convert.ToHexStringLower(SHA256.HashData(address));
         var scope = policy.Kind == GuestMutationKind.SessionIssuance
             ? "sessions" : "rooms";

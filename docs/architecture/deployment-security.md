@@ -1498,6 +1498,32 @@ admission check is separate from downstream guest/session/lobby Redis
 availability, from the read-only observer (#63), and from the real-world
 network HA/abuse controls still open in #21.
 
+## IPv6 /64 anti-abuse admission partitions (#95)
+
+The shared non-Development Redis guest session-issuance (12/min) and room
+creation (8/min) limiters now charge **native IPv6 addresses by their /64
+network prefix**, rather than by the full 128-bit address. Rotating the
+interface identifier inside one /64 therefore cannot obtain new permits.
+Different /64 prefixes retain separate budgets; the two endpoint policies
+remain separate. The Redis key contains only SHA-256 of the binary network
+prefix, never raw IPv6. Native IPv4, IPv4-mapped IPv6, and unknown-address
+partitioning remain byte-for-byte unchanged; the existing key namespace is
+kept for backwards compatibility with IPv4 quotas.
+
+This change affects only the Redis admission limiter in Production/Staging.
+The trusted proxy list and forwarded-header sanitization still govern the
+remote IP; client-provided XFF from an untrusted peer cannot choose a quota
+partition. During deployment, **roll all API nodes to the same version
+together**: older nodes hash full IPv6 addresses and newer nodes hash /64,
+temporarily yielding separate budgets until the fleet converges. Monitor
+aggregate 429/503 admission metrics and adapt edge controls separately.
+
+A /64 is **not** a verified person, home, device or abuse-proof identity.
+It can group unrelated users (e.g., shared networks) and cannot stop an
+attacker who owns many IPv4 addresses, multiple IPv6 /64 prefixes or a
+distributed network. Keep WAF/edge controls, proxy configuration, detection
+and account-grade identity policy under the open umbrella issue #21.
+
 ## Sanitized Data Protection PFX startup failures (#66)
 
 Production and Staging Data Protection keys still require an operator-managed
