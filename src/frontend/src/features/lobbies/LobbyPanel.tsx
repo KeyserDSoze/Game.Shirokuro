@@ -76,95 +76,84 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     return () => { active = false }
   }, [])
 
-  // A tab opened before another tab's guest sign-in has no session yet.
-  // It still needs to hear the opaque cross-tab signal (or regain focus)
-  // and ask the server for the browser's current cookie identity. Never
-  // auto-issue a guest or accept identity/room data from BroadcastChannel.
+  // A tab can be signed out or signed in when another tab changes its
+  // cookie. Every signal only asks the server for the *current* identity;
+  // no guest, invite, roster or cookie data is accepted over the channel.
   useEffect(() => {
-    if (session) return
-
     let active = true
-    const recheckWithoutSession = () => {
-      const generation = sessionGenerationRef.current
-      void guestLobbyApi.session()
-        .then(identity => {
-          if (!active || generation !== sessionGenerationRef.current ||
-              identity.kind !== 'guest') return
-          // Invalidate old /me or sign-in completions before adopting the
-          // newly verified guest; no private room state crosses this boundary.
-          sessionGenerationRef.current++
-          setRoom(null)
-          setInvite('')
-          setSession(identity)
-          setMessage(t('lobbySessionChanged'))
-        })
-        // 401: still signed out; 503/offline: no proof of any identity.
-        // Keep the explicit guest sign-in button without creating a cookie.
-        .catch(() => {})
-    }
-    const onVisible = () => {
-      if (!document.hidden) recheckWithoutSession()
-    }
-    const channel = sessionChannelRef.current
-    window.addEventListener('focus', recheckWithoutSession)
-    document.addEventListener('visibilitychange', onVisible)
-    channel?.addEventListener('message', recheckWithoutSession)
-    return () => {
-      active = false
-      window.removeEventListener('focus', recheckWithoutSession)
-      document.removeEventListener('visibilitychange', onVisible)
-      channel?.removeEventListener('message', recheckWithoutSession)
-    }
-  }, [session, t])
+    let inFlight = false
+    let pendingRecheck = false
 
-  useEffect(() => {
-    if (!session) return
-
-    let active = true
-    const recheckOnFocus = () => {
-      // A late /me response for an earlier identity must not invalidate or
-      // restore a guest who authenticated while the read was pending.
+    const recheck = () => {
+      if (!active) return
+      if (inFlight) {
+        // Coalesce bursts of focus/visibility/BC events, but don't lose a
+        // logout/login that occurs while the first /me read is outstanding.
+        // Exactly one trailing read is sufficient for any pending burst.
+        pendingRecheck = true
+        return
+      }
+      inFlight = true
       const generation = sessionGenerationRef.current
-      // Another tab can sign out or replace the cookie while this tab keeps
-      // a room visible. Query the server on focus; never auto-issue a guest.
       void guestLobbyApi.session()
         .then(identity => {
           if (!active || generation !== sessionGenerationRef.current) return
-          if (identity.kind !== 'guest') {
+          if (!session) {
+            if (identity.kind !== 'guest') return
+            // Adopt only a newly server-verified signed guest. A stale read
+            // cannot overwrite a later login or import another tab's room.
+            sessionGenerationRef.current++
+            setRoom(null)
+            setInvite('')
+            setSession(identity)
+            setMessage(t('lobbySessionChanged'))
+          } else if (identity.kind !== 'guest') {
             forgetGuest()
             setMessage(t('lobbySessionExpired'))
           } else if (identity.playerId !== session.playerId) {
-            // Different server-issued identity must not inherit the previous
-            // guest's invite, room, roster or revision.
+            // A different guest can never inherit a previous room or roster.
             forgetGuest()
             setSession(identity)
             setMessage(t('lobbySessionChanged'))
           }
         })
         .catch(error => {
-          // A transient offline/503/403 response is not proof of revocation.
-          if (active && generation === sessionGenerationRef.current &&
+          // Only a confirmed 401 revokes an existing guest. A signed-out tab
+          // stays signed out, and 403/503/fetch failures never invent/logout
+          // an identity based on an unavailable server.
+          if (active && session &&
+              generation === sessionGenerationRef.current &&
               error instanceof LobbyHttpError && error.status === 401) {
             forgetGuest()
             setMessage(t('lobbySessionExpired'))
           }
         })
+        .finally(() => {
+          inFlight = false
+          if (active && pendingRecheck &&
+              generation === sessionGenerationRef.current) {
+            pendingRecheck = false
+            recheck()
+          }
+        })
     }
-    // Headless/embedded browsers may not reliably fire window.focus when
-    // tabs switch; visibilitychange and same-origin credential-free notices
-    // cover those cases without polling or persisting identity in storage.
     const onVisible = () => {
-      if (!document.hidden) recheckOnFocus()
+      if (!document.hidden) recheck()
+    }
+    // Ignore every non-protocol payload. The channel is a hint, never an
+    // identity authority or permission to consume unlimited Redis lookups.
+    const onMessage = (event: MessageEvent) => {
+      if (event.data === 'recheck') recheck()
     }
     const channel = sessionChannelRef.current
-    window.addEventListener('focus', recheckOnFocus)
+    window.addEventListener('focus', recheck)
     document.addEventListener('visibilitychange', onVisible)
-    channel?.addEventListener('message', recheckOnFocus)
+    channel?.addEventListener('message', onMessage)
     return () => {
       active = false
-      window.removeEventListener('focus', recheckOnFocus)
+      window.removeEventListener('focus', recheck)
       document.removeEventListener('visibilitychange', onVisible)
-      channel?.removeEventListener('message', recheckOnFocus)
+      channel?.removeEventListener('message', onMessage)
     }
   }, [session, forgetGuest, t])
 
