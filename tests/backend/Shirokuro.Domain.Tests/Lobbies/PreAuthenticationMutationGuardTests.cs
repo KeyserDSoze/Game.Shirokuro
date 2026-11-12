@@ -331,6 +331,67 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task ProductionHostileHubOriginsAreRejectedBeforeGuestRedisAuthority()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(1, limiter.Calls);
+        Assert.Equal(0, cache.Reads);
+
+        cache.Unavailable = true;
+        foreach (var (method, path) in new[]
+                 {
+                     (HttpMethod.Post, "/hubs/lobbies/negotiate?negotiateVersion=1"),
+                     (HttpMethod.Get, "/hubs/lobbies")
+                 })
+        {
+            foreach (var origin in new[]
+                     {
+                         "https://evil.example", "null", "https://game.example/path",
+                         "https://game.example, https://evil.example"
+                     })
+            {
+                using var request = new HttpRequestMessage(method, path);
+                request.Headers.TryAddWithoutValidation("Origin", origin);
+                using var denied = await guest.SendAsync(request);
+                AssertEarlyForbidden(denied);
+                Assert.Equal(0, cache.Reads); // Hostile Origin never reaches Redis.
+                Assert.Equal(1, limiter.Calls);
+            }
+        }
+
+        // A legitimate HTTPS Origin passes this fence, but Redis failure
+        // still fails closed. No cookie, sensitive error or roster leaks.
+        using (var trusted = new HttpRequestMessage(HttpMethod.Post,
+                   "/hubs/lobbies/negotiate?negotiateVersion=1"))
+        {
+            trusted.Headers.TryAddWithoutValidation("Origin", "https://game.example");
+            using var unavailable = await guest.SendAsync(trusted);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+            Assert.Equal("no-store", unavailable.Headers.CacheControl?.ToString());
+            Assert.False(unavailable.Headers.Contains("Set-Cookie"));
+            Assert.DoesNotContain("Private Redis",
+                await unavailable.Content.ReadAsStringAsync());
+        }
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // A valid signed guest still negotiates once the authority recovers.
+        cache.Unavailable = false;
+        using var recoveredRequest = new HttpRequestMessage(HttpMethod.Post,
+            "/hubs/lobbies/negotiate?negotiateVersion=1");
+        recoveredRequest.Headers.TryAddWithoutValidation("Origin", "https://game.example");
+        using var recovered = await guest.SendAsync(recoveredRequest);
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
     public async Task PublicProbesWithGuestCookieNeverAskUnavailableRedisForAuthentication()
     {
         var cache = new CountingCache();
