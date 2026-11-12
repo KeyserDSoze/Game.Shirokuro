@@ -132,6 +132,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     busyRef.current = true
     const generation = sessionGenerationRef.current
     const operation = ++operationRef.current
+    // Capture the room and identity that initiated this request. After a
+    // revision conflict only their authorized roster can be re-read.
+    const conflictRoomId = room?.lobbyId
+    const conflictPlayerId = session?.playerId
     const isCurrent = () =>
       generation === sessionGenerationRef.current &&
       operation === operationRef.current
@@ -150,6 +154,41 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           forgetGuest()
           setMessage(t('lobbySessionExpired'))
           return
+        }
+        if (error.status === 409 && conflictRoomId && conflictPlayerId) {
+          // Never replay a rejected mutation: read the new server revision
+          // once, then require a separate explicit player confirmation.
+          try {
+            const latest = await guestLobbyApi.read(conflictRoomId)
+            if (!isCurrent()) return
+            if (latest.lobbyId !== conflictRoomId ||
+                !latest.participants.some(p => p.playerId === conflictPlayerId)) {
+              setRoom(null)
+              setMessage(t('lobbyMissing'))
+              return
+            }
+            showRoom(latest)
+            setMessage(t('lobbyConflictRefreshed'))
+            return
+          } catch (refreshError) {
+            if (!isCurrent()) return
+            if (refreshError instanceof LobbyHttpError) {
+              if (refreshError.status === 401) {
+                forgetGuest()
+                setMessage(t('lobbySessionExpired'))
+                return
+              }
+              if (refreshError.status === 404) {
+                setRoom(null)
+                setMessage(t('lobbyMissing'))
+                return
+              }
+            }
+            // 403, 503 and offline are not evidence of session revocation.
+            // Keep the last known view but require a manual refresh.
+            setMessage(t('lobbyConflict'))
+            return
+          }
         }
         // A missing room is stale, but 403/429/503 do NOT prove logout.
         if (error.status === 404) setRoom(null)
