@@ -22,11 +22,19 @@ public sealed class RedisReplicationMonitoringTests
             new NullFileProvider();
     }
 
-    private static IConfiguration Settings(string? enabled) =>
+    private const string AppTls =
+        "localhost:6386,ssl=true,user=app,password=app-example-only";
+    private const string ObserverTls =
+        "localhost:6386,ssl=true,user=observer,password=other-example-only";
+
+    private static IConfiguration Settings(
+        string? enabled, string? observer = ObserverTls, string? app = AppTls) =>
         new ConfigurationBuilder().AddInMemoryCollection(
             new Dictionary<string, string?>
             {
-                [RedisReplicationMonitoring.EnabledKey] = enabled
+                [RedisReplicationMonitoring.EnabledKey] = enabled,
+                [RedisReplicationMonitoring.ConnectionStringKey] = observer,
+                [GuestSessionRedisConfiguration.ConnectionStringKey] = app
             }).Build();
 
     [Fact]
@@ -210,6 +218,11 @@ public sealed class RedisReplicationMonitoringTests
         }
 
         var enabledServices = new ServiceCollection();
+        var validated = RedisReplicationMonitoring.ReadRestrictedOptions(
+            Settings("true"));
+        Assert.False(validated.AllowAdmin);
+        Assert.Equal("observer", validated.User);
+        Assert.True(validated.Ssl);
         RedisReplicationMonitoring.Configure(enabledServices,
             Settings("true"), new EnvironmentStub(Environments.Production));
         Assert.Contains(enabledServices, service =>
@@ -217,6 +230,59 @@ public sealed class RedisReplicationMonitoringTests
         Assert.Contains(enabledServices, service =>
             service.ServiceType == typeof(IHostedService) &&
             service.ImplementationType == typeof(RedisReplicationMonitoringWorker));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("localhost:6386,ssl=false,user=observer,password=other")]
+    [InlineData("localhost:6386,ssl=true,user=default,password=other")]
+    [InlineData("localhost:6386,ssl=true,user=app,password=other")]
+    [InlineData("localhost:6386,ssl=true,user=observer,password=app-example-only")]
+    [InlineData("localhost:6386,ssl=true,user=observer,password=other,allowAdmin=true")]
+    [InlineData("localhost:6386,ssl=true,user=observer")]
+    [InlineData("localhost:6386,user=observer,password=other")]
+    public void UnsafeObserverConnectionFailsClosedWithoutLeakingConfiguration(
+        string? observer)
+    {
+        var services = new ServiceCollection();
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            RedisReplicationMonitoring.Configure(services,
+                Settings("true", observer),
+                new EnvironmentStub(Environments.Production)));
+        Assert.Equal(RedisReplicationMonitoring.InvalidConnection, error.Message);
+        Assert.DoesNotContain("app-example-only", error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("other-example-only", error.Message,
+            StringComparison.Ordinal);
+        Assert.Empty(services);
+    }
+
+    [Fact]
+    public void ObserverSentinelServiceNameMustMatchGameAndUseSeparateDiscoveryAuth()
+    {
+        var app = "localhost:26380,ssl=true,serviceName=game,user=app," +
+            "password=app-secret,sentinelUser=discovery,sentinelPassword=discovery-secret";
+        var mismatched = "localhost:26380,ssl=true,serviceName=other,user=observer," +
+            "password=observer-secret,sentinelUser=discovery,sentinelPassword=discovery-secret";
+        Assert.Equal(RedisReplicationMonitoring.InvalidConnection,
+            Assert.Throws<InvalidOperationException>(() =>
+                RedisReplicationMonitoring.ReadRestrictedOptions(
+                    Settings("true", mismatched, app))).Message);
+        var missingDiscovery = "localhost:26380,ssl=true,serviceName=game," +
+            "user=observer,password=observer-secret";
+        Assert.Equal(RedisReplicationMonitoring.InvalidConnection,
+            Assert.Throws<InvalidOperationException>(() =>
+                RedisReplicationMonitoring.ReadRestrictedOptions(
+                    Settings("true", missingDiscovery, app))).Message);
+        var valid = "localhost:26380,ssl=true,serviceName=game," +
+            "user=observer,password=observer-secret," +
+            "sentinelUser=discovery,sentinelPassword=discovery-secret";
+        var parsed = RedisReplicationMonitoring.ReadRestrictedOptions(
+            Settings("true", valid, app));
+        Assert.Equal("game", parsed.ServiceName);
+        Assert.Equal("observer", parsed.User);
+        Assert.Equal("discovery", parsed.SentinelUser);
+        Assert.False(parsed.AllowAdmin);
     }
 
     [Theory]
