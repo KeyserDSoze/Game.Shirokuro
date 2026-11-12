@@ -230,9 +230,15 @@ public sealed class RedisReplicationMonitoringTests
         var failure = Assert.Throws<InvalidOperationException>(() =>
             RedisReplicationMonitoring.Configure(services, Settings(value),
                 new EnvironmentStub(Environments.Production)));
+        // Short malformed values such as "on" are substrings of innocent
+        // framework words like "monitoring"; assert the fixed user-visible
+        // message rather than scanning test-runner stack frames.
         Assert.Equal(RedisReplicationMonitoring.InvalidConfiguration,
             failure.Message);
-        Assert.DoesNotContain(value, failure.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("RedisConnectionString", failure.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("password=", failure.Message,
+            StringComparison.OrdinalIgnoreCase);
         Assert.Empty(services);
     }
 }
