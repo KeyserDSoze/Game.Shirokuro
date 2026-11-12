@@ -1,4 +1,5 @@
 using System.IO;
+using System.Reflection;
 using System.Threading;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
@@ -170,6 +171,45 @@ public sealed class GuestExpiryBatchIsolationTests
         TimeProvider clock, Index index, IAsyncGuestLobby lobby, IGuestRevocationFence fence) =>
         new(new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
             clock, lobby, index, fence);
+
+    [Fact]
+    public async Task PoisonedLobbyIndexNeverAcknowledgesGuestExpiryAndRetries()
+    {
+        var clock = new ManualClock();
+        var guest = GuestSessions.NewPlayerId();
+        var index = new Index();
+        await index.ScheduleRevokedAsync(guest);
+        var database = DispatchProxy.Create<IDatabase,
+            RedisLobbyCommandTimeoutTests.IndexedRoomDatabase>();
+        var fixture =
+            (RedisLobbyCommandTimeoutTests.IndexedRoomDatabase)(object)database;
+        fixture.Members =
+            [(RedisValue)("guest-session:" + new string('a', 64))];
+
+        var store = new RedisLobbySnapshotStore(database, clock);
+        var lobby = new RedisGuestLobbyRuntime(store, clock);
+        var fence = new Fence();
+        using var worker = Worker(clock, index, lobby, fence);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => worker.SweepOnceAsync());
+        Assert.Equal("Guest expiry maintenance has retryable items.",
+            failure.Message);
+        Assert.DoesNotContain(guest, failure.ToString());
+        Assert.Single(index.Remaining);
+        Assert.Equal(0, index.AckCount);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
+        Assert.Equal([guest], fence.Calls);
+
+        // Once the tampered index is repaired, the same due work may be
+        // retried and acknowledged, without any ghost room deletion.
+        fixture.Members = [];
+        Assert.Equal(0, await worker.SweepOnceAsync());
+        Assert.Empty(index.Remaining);
+        Assert.Equal(1, index.AckCount);
+        Assert.Equal([guest, guest], fence.Calls);
+    }
 
     [Fact]
     public async Task FailedTargetedSessionDeletionLeavesEncryptedItemForRetry()

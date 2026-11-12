@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Hosting;
@@ -342,6 +343,165 @@ public sealed class RedisLobbyCommandTimeoutTests
             Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
             Assert.False(response.Headers.Contains("Set-Cookie"));
         }
+    }
+
+    /// <summary>
+    /// The capacity index is persisted Redis input, not permission to fetch
+    /// keys in other keyspaces. No actual Redis commands are issued by tests.
+    /// </summary>
+    public class IndexedRoomDatabase : DispatchProxy
+    {
+        public RedisValue[] Members { get; set; } = [];
+        public byte[]? Raw { get; set; }
+        public List<string> ReadKeys { get; } = [];
+        public int Writes { get; private set; }
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            return method?.Name switch
+            {
+                "SortedSetRangeByRankAsync" => Task.FromResult(Members),
+                "StringGetAsync" => Read(args),
+                _ => RejectWrite()
+            };
+        }
+
+        private Task<RedisValue> Read(object?[]? args)
+        {
+            ReadKeys.Add(((RedisKey)args![0]!).ToString());
+            return Task.FromResult(Raw is null
+                ? RedisValue.Null : (RedisValue)Raw);
+        }
+
+        private object RejectWrite()
+        {
+            Writes++;
+            throw new InvalidOperationException(
+                "Administrative index scan must never mutate Redis.");
+        }
+    }
+
+    public static string IndexedKeyForRoom(string roomId) =>
+        "shirokuro:lobby:{rooms}:v2:room:" +
+        Convert.ToHexStringLower(
+            SHA256.HashData(Encoding.UTF8.GetBytes(roomId)));
+
+    private static (string RoomId, string PlayerId, byte[] Encoded)
+        ValidIndexedRoom()
+    {
+        var roomId = "room-" + Guid.NewGuid().ToString("N");
+        var playerId = GuestSessions.NewPlayerId();
+        var state = LobbyState.Create(
+            new LobbyDefinition(roomId, ["white", "black"], ["kira"]))
+            .Join(playerId, "white", 0);
+        return (roomId, playerId, RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(state, DateTimeOffset.UtcNow,
+                playerId, QuotaTracked: true)));
+    }
+
+    [Theory]
+    [InlineData("another-authority")]
+    [InlineData("capacity-index")]
+    [InlineData("short-hash")]
+    [InlineData("uppercase-hash")]
+    [InlineData("other-namespace")]
+    [InlineData("extra-suffix")]
+    public async Task CorruptCapacityIndexCannotReadArbitraryRedisKeys(
+        string caseName)
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        var prefix = "shirokuro:lobby:{rooms}:v2:";
+        var hash = new string('a', 64);
+        var key = caseName switch
+        {
+            "another-authority" => "guest-session:" + hash,
+            "capacity-index" => prefix + "capacity:all",
+            "short-hash" => prefix + "room:abc",
+            "uppercase-hash" => prefix + "room:" + new string('A', 64),
+            "other-namespace" => "shirokuro:lobby:{else}:v2:room:" + hash,
+            "extra-suffix" => prefix + "room:" + hash + ":other",
+            _ => throw new ArgumentOutOfRangeException(nameof(caseName))
+        };
+        fixture.Members = [(RedisValue)key];
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var ex = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+
+        Assert.Null(ex.InnerException);
+        Assert.DoesNotContain(key, ex.Message);
+        Assert.DoesNotContain("Redis", ex.Message,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Theory]
+    [InlineData("truncated")]
+    [InlineData("missing-lobby-id")]
+    [InlineData("mismatched-lobby-id")]
+    [InlineData("bad-version")]
+    [InlineData("oversized")]
+    [InlineData("untracked")]
+    public async Task CorruptIndexedRoomCannotAuthorizeAdministrativeCleanup(
+        string caseName)
+    {
+        var (roomId, playerId, encoded) = ValidIndexedRoom();
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = [(RedisValue)IndexedKeyForRoom(roomId)];
+        var json = JsonNode.Parse(Encoding.UTF8.GetString(encoded))!.AsObject();
+        fixture.Raw = caseName switch
+        {
+            "truncated" => Encoding.UTF8.GetBytes("{\"LobbyId\":"),
+            "missing-lobby-id" => Encoding.UTF8.GetBytes("{}"),
+            "mismatched-lobby-id" => Modified("LobbyId",
+                "room-" + Guid.NewGuid().ToString("N")),
+            "bad-version" => Modified("Version", 999),
+            "oversized" => new byte[RedisLobbySnapshotCodec.MaxBytes + 1],
+            "untracked" => Modified("QuotaTracked", false),
+            _ => throw new ArgumentOutOfRangeException(nameof(caseName))
+        };
+
+        byte[] Modified(string property, object value)
+        {
+            json[property] = JsonValue.Create(value);
+            return Encoding.UTF8.GetBytes(json.ToJsonString());
+        }
+
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var failure = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+        Assert.Null(failure.InnerException);
+        Assert.DoesNotContain(roomId, failure.Message);
+        Assert.DoesNotContain(playerId, failure.Message);
+        Assert.DoesNotContain("Redis", failure.Message,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([IndexedKeyForRoom(roomId)], fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Fact]
+    public async Task ValidIndexedRoomsAndMissingExpiredKeysKeepExistingSemantics()
+    {
+        var (roomId, playerId, encoded) = ValidIndexedRoom();
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = [(RedisValue)IndexedKeyForRoom(roomId)];
+        fixture.Raw = encoded;
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var indexed = Assert.Single(await store.GetIndexedRoomsAsync());
+        Assert.Equal(roomId, indexed.Snapshot.State.Definition.LobbyId);
+        Assert.Equal(playerId, Assert.Single(
+            indexed.Snapshot.State.Participants).PlayerId);
+        Assert.True(indexed.Snapshot.QuotaTracked);
+        Assert.Equal([IndexedKeyForRoom(roomId)], fixture.ReadKeys);
+
+        fixture.ReadKeys.Clear();
+        fixture.Raw = null; // A room may expire between ZRANGE and GET.
+        Assert.Empty(await store.GetIndexedRoomsAsync());
+        Assert.Equal([IndexedKeyForRoom(roomId)], fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
     }
 
     private static (IDatabase Database, NeverRespondingDatabase Controller)

@@ -316,25 +316,61 @@ public sealed class RedisLobbySnapshotStore(
         foreach (var member in members)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var key = (RedisKey)member.ToString();
+            var key = member.ToString();
+            // This ZSET is persisted data, not authority to read arbitrary
+            // Redis keys. Check our exact room-key grammar before GET.
+            if (!IsIndexedRoomKey(key))
+                throw new LobbySnapshotUnavailableException();
+
             var raw = await AwaitRedisAsync(
-                () => database.StringGetAsync(key), cancellationToken);
+                () => database.StringGetAsync((RedisKey)key), cancellationToken);
             if (raw.IsNull)
                 continue; // Redis expiry can race this maintenance scan.
+
             var bytes = (byte[])raw!;
-            using var json = JsonDocument.Parse(bytes);
-            var id = json.RootElement.GetProperty("LobbyId").GetString()
-                ?? throw new InvalidDataException("Missing persisted lobby ID.");
-            if (!string.Equals(key.ToString(), RoomKey(id).ToString(),
-                    StringComparison.Ordinal))
-                throw new InvalidDataException("Persisted lobby key mismatch.");
-            var snapshot = RedisLobbySnapshotCodec.Decode(bytes, id);
-            if (!snapshot.QuotaTracked)
-                throw new InvalidDataException("Missing lobby capacity tracking.");
+            if (bytes.Length is 0 or > RedisLobbySnapshotCodec.MaxBytes)
+                throw new LobbySnapshotUnavailableException();
+
+            LobbySnapshot snapshot;
+            try
+            {
+                using var json = JsonDocument.Parse(bytes);
+                if (json.RootElement.ValueKind != JsonValueKind.Object ||
+                    !json.RootElement.TryGetProperty("LobbyId", out var lobbyId) ||
+                    lobbyId.ValueKind != JsonValueKind.String)
+                    throw new LobbySnapshotUnavailableException();
+
+                var id = lobbyId.GetString();
+                if (string.IsNullOrWhiteSpace(id) ||
+                    !string.Equals(key, RoomKey(id).ToString(),
+                        StringComparison.Ordinal))
+                    throw new LobbySnapshotUnavailableException();
+
+                snapshot = RedisLobbySnapshotCodec.Decode(bytes, id);
+                if (!snapshot.QuotaTracked)
+                    throw new LobbySnapshotUnavailableException();
+            }
+            catch (Exception error) when (error is JsonException or InvalidDataException)
+            {
+                // Indexed bytes are untrusted just like member roster reads.
+                // Do not expose keys, room IDs, JSON fragments or exceptions.
+                // The caller must retry cleanup; never silently skip/ack.
+                throw new LobbySnapshotUnavailableException();
+            }
+
             if (Remaining(snapshot) > TimeSpan.Zero)
                 result.Add(new Stored(snapshot, bytes));
         }
         return result;
+    }
+
+    private bool IsIndexedRoomKey(string key)
+    {
+        var roomPrefix = _prefix + "room:";
+        return key.Length == roomPrefix.Length + 64 &&
+               key.StartsWith(roomPrefix, StringComparison.Ordinal) &&
+               key.AsSpan(roomPrefix.Length).IndexOfAnyExcept(
+                   "0123456789abcdef") < 0;
     }
 
     private TimeSpan Remaining(LobbySnapshot snapshot)
