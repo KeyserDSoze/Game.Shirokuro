@@ -2,6 +2,7 @@ using System.Text;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
 using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Domain.Lobbies;
 using StackExchange.Redis;
@@ -42,6 +43,66 @@ public sealed class RedisLobbyQuotaStoreTests
         ConnectionMultiplexer redis, TimeProvider clock, string ns,
         TimeSpan? timeout = null) =>
         new(redis.GetDatabase(), clock, timeout, ns);
+
+    [Fact]
+    public async Task OversizedGlobalIndexMemberFailsClosedWithoutCopyingOrCleaningRooms()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "indexbytes-" + Guid.NewGuid().ToString("N");
+            var first = Store(a, clock, ns);
+            var second = Store(b, clock, ns);
+            var runtime = new RedisGuestLobbyRuntime(second, clock);
+            var alice = GuestSessions.NewPlayerId();
+            var bob = GuestSessions.NewPlayerId();
+            var room = await runtime.CreateAsync(
+                alice, ["white", "black"], "white");
+            await runtime.JoinAsync(room.LobbyId, bob, "black", room.Revision);
+            var before = (await first.ReadAsync(room.LobbyId))!.Snapshot;
+            Assert.Single(await first.GetIndexedRoomsAsync());
+
+            var db = a.GetDatabase();
+            var indexKey = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var key = Assert.Single(await db.SortedSetRangeByRankAsync(indexKey))
+                .ToString();
+            var score = await db.SortedSetScoreAsync(indexKey, key);
+            Assert.NotNull(score);
+            var oversized = new string('Z', 64 * 1024);
+            Assert.True(await db.SortedSetAddAsync(
+                indexKey, oversized, score!.Value + 1));
+            // The poisoned key sorts AFTER the valid key, so the complete
+            // index must be checked before reading even one room snapshot.
+            Assert.Equal(key,
+                (await db.SortedSetRangeByRankAsync(indexKey))[0].ToString());
+
+            var ex = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+                () => second.GetIndexedRoomsAsync());
+            Assert.Null(ex.InnerException);
+            Assert.DoesNotContain(oversized[..100], ex.Message);
+            Assert.DoesNotContain(alice, ex.Message);
+
+            await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+                () => runtime.RemovePlayerFromAllRoomsAsync(alice));
+            Assert.Equal(2, (await first.ReadAsync(room.LobbyId))!
+                .Snapshot.State.Participants.Count);
+            var damagedIndex = await db.SortedSetRangeByRankAsync(indexKey);
+            Assert.Equal(2, damagedIndex.Length);
+            Assert.Contains(damagedIndex, x => x.ToString() == oversized);
+
+            // Only authorized operator repair can remove the damaged
+            // index entry. The healthy room remains intact throughout.
+            Assert.True(await db.SortedSetRemoveAsync(indexKey, oversized));
+            Assert.Single(await second.GetIndexedRoomsAsync());
+            Assert.Equal(1, await runtime.RemovePlayerFromAllRoomsAsync(alice));
+            var after = (await first.ReadAsync(room.LobbyId))!.Snapshot;
+            Assert.Equal(bob, Assert.Single(after.State.Participants).PlayerId);
+            Assert.Equal(before.LastActivityUtc, after.LastActivityUtc);
+        }
+    }
 
     [Fact]
     public async Task RedisGlobalAndOwnerLimitsAreAtomicAcrossTwoIndependentClients()
