@@ -21,6 +21,8 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     private readonly HashSet<string> _pendingExpiredPlayerIds = new(StringComparer.Ordinal);
     private const string KeyPrefix = "guest-session:";
     private const int ValueLength = sizeof(long) + 32; // UTC ticks + SHA-256(player ID)
+    // Bounded client wait; does not cancel a Redis command already delivered.
+    public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
 
     /// <summary>Registers a random, server-issued token for local Development.</summary>
     public string Register(string trustedPlayerId, DateTimeOffset expiresUtc)
@@ -41,15 +43,19 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
         string trustedPlayerId, DateTimeOffset expiresUtc,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (sharedCache is null)
             return Register(trustedPlayerId, expiresUtc);
 
         ValidateRegistration(trustedPlayerId, expiresUtc);
         var token = NewToken();
-        await sharedCache.SetAsync(
+        // An uncertain Redis write never issues a guest cookie or local
+        // tracking entry. A delayed server-side SET can leave only an orphan
+        // ticket with an absolute TTL, not an authorized browser session.
+        await AwaitCacheAsync(sharedCache.SetAsync(
             SharedKey(token), Encode(trustedPlayerId, expiresUtc),
             new DistributedCacheEntryOptions { AbsoluteExpiration = expiresUtc },
-            cancellationToken);
+            cancellationToken), cancellationToken);
 
         // Do not issue local session state until the shared store accepted
         // the ticket. The worker still knows which identities originated here.
@@ -81,13 +87,16 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     public async Task<bool> IsActiveAsync(
         ClaimsPrincipal? principal, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (sharedCache is null)
             return IsActive(principal);
         if (!TryClaims(principal, out var token, out var playerId))
             return false;
         try
         {
-            var value = await sharedCache.GetAsync(SharedKey(token), cancellationToken);
+            var value = await AwaitCacheAsync(
+                sharedCache.GetAsync(SharedKey(token), cancellationToken),
+                cancellationToken);
             return Matches(value, playerId, clock.GetUtcNow());
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
@@ -103,7 +112,7 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     /// a raw browser token, never scans Redis and never deletes by player ID.
     /// This is called by recovery maintenance only after lobby fencing/CAS.
     /// </summary>
-    public Task RemoveRestoredSessionAsync(
+    public async Task RemoveRestoredSessionAsync(
         string trustedTokenDigest, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -115,8 +124,9 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
                 c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new ArgumentException("Invalid trusted session digest.",
                 nameof(trustedTokenDigest));
-        return sharedCache.RemoveAsync(KeyPrefix + trustedTokenDigest,
-            cancellationToken);
+        await AwaitCacheAsync(
+            sharedCache.RemoveAsync(KeyPrefix + trustedTokenDigest,
+                cancellationToken), cancellationToken);
     }
 
     /// <summary>Development-only revocation. Shared revocation is async.</summary>
@@ -138,23 +148,47 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     public async Task<bool> RevokeAsync(
         ClaimsPrincipal? principal, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (sharedCache is null)
             return Revoke(principal);
         if (!TryClaims(principal, out var token, out var playerId))
             return false;
 
         var key = SharedKey(token);
-        var value = await sharedCache.GetAsync(key, cancellationToken);
+        var value = await AwaitCacheAsync(
+            sharedCache.GetAsync(key, cancellationToken), cancellationToken);
         if (!Matches(value, playerId, clock.GetUtcNow()))
             return false;
 
         // Tokens are never reused: removing their unique key invalidates any
         // later validation in every node. Concurrent already-in-flight checks
         // may finish before this deletion, as with local revocation.
-        await sharedCache.RemoveAsync(key, cancellationToken);
+        // A timeout cannot confirm revocation. If Redis has already deleted
+        // the key, a subsequent request will fail auth; never report success
+        // based on a timed-out RemoveAsync.
+        await AwaitCacheAsync(sharedCache.RemoveAsync(key, cancellationToken),
+            cancellationToken);
         lock (_gate)
             _active.Remove(token);
         return true;
+    }
+
+    private static async Task AwaitCacheAsync(
+        Task operation, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        await operation.WaitAsync(timeout.Token);
+    }
+
+    private static async Task<T> AwaitCacheAsync<T>(
+        Task<T> operation, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        return await operation.WaitAsync(timeout.Token);
     }
 
     /// <summary>

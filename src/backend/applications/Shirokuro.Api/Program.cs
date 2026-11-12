@@ -422,7 +422,18 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     context.Response.Headers.CacheControl = "no-store";
     // Revoke on the server BEFORE the cookie is cleared client-side.
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
-    if (!await registry.RevokeAsync(context.User, context.RequestAborted))
+    bool revoked;
+    try
+    {
+        revoked = await registry.RevokeAsync(context.User, context.RequestAborted);
+    }
+    catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        // Unconfirmed Redis revocation is never a success or a raw 500.
+        // Don't sign out and don't claim the ticket was removed across nodes.
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    if (!revoked)
         return Results.Forbid();
 
     // The shared ticket is NOW invalid across nodes. Install the mutation

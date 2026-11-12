@@ -1579,3 +1579,34 @@ rotation and independent cleanup tests remain required. This is not an
 operational HA/queue-lag SLA or proof that every Redis outage is 2 seconds
 long; real monitoring/alerting, distributed identity and deployment remain
 in parent #21.
+
+## Bounded Redis guest session authority operations (#69)
+
+In Production/Staging, the **independent** Redis `IDistributedCache` is
+still the sole authority for browser guest cookies, subsequent HTTP requests
+and SignalR roster calls. All shared session operations now bound the
+**client-side wait per Redis command to 2 seconds**, linked to the original
+request/worker cancellation token: issuing a token (`SetAsync`), validating
+a session (`GetAsync`), revoking it (`GetAsync` then `RemoveAsync`), and
+deleting a trusted restored token digest during disaster recovery
+(`RemoveAsync`). A cancelled request does not start a new cache command.
+
+An **unconfirmed SET cannot issue a guest cookie** or mark a local session
+active; the existing endpoint returns sanitized `503` without `Set-Cookie`.
+If Redis cannot confirm the guest ticket on read, protected HTTP and
+SignalR authorization **fail closed** (no cached positive permissions).
+If either shared-cache revocation step fails/times out, guest logout now
+returns sanitized `503` instead of leaking a raw `500` or incorrectly
+claiming a confirmed logout with HTTP `204`. It does not clear the cookie
+until a revocation has actually completed, and it cannot re-grant access to
+an already deleted ticket. Existing cross-node session revocation, fenced
+lobby cleanup and encrypted expiry-index replay remain separate guarantees.
+
+**Crucial limitation:** abandoning the .NET await does not cancel a Redis
+command already delivered. A timed-out SET may later persist an orphan
+entry with its fixed TTL, but the application did not issue the secret
+cookie. A timed-out removal may complete asynchronously; retrying logout
+may then encounter an already revoked/unauthorized cookie. No optimistic
+fallback, immediate command retry or claim of rollback is introduced.
+This reduces stalled request costs; it is not a Redis deployment SLA and
+does not replace independent Redis server ACL/TLS/HA/alerts (#21).
