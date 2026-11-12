@@ -270,7 +270,14 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
-app.UseAuthentication();
+// Public liveness/readiness probes never consume a principal. A browser
+// can send a stale signed guest cookie automatically; validating it against
+// Redis would delay these probes during a session-authority outage.
+// Routing resolves server-owned metadata before this conditional branch.
+// Every protected API endpoint and SignalR still uses cookie authentication.
+app.UseWhen(
+    context => context.GetEndpoint()?.Metadata.GetMetadata<PublicProbeEndpoint>() is null,
+    branch => branch.UseAuthentication());
 app.UseAuthorization();
 
 // The two explicit POST endpoints alone carry admission-budget metadata.
@@ -332,7 +339,8 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }));
+app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }))
+    .WithMetadata(new PublicProbeEndpoint());
 
 // Liveness above is intentionally independent of Redis; the readiness route
 // is for load balancers and checks BOTH Redis connections plus Data Protection.
@@ -345,7 +353,7 @@ app.MapGet("/api/ready", async (HttpContext context, IDeploymentReadiness readin
         statusCode: ready
             ? StatusCodes.Status200OK
             : StatusCodes.Status503ServiceUnavailable);
-});
+}).WithMetadata(new PublicProbeEndpoint());
 
 // Ephemeral guests: identity comes solely from cryptographically random server bytes.
 var guestSessionIssuance = app.MapPost("/api/sessions/guest",
