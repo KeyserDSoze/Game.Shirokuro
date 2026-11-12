@@ -85,6 +85,34 @@ public sealed class RedisTlsProductionTests
     }
 
     [Fact]
+    public async Task ReadOnlyProductionReplicationMonitorUsesAuthenticatedTlsWithoutACollector()
+    {
+        if (Connection is null) return; // Dedicated TLS CI fixture.
+        using var capture = new MultiplayerMetricCapture();
+        using var server = Server();
+        using var client = Client(server);
+        using (var ready = await client.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
+
+        var sampler = new RedisReplicationSampler(
+            server.Services.GetRequiredService<IConnectionMultiplexer>());
+        await sampler.SampleOnceAsync();
+
+        Assert.Contains(
+            capture.For(MultiplayerMetrics.RedisReplicationObservationsName),
+            sample => sample.Tags["role"] == "master" &&
+                      sample.Tags["outcome"] == "ok" &&
+                      sample.Tags["link"] == "na");
+        Assert.Contains(
+            capture.ForDurations(MultiplayerMetrics.RedisConnectedReplicasName),
+            sample => sample.Seconds == 0 && sample.Tags.Count == 0);
+        Assert.Empty(capture.ForDurations(
+            MultiplayerMetrics.RedisReplicaAckLagSecondsName));
+        using var healthy = await client.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, healthy.StatusCode);
+    }
+
+    [Fact]
     public async Task TwoRealProductionNodesShareTlsSessionsReadinessRoomsAndLogoutFence()
     {
         if (Connection is null) return; // Dedicated TLS job always sets this.

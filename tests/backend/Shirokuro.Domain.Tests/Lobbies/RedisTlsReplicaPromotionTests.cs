@@ -223,6 +223,23 @@ public sealed class RedisTlsReplicaPromotionTests
         }
         Assert.True(replicated, "TLS replica never caught up with guest tokens.");
 
+        // Read the REAL Redis 7.4 INFO replication payload on both sides,
+        // not a fixture string. Extract only role/count/ACK delay. The
+        // primary can report connected replicas, while a replica only
+        // reports link status, and neither leaks its master_host/IP.
+        var masterSample = RedisReplicationInfo.Parse(
+            await RedisCliAsync(MasterContainer, "INFO", "replication"));
+        var replicaSample = RedisReplicationInfo.Parse(
+            await RedisCliAsync(ReplicaContainer, "INFO", "replication"));
+        Assert.Equal(RedisReplicationRole.Primary, masterSample.Role);
+        Assert.Equal(RedisReplicaLink.NotApplicable, masterSample.Link);
+        Assert.True(masterSample.ConnectedReplicas >= 1);
+        Assert.NotNull(masterSample.MaxOnlineAckLagSeconds);
+        Assert.Equal(RedisReplicationRole.Replica, replicaSample.Role);
+        Assert.Equal(RedisReplicaLink.Up, replicaSample.Link);
+        Assert.Null(replicaSample.ConnectedReplicas);
+        Assert.Null(replicaSample.MaxOnlineAckLagSeconds);
+
         // A replica can PING and serve existing GETs, but must NOT pass
         // readiness: both independent Production Redis connectors need a
         // short-lived WRITE, not just liveness/read access. This host is
@@ -267,6 +284,10 @@ public sealed class RedisTlsReplicaPromotionTests
             "REPLICAOF", "NO", "ONE"));
         var promoted = await RedisCliAsync(ReplicaContainer, "INFO", "replication");
         Assert.Contains("role:master", promoted, StringComparison.Ordinal);
+        var afterPromotion = RedisReplicationInfo.Parse(promoted);
+        Assert.Equal(RedisReplicationRole.Primary, afterPromotion.Role);
+        Assert.Equal(0, afterPromotion.ConnectedReplicas);
+        Assert.Null(afterPromotion.MaxOnlineAckLagSeconds);
         Assert.Equal("PONG", await RedisCliAsync(ReplicaContainer, "PING"));
 
         // Do NOT infer automatic reconnection or role rediscovery for an

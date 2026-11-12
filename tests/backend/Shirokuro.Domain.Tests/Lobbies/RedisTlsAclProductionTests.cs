@@ -86,6 +86,23 @@ public sealed class RedisTlsAclProductionTests
     }
 
     [Fact]
+    public async Task ScopedTlsAclCanReadReplicationInfoWithoutAdminOrKeys()
+    {
+        if (Connection is null) return;
+        var options = ConfigurationOptions.Parse(Connection);
+        Assert.True(options.Ssl);
+        Assert.False(options.AllowAdmin);
+        using var connection = await ConnectionMultiplexer.ConnectAsync(options);
+        using var capture = new MultiplayerMetricCapture();
+        await new RedisReplicationSampler(connection).SampleOnceAsync();
+        Assert.Contains(
+            capture.For(MultiplayerMetrics.RedisReplicationObservationsName),
+            sample => sample.Tags["role"] == "master" &&
+                      sample.Tags["outcome"] == "ok" &&
+                      sample.Tags["link"] == "na");
+    }
+
+    [Fact]
     public async Task TwoProductionNodesUseAuthenticatedTlsRedisForSessionsRoomsAndFence()
     {
         if (Connection is null) return; // Opt-in ephemeral ACL CI fixture.
