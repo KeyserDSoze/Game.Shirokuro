@@ -1732,3 +1732,28 @@ types, per-IP quota or network fallback have been introduced. xUnit
 covers seven already-cancelled calls, invariance of room quota/revision/
 participants, cancelled worker cleanup and normal valid-token behavior.
 Production Redis deadlines and guest session authorization are unchanged.
+
+## Cookie mutation guard before guest authentication (#75)
+
+All cookie-backed guest/lobby mutations now carry server-owned
+`WebMutationGuardRequired` endpoint metadata: guest issuance POST, guest
+logout DELETE and the full pre-match lobby POST/PATCH/DELETE route group.
+The Origin + `X-Shirokuro-Request: 1` intent guard runs **before**
+`UseAuthentication` and `UseAuthorization`, instead of just before the
+shared Redis rate limiter. An invalid, hostile, absent or malformed Origin
+or intent is rejected with **403 / Cache-Control: no-store**, without
+`Set-Cookie`, `Retry-After`, a guest Redis ticket lookup, or an
+admission-budget permit. Valid requests still authenticate against the
+independent Redis session authority and must pass all existing domain
+membership, CAS/fencing, and distributed quota controls. Endpoint handler
+guards are kept as defense in depth; the middleware never bases security
+on a client-supplied path or header claim about the endpoint type.
+
+Only **mutation endpoints** carry this metadata: health, readiness,
+`GET /api/sessions/me`, member roster reads and SignalR endpoints do not
+add an Origin requirement. Standard Development Vite origins and
+Production explicit HTTPS allowlists are unchanged. This change reduces
+avoidable Redis work on rejected cross-origin traffic; it is **not**
+proof of trust for arbitrary non-browser clients that can forge Origin and
+intent, nor a substitute for SameSite cookies, backend authentication,
+rate limits or operational WAF/anti-Sybil defenses (#21).

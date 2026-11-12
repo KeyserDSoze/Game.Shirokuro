@@ -251,18 +251,15 @@ if (app.Environment.IsDevelopment())
     app.UseCors("local-dev");
 }
 
-app.UseAuthentication();
-app.UseAuthorization();
-
-// Reject invalid cookie-backed POST intents BEFORE spending the shared
-// Redis (or Development local) admission budget. Previously the endpoint
-// guard ran only after the limiter: cross-origin traffic could deplete a
-// trusted client's per-IP quota and turn a CSRF rejection into 429/503.
-// Trusted metadata, not user input or path spellings, selects the two routes.
-// Keep the endpoint's own guard as defense in depth.
+// Endpoint routing selects trusted metadata before these middleware calls.
+// Invalid Origin/intent must be rejected BEFORE cookie authentication reads
+// the independent Redis guest session authority and BEFORE any shared or
+// Development per-IP mutation budget is spent. Every mutation carries the
+// marker; read-only API, health/readiness and SignalR remain unaffected.
+// Handler-level checks are intentionally retained as defense in depth.
 app.Use(async (context, next) =>
 {
-    if (context.GetEndpoint()?.Metadata.GetMetadata<GuestMutationRateLimit>()
+    if (context.GetEndpoint()?.Metadata.GetMetadata<WebMutationGuardRequired>()
             is not null &&
         !WebMutationGuard.Allows(context, app.Environment))
     {
@@ -273,9 +270,12 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
-// Routing/authorization have already selected a trusted endpoint. Only the
-// two explicit POST endpoints carry metadata, avoiding URL/case aliases
-// bypassing a path-based filter. Redis errors deny issuance/creation (503).
+app.UseAuthentication();
+app.UseAuthorization();
+
+// The two explicit POST endpoints alone carry admission-budget metadata.
+// Authorization still precedes the per-IP Redis limiter for authenticated
+// room creation. Failed Origin checks cannot spend Redis budget or auth reads.
 if (!app.Environment.IsDevelopment())
 {
     app.Use(async (context, next) =>
@@ -421,6 +421,7 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
 });
 // Metadata has only trusted enum values for both deployment modes.
 guestSessionIssuance.WithMetadata(
+    new WebMutationGuardRequired(),
     new GuestMutationRateLimit(GuestMutationKind.SessionIssuance));
 if (app.Environment.IsDevelopment())
     guestSessionIssuance.RequireRateLimiting("guest-session-issuance");
@@ -531,7 +532,7 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     }
 
     return Results.NoContent();
-}).RequireAuthorization();
+}).RequireAuthorization().WithMetadata(new WebMutationGuardRequired());
 
 
 // Read-only authenticated roster. Never accept a playerId from the request.

@@ -23,7 +23,12 @@ public static class GuestLobbyEndpoints
 {
     public static void MapGuestLobbyEndpoints(this IEndpointRouteBuilder app)
     {
-        var route = app.MapGroup("/api/lobbies").RequireAuthorization();
+        // Every route in this group mutates cookie-backed lobby state.
+        // The marker runs Origin/intent validation before cookie auth and
+        // before the POST create quota, without URL-based security routing.
+        var route = app.MapGroup("/api/lobbies")
+            .RequireAuthorization()
+            .WithMetadata(new WebMutationGuardRequired());
 
         var createRoom = route.MapPost("", async (CreateRoomRequest request, HttpContext context,
             IHostEnvironment environment, IAsyncGuestLobby lobby) =>

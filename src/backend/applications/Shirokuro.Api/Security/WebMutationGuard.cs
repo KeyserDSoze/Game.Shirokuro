@@ -4,6 +4,13 @@ using Microsoft.Extensions.Hosting;
 namespace Shirokuro.Api.Security;
 
 /// <summary>
+/// Server-owned endpoint marker for all cookie-backed write operations.
+/// Evaluated before authentication: untrusted Origin/intent must never
+/// trigger even a guest Redis ticket lookup.
+/// </summary>
+public sealed record WebMutationGuardRequired();
+
+/// <summary>
 /// Cookie-backed write protection. An arbitrary HTTP Host or forwarded Host
 /// is never a trust source: production origins require explicit configuration.
 /// </summary>
