@@ -331,6 +331,81 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task MalformedRoomIdsNeverSpendGuestRedisOrMutationQuota()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // The same signed guest whose Redis ticket cannot be checked is
+        // attached to each request. Impossible room codes must be rejected
+        // by SERVER-OWNED endpoint metadata before cookie authentication.
+        cache.Unavailable = true;
+        foreach (var bad in new[]
+                 {
+                     "room-1", "room-" + new string('A', 32),
+                     "room-" + new string('a', 31),
+                     "room-" + new string('a', 33),
+                     "room-" + new string('a', 31) + "-bad"
+                 })
+        {
+            using (var roster = await guest.GetAsync(
+                       "/api/lobbies/" + bad + "/roster"))
+            {
+                Assert.Equal(HttpStatusCode.NotFound, roster.StatusCode);
+                Assert.Equal("no-store", roster.Headers.CacheControl?.ToString());
+                Assert.False(roster.Headers.Contains("Set-Cookie"));
+            }
+
+            foreach (var (method, suffix) in new[]
+                     {
+                         (HttpMethod.Post, "/join"),
+                         (HttpMethod.Patch, "/hero"),
+                         (HttpMethod.Patch, "/team"),
+                         (HttpMethod.Delete, "/membership")
+                     })
+            {
+                using var request = Mutation(method,
+                    "/api/lobbies/" + bad + suffix, "https://game.example");
+                using var rejected = await guest.SendAsync(request);
+                Assert.Equal(HttpStatusCode.NotFound, rejected.StatusCode);
+                Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+                Assert.False(rejected.Headers.Contains("Set-Cookie"));
+                Assert.False(rejected.Headers.Contains("Retry-After"));
+            }
+            Assert.Equal(0, cache.Reads);
+            Assert.Equal(1, limiter.Calls);
+        }
+
+        // A canonically shaped but absent room still reaches the normal
+        // guest auth check: Redis being unavailable must fail CLOSED (503),
+        // not be mistaken for a missing room or bypass the authority.
+        const string valid = "room-00000000000000000000000000000000";
+        using (var roster = await guest.GetAsync(
+                   "/api/lobbies/" + valid + "/roster"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, roster.StatusCode);
+            Assert.Equal("no-store", roster.Headers.CacheControl?.ToString());
+            Assert.False(roster.Headers.Contains("Set-Cookie"));
+        }
+        using (var request = Mutation(HttpMethod.Post,
+                   "/api/lobbies/" + valid + "/join", "https://game.example"))
+        using (var denied = await guest.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
     public async Task ProductionHostileHubOriginsAreRejectedBeforeGuestRedisAuthority()
     {
         var cache = new CountingCache();
