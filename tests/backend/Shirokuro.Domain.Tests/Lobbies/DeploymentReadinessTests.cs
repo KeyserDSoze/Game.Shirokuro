@@ -114,7 +114,8 @@ public sealed class DeploymentReadinessTests
                             ConfigurationOptions.Parse(realSessionConnection
                                 ?? throw new InvalidOperationException(
                                     "Dedicated test Redis TLS connection is required."));
-                        options.InstanceName = "shirokuro-readiness-test:";
+                        // The isolated ACL fixture permits only shirokuro:* keys.
+                        options.InstanceName = "shirokuro:readiness-test:";
                     });
                 else
                     services.AddSingleton<IDistributedCache>(sessions);
