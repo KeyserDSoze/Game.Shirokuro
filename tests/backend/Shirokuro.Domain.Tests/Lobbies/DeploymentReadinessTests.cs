@@ -162,6 +162,14 @@ public sealed class DeploymentReadinessTests
         await AssertStatus(ready, HttpStatusCode.OK, "ready");
         using var health = await client.GetAsync("/api/health");
         Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        Assert.Equal("no-store", health.Headers.CacheControl?.ToString());
+        Assert.False(health.Headers.Contains("Set-Cookie"));
+        using var healthJson = JsonDocument.Parse(
+            await health.Content.ReadAsStringAsync());
+        Assert.Equal("ok", healthJson.RootElement.GetProperty("status").GetString());
+        Assert.Equal("Shirokuro",
+            healthJson.RootElement.GetProperty("application").GetString());
+        Assert.Equal(2, healthJson.RootElement.EnumerateObject().Count());
     }
 
     [Fact]
