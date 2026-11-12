@@ -151,6 +151,162 @@ public sealed class DistributedGuestRateLimitTests
         }
     }
 
+    [Theory]
+    [InlineData("-100")]
+    [InlineData("0")]
+    [InlineData("garbage")]
+    [InlineData("1.5")]
+    [InlineData("01")]
+    [InlineData("1e0")]
+    [InlineData("9")]
+    [InlineData("999999999999999999999999999999999")]
+    public async Task CorruptRedisCounterNeverGrantsPermitsOrMutatesBucket(
+        string damagedCount)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::1");
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            Assert.True(await db.StringSetAsync(
+                key, damagedCount, TimeSpan.FromSeconds(35)));
+            var one = new RedisGuestMutationLimiter(db);
+            var two = new RedisGuestMutationLimiter(b.GetDatabase());
+            foreach (var limiter in new[] { one, two })
+            {
+                var error = await Assert.ThrowsAsync<InvalidDataException>(
+                    () => limiter.AcquireAsync(policy, ip));
+                Assert.Equal("Invalid distributed limit result.", error.Message);
+                Assert.DoesNotContain(damagedCount, error.Message);
+                Assert.Null(error.InnerException);
+            }
+            Assert.Equal(damagedCount, (string?)await db.StringGetAsync(key));
+            var ttl = await db.KeyTimeToLiveAsync(key);
+            Assert.True(ttl > TimeSpan.Zero && ttl <= TimeSpan.FromSeconds(35));
+
+            // Recovery is explicit repair, never an automatic quota reset.
+            Assert.True(await db.KeyDeleteAsync(key));
+            Assert.True((await two.AcquireAsync(policy, ip)).Allowed);
+            Assert.Equal("1", (string?)await db.StringGetAsync(key));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingOrExtendedCounterTtlCannotGrantPermits(
+        bool extendedTtl)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(
+                GuestMutationKind.SessionIssuance);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::1");
+            var db = a.GetDatabase();
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            TimeSpan? expiry = extendedTtl ? TimeSpan.FromMinutes(2) : null;
+            Assert.True(await db.StringSetAsync(key, "1", expiry));
+
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                new RedisGuestMutationLimiter(b.GetDatabase())
+                    .AcquireAsync(policy, ip));
+            Assert.Equal("Invalid distributed limit result.", ex.Message);
+            Assert.Null(ex.InnerException);
+            Assert.Equal("1", (string?)await db.StringGetAsync(key));
+            var remaining = await db.KeyTimeToLiveAsync(key);
+            if (extendedTtl)
+                Assert.True(remaining > TimeSpan.FromSeconds(60));
+            else
+                Assert.Null(remaining);
+
+            Assert.True(await db.KeyDeleteAsync(key));
+            Assert.True((await new RedisGuestMutationLimiter(b.GetDatabase())
+                .AcquireAsync(policy, ip)).Allowed);
+        }
+    }
+
+    [Fact]
+    public async Task HealthyRedisQuotaIncrementsAcrossClientsWithoutSlidingTtl()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::1");
+            var db = a.GetDatabase();
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            Assert.True(await db.StringSetAsync(key, "7", TimeSpan.FromSeconds(30)));
+            var beforeTtl = await db.KeyTimeToLiveAsync(key);
+            Assert.True((await new RedisGuestMutationLimiter(db)
+                .AcquireAsync(policy, ip)).Allowed);
+            Assert.False((await new RedisGuestMutationLimiter(b.GetDatabase())
+                .AcquireAsync(policy, ip)).Allowed);
+            Assert.Equal("8", (string?)await db.StringGetAsync(key));
+            var afterTtl = await db.KeyTimeToLiveAsync(key);
+            Assert.True(afterTtl > TimeSpan.Zero);
+            Assert.True(afterTtl <= beforeTtl);
+        }
+    }
+
+    [Fact]
+    public async Task CorruptProductionAdmissionReturns503WithoutGuestCookie()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var services = new ServiceCollection();
+            services.AddDistributedMemoryCache();
+            using var provider = services.BuildServiceProvider();
+            using var server = Server(
+                provider.GetRequiredService<IDistributedCache>(), a);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::b");
+            var policy = new GuestMutationRateLimit(
+                GuestMutationKind.SessionIssuance);
+            var db = b.GetDatabase();
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            Assert.True(await db.StringSetAsync(key, "-900",
+                TimeSpan.FromSeconds(35)));
+
+            Task<HttpContext> Issue() => server.Server.SendAsync(context =>
+            {
+                context.Connection.RemoteIpAddress = ip;
+                context.Request.Method = "POST";
+                context.Request.Path = "/api/sessions/guest";
+                context.Request.Scheme = "https";
+                context.Request.Host = new HostString("game.example");
+                context.Request.Headers["Origin"] = "https://game.example";
+                context.Request.Headers["X-Shirokuro-Request"] = "1";
+            });
+
+            var denied = await Issue();
+            Assert.Equal(503, denied.Response.StatusCode);
+            Assert.Equal("no-store",
+                denied.Response.Headers.CacheControl.ToString());
+            Assert.False(denied.Response.Headers.ContainsKey("Set-Cookie"));
+            Assert.Equal("-900", (string?)await db.StringGetAsync(key));
+
+            Assert.True(await db.KeyDeleteAsync(key));
+            var recovered = await Issue();
+            Assert.Equal(200, recovered.Response.StatusCode);
+            Assert.True(recovered.Response.Headers.ContainsKey("Set-Cookie"));
+        }
+    }
+
     private static WebApplicationFactory<Program> Server(
         IDistributedCache sessions, IConnectionMultiplexer redis,
         bool trustProxy = false) =>
