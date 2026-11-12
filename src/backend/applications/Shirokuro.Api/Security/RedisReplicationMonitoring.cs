@@ -66,9 +66,12 @@ public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
                 throw new InvalidOperationException(
                     "Redis replication metadata unavailable.");
 
-            var raw = await current.InfoRawAsync("replication")
+            // Explicitly issue only the literal read-only subcommand.
+            // Generic ExecuteAsync can operate without enabling the
+            // administrative mode required by the typed InfoRawAsync API.
+            var raw = await current.ExecuteAsync("INFO", "replication")
                 .WaitAsync(limit.Token);
-            var observation = RedisReplicationInfo.Parse(raw);
+            var observation = RedisReplicationInfo.Parse(raw.ToString());
             MultiplayerMetrics.RecordRedisReplication(
                 observation, RedisReplicationPollOutcome.Ok);
         }

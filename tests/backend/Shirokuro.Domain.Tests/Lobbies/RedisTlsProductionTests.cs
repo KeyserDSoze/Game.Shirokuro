@@ -103,9 +103,9 @@ public sealed class RedisTlsProductionTests
         {
             // Directly assert the server-level INFO command; if a client
             // blocks it, print ONLY a bounded exception category in CI.
-            var raw = await connected.InfoRawAsync("replication");
+            var raw = await connected.ExecuteAsync("INFO", "replication");
             Assert.Equal(RedisReplicationRole.Primary,
-                RedisReplicationInfo.Parse(raw).Role);
+                RedisReplicationInfo.Parse(raw.ToString()).Role);
         }
         catch (Exception ex)
         {
