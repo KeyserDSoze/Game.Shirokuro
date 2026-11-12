@@ -245,15 +245,35 @@ test('guest session revoked in another tab clears private roster on focus withou
   test.setTimeout(90_000)
   const owner = await context.newPage()
   await owner.goto('/')
+
+  // The second tab is ALREADY OPEN without a guest before the owner logs
+  // in. Wait for its anonymous initial read to complete so adoption cannot
+  // be attributed to the initial page-load request.
+  const second = await context.newPage()
+  const initialAnonymousRead = second.waitForResponse(response =>
+    response.url().endsWith('/api/sessions/me') && response.status() === 401)
+  await second.goto('/')
+  await initialAnonymousRead
+  await expect(second.getByTestId('lobby-sign-in')).toBeVisible()
+  const secondGuestPosts: string[] = []
+  second.on('request', request => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/sessions/guest'))
+      secondGuestPosts.push(request.url())
+  })
+
   await owner.getByTestId('lobby-sign-in').click()
   await expect(owner.getByTestId('lobby-player')).toContainText('guest-')
   const oldIdentity = (await owner.getByTestId('lobby-player').textContent())!.trim()
+  // An opaque broadcast triggers ONLY a GET /me in the previously signed-
+  // out tab. It must not issue a new guest or inherit any invitation/roster.
+  await expect(second.getByTestId('lobby-player')).toHaveText(oldIdentity)
+  expect(secondGuestPosts).toEqual([])
+  await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-invite-input')).toHaveValue('')
+
   await owner.getByTestId('lobby-create').click()
   const oldRoom = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
-
-  const second = await context.newPage()
-  await second.goto('/')
-  await expect(second.getByTestId('lobby-player')).toHaveText(oldIdentity)
+  await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
   await second.getByTestId('lobby-invite-input').fill(oldRoom)
   await second.getByTestId('lobby-join-team').fill('white')
   await second.getByTestId('lobby-join').click()
