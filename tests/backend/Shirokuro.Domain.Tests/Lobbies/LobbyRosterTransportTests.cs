@@ -20,6 +20,12 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 
 public sealed class LobbyRosterTransportTests
 {
+    private const string RoomA = "room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string RoomB = "room-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    private const string RoomMissing = "room-00000000000000000000000000000000";
+    private const string RoomSecret = "room-cccccccccccccccccccccccccccccccc";
+    private const string RoomShared = "room-dddddddddddddddddddddddddddddddd";
+
     private static WebApplicationFactory<Program> CreateServer() =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
@@ -27,12 +33,12 @@ public sealed class LobbyRosterTransportTests
                 services.AddSingleton(_ =>
                 {
                     var coordinator = new InMemoryLobbyCoordinator();
-                    coordinator.Create("room-1", ["white", "black"]);
-                    coordinator.Join("room-1", "alice", "white", 0);
-                    coordinator.Join("room-1", "bob", "black", 1);
-                    coordinator.ChooseHero("room-1", "alice", "kira", 2);
-                    coordinator.Create("room-2", ["white", "black"]);
-                    coordinator.Join("room-2", "cara", "white", 0);
+                    coordinator.Create(RoomA, ["white", "black"]);
+                    coordinator.Join(RoomA, "alice", "white", 0);
+                    coordinator.Join(RoomA, "bob", "black", 1);
+                    coordinator.ChooseHero(RoomA, "alice", "kira", 2);
+                    coordinator.Create(RoomB, ["white", "black"]);
+                    coordinator.Join(RoomB, "cara", "white", 0);
                     return coordinator;
                 });
             }));
@@ -64,12 +70,12 @@ public sealed class LobbyRosterTransportTests
         {
             AllowAutoRedirect = false
         });
-        var anonymous = await client.GetAsync("/api/lobbies/room-1/roster");
+        var anonymous = await client.GetAsync($"/api/lobbies/{RoomA}/roster");
         Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
 
         client.DefaultRequestHeaders.Add("X-Player-Id", "alice");
         client.DefaultRequestHeaders.Add("X-User-Id", "alice");
-        var spoofed = await client.GetAsync("/api/lobbies/room-1/roster?playerId=alice");
+        var spoofed = await client.GetAsync($"/api/lobbies/{RoomA}/roster?playerId=alice");
         Assert.Equal(HttpStatusCode.Unauthorized, spoofed.StatusCode);
     }
 
@@ -78,13 +84,13 @@ public sealed class LobbyRosterTransportTests
     {
         using var server = CreateServer();
         using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
-        var response = await alice.GetAsync("/api/lobbies/room-1/roster");
+        var response = await alice.GetAsync($"/api/lobbies/{RoomA}/roster");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         var json = await response.Content.ReadAsStringAsync();
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
-        Assert.Equal("room-1", root.GetProperty("lobbyId").GetString());
+        Assert.Equal(RoomA, root.GetProperty("lobbyId").GetString());
         Assert.Equal(3, root.GetProperty("revision").GetInt64());
         Assert.Equal(2, root.GetProperty("participants").GetArrayLength());
         Assert.Equal("alice",
@@ -102,7 +108,7 @@ public sealed class LobbyRosterTransportTests
     {
         using var server = CreateServer();
         using var bob = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "bob"));
-        var response = await bob.GetAsync("/api/lobbies/room-2/roster?playerId=cara");
+        var response = await bob.GetAsync($"/api/lobbies/{RoomB}/roster?playerId=cara");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 
@@ -111,8 +117,8 @@ public sealed class LobbyRosterTransportTests
     {
         using var server = CreateServer();
         using var bob = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "bob"));
-        var absent = await bob.GetAsync("/api/lobbies/missing/roster");
-        var denied = await bob.GetAsync("/api/lobbies/room-2/roster");
+        var absent = await bob.GetAsync($"/api/lobbies/{RoomMissing}/roster");
+        var denied = await bob.GetAsync($"/api/lobbies/{RoomB}/roster");
         Assert.Equal(HttpStatusCode.NotFound, absent.StatusCode);
         Assert.Equal(absent.StatusCode, denied.StatusCode);
         Assert.Equal(await absent.Content.ReadAsStringAsync(),
@@ -125,13 +131,13 @@ public sealed class LobbyRosterTransportTests
         using var server = CreateServer();
         using var noId = ClientFor(server, new Claim(ClaimTypes.Name, "alice"));
         Assert.Equal(HttpStatusCode.Forbidden,
-            (await noId.GetAsync("/api/lobbies/room-1/roster")).StatusCode);
+            (await noId.GetAsync($"/api/lobbies/{RoomA}/roster")).StatusCode);
 
         using var duplicateId = ClientFor(server,
             new Claim(ClaimTypes.NameIdentifier, "alice"),
             new Claim(ClaimTypes.NameIdentifier, "bob"));
         Assert.Equal(HttpStatusCode.Forbidden,
-            (await duplicateId.GetAsync("/api/lobbies/room-1/roster")).StatusCode);
+            (await duplicateId.GetAsync($"/api/lobbies/{RoomA}/roster")).StatusCode);
     }
 
     [Fact]
@@ -144,7 +150,7 @@ public sealed class LobbyRosterTransportTests
         });
         client.DefaultRequestHeaders.Add("Cookie", "Shirokuro.Session=alice");
         Assert.Equal(HttpStatusCode.Unauthorized,
-            (await client.GetAsync("/api/lobbies/room-1/roster")).StatusCode);
+            (await client.GetAsync($"/api/lobbies/{RoomA}/roster")).StatusCode);
     }
 
     [Fact]
@@ -245,34 +251,65 @@ public sealed class LobbyRosterTransportTests
     public async Task SignalRMethodReauthorizesMemberAndRejectsSpoofedContextUserIdentifier()
     {
         var coordinator = new InMemoryLobbyCoordinator();
-        coordinator.Create("room", ["white", "black"]);
-        coordinator.Join("room", "alice", "white", 0);
-        coordinator.Join("room", "bob", "black", 1);
+        coordinator.Create(RoomA, ["white", "black"]);
+        coordinator.Join(RoomA, "alice", "white", 0);
+        coordinator.Join(RoomA, "bob", "black", 1);
         var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator));
 
         // The caller's authenticated principal, not a transport-supplied or
         // caller-controlled identifier, is the authoritative identity.
         hub.Context = new FakeHubContext(Principal("alice"), "spoofed-bob");
-        var roster = await hub.GetRoster("room");
-        Assert.Equal("room", roster.LobbyId);
+        var roster = await hub.GetRoster(RoomA);
+        Assert.Equal(RoomA, roster.LobbyId);
         Assert.Equal(2, roster.Participants.Count);
 
         hub.Context = new FakeHubContext(Principal("outsider"), "alice");
         Assert.Equal("Lobby unavailable.",
-            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("room"))).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomA))).Message);
 
         hub.Context = new FakeHubContext(Principal("alice"));
         Assert.Equal("Lobby unavailable.",
-            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("unknown"))).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomMissing))).Message);
 
         hub.Context = new FakeHubContext(new ClaimsPrincipal(new ClaimsIdentity()));
         Assert.Equal("Lobby unavailable.",
-            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("room"))).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomA))).Message);
 
         hub.Context = new FakeHubContext(Principal("bob"));
-        Assert.Equal("room", (await hub.GetRoster("room")).LobbyId);
+        Assert.Equal(RoomA, (await hub.GetRoster(RoomA)).LobbyId);
     }
 
+
+    [Fact]
+    public async Task HubRejectsMalformedIdsWithUniformNotFoundError()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create(RoomA, ["white", "black"]);
+        coordinator.Join(RoomA, "alice", "white", 0);
+        var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator))
+        {
+            Context = new FakeHubContext(Principal("alice"))
+        };
+        Assert.Equal(RoomA, (await hub.GetRoster(RoomA)).LobbyId);
+
+        foreach (var bad in new[]
+                 {
+                     "", "room-1", "room-" + new string('A', 32),
+                     "room-" + new string('a', 31),
+                     "room-" + new string('a', 33),
+                     "room-" + new string('a', 31) + "/",
+                     " room-" + new string('a', 32),
+                     "room-" + new string('a', 31) + "é"
+                 })
+        {
+            var error = await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(bad));
+            Assert.Equal("Lobby unavailable.", error.Message);
+        }
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(RoomMissing))).Message);
+    }
 
     [Fact]
     public async Task ExistingSignalRConnectionCannotReadAfterGuestLogoutRevocation()
@@ -284,8 +321,8 @@ public sealed class LobbyRosterTransportTests
         var principal = GuestSessions.CreatePrincipal(playerId, token);
 
         var coordinator = new InMemoryLobbyCoordinator();
-        coordinator.Create("secret", ["white", "black"]);
-        coordinator.Join("secret", playerId, "white", 0);
+        coordinator.Create(RoomSecret, ["white", "black"]);
+        coordinator.Join(RoomSecret, playerId, "white", 0);
 
         // The same Context.User survives as a cached principal across a
         // long-lived socket; the registry must be consulted per invocation.
@@ -293,17 +330,17 @@ public sealed class LobbyRosterTransportTests
         {
             Context = new FakeHubContext(principal)
         };
-        Assert.Equal("secret", (await hub.GetRoster("secret")).LobbyId);
+        Assert.Equal(RoomSecret, (await hub.GetRoster(RoomSecret)).LobbyId);
         Assert.True(registry.Revoke(principal));
         Assert.Equal("Lobby unavailable.",
-            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("secret"))).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomSecret))).Message);
 
         // A valid ticket with a session ID no longer registered also fails.
         var newHub = new LobbyRosterHub(new LobbyRosterReader(coordinator), registry)
         {
             Context = new FakeHubContext(principal)
         };
-        await Assert.ThrowsAsync<HubException>(() => newHub.GetRoster("secret"));
+        await Assert.ThrowsAsync<HubException>(() => newHub.GetRoster(RoomSecret));
     }
 
     [Fact]
@@ -321,17 +358,17 @@ public sealed class LobbyRosterTransportTests
         var principal = GuestSessions.CreatePrincipal(id, token);
 
         var coordinator = new InMemoryLobbyCoordinator();
-        coordinator.Create("shared", ["white", "black"]);
-        coordinator.Join("shared", id, "white", 0);
+        coordinator.Create(RoomShared, ["white", "black"]);
+        coordinator.Join(RoomShared, id, "white", 0);
         var hub = new LobbyRosterHub(new LobbyRosterReader(coordinator), onA)
         {
             Context = new FakeHubContext(principal)
         };
 
-        Assert.Equal("shared", (await hub.GetRoster("shared")).LobbyId);
+        Assert.Equal(RoomShared, (await hub.GetRoster(RoomShared)).LobbyId);
         Assert.True(await onB.RevokeAsync(principal));
         Assert.Equal("Lobby unavailable.",
-            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster("shared"))).Message);
+            (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomShared))).Message);
     }
 
     [Fact]
