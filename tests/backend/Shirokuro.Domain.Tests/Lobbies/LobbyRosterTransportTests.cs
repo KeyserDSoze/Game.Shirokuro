@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Hubs;
 using Shirokuro.Api.Security;
@@ -26,7 +27,8 @@ public sealed class LobbyRosterTransportTests
     private const string RoomSecret = "room-cccccccccccccccccccccccccccccccc";
     private const string RoomShared = "room-dddddddddddddddddddddddddddddddd";
 
-    private static WebApplicationFactory<Program> CreateServer() =>
+    private static WebApplicationFactory<Program> CreateServer(
+        IAsyncGuestLobby? overrideLobby = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
             {
@@ -41,6 +43,11 @@ public sealed class LobbyRosterTransportTests
                     coordinator.Join(RoomB, "cara", "white", 0);
                     return coordinator;
                 });
+                if (overrideLobby is not null)
+                {
+                    services.RemoveAll<IAsyncGuestLobby>();
+                    services.AddSingleton(overrideLobby);
+                }
             }));
 
     private static HttpClient ClientFor(
@@ -60,6 +67,79 @@ public sealed class LobbyRosterTransportTests
         var signed = options.TicketDataFormat.Protect(ticket);
         client.DefaultRequestHeaders.Add("Cookie", options.Cookie.Name + "=" + signed);
         return client;
+    }
+
+    private sealed class ContendedLobby : IAsyncGuestLobby
+    {
+        public int Reads { get; private set; }
+
+        public Task<LobbyRosterView> ForMemberAsync(string roomId, string trustedPlayerId,
+            CancellationToken cancellationToken = default)
+        {
+            Reads++;
+            // Simulate the Redis runtime's bounded heartbeat CAS retry
+            // exhaustion AFTER auth/member routing, without real contention
+            // races or an arbitrary InvalidOperationException catch-all.
+            return Task.FromException<LobbyRosterView>(
+                new LobbyReadContentionException());
+        }
+
+        public Task<LobbyRosterView> CreateAsync(string trustedPlayerId,
+            IReadOnlyList<string>? teamIds, string? initialTeam,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> JoinAsync(string roomId, string trustedPlayerId,
+            string? teamId, long? expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> ChooseHeroAsync(string roomId, string trustedPlayerId,
+            string? heroId, long expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> ChangeTeamAsync(string roomId, string trustedPlayerId,
+            string? teamId, long expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task LeaveAsync(string roomId, string trustedPlayerId,
+            long expectedRevision, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task ContendedAuthenticatedHttpRosterReturnsUncachedSanitized503()
+    {
+        var contended = new ContendedLobby();
+        using var server = CreateServer(contended);
+        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+
+        using var response = await alice.GetAsync($"/api/lobbies/{RoomA}/roster");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("contention", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("alice", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Redis", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, contended.Reads);
+    }
+
+    [Fact]
+    public async Task ContendedSignalRRosterKeepsExistingOpaqueUnavailableError()
+    {
+        var contended = new ContendedLobby();
+        var hub = new LobbyRosterHub(
+            new LobbyRosterReader(new InMemoryLobbyCoordinator()),
+            lobby: contended)
+        {
+            Context = new FakeHubContext(Principal("alice"))
+        };
+        var error = await Assert.ThrowsAsync<HubException>(
+            () => hub.GetRoster(RoomA));
+        Assert.Equal("Lobby unavailable.", error.Message);
+        Assert.Equal(1, contended.Reads);
     }
 
     [Fact]
