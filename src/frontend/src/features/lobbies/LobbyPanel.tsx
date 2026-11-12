@@ -7,6 +7,9 @@ import {
   guestLobbyApi, LobbyHttpError, LobbyInputError, parseInviteCode, parseTeamIds,
   type GuestSession, type LobbyRoster,
 } from './api'
+import {
+  LOBBY_ROSTER_POLL_INTERVAL_MS, classifyRosterPollFailure, reconcilePolledRoster,
+} from './rosterSync'
 
 type Props = { previewHeroId: string }
 const SESSION_CHANGE_CHANNEL = 'shirokuro:guest-session-changed'
@@ -30,6 +33,13 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const sessionGenerationRef = useRef(0)
   const operationRef = useRef(0)
   const busyRef = useRef(false)
+  const currentRoomRef = useRef<LobbyRoster | null>(null)
+  const roomId = room?.lobbyId
+  const actorId = session?.playerId
+
+  // A timer callback must inspect the latest roster, not the revision
+  // captured when its room/identity effect was installed.
+  useEffect(() => { currentRoomRef.current = room }, [room])
 
   // Broadcast only an opaque "recheck" signal: NEVER a cookie, player ID,
   // invitation code, roster or session state. Other tabs ask the API.
@@ -156,6 +166,66 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       channel?.removeEventListener('message', onMessage)
     }
   }, [session, forgetGuest, t])
+
+  // Read-only pre-match roster synchronization. The server continues to
+  // authorize every GET; neither SignalR nor cross-tab data grants access.
+  // Timer callbacks don't overlap, never mint guests and stop on hidden tabs.
+  useEffect(() => {
+    if (!roomId || !actorId) return
+    let active = true
+    let inFlight = false
+
+    const poll = async () => {
+      if (!active || inFlight || document.hidden || busyRef.current) return
+      const generation = sessionGenerationRef.current
+      const operation = operationRef.current
+      inFlight = true
+      const stillCurrent = () =>
+        active && generation === sessionGenerationRef.current &&
+        operation === operationRef.current && !busyRef.current &&
+        currentRoomRef.current?.lobbyId === roomId
+
+      try {
+        const latest = await guestLobbyApi.read(roomId)
+        if (!stillCurrent()) return
+        const current = currentRoomRef.current!
+        const result = reconcilePolledRoster(current, latest, actorId)
+        if (result === 'updated') {
+          // Another action may have committed a newer revision before
+          // React applies this state update: never overwrite it.
+          setRoom(previous =>
+            previous?.lobbyId === roomId && previous.revision < latest.revision
+              ? latest : previous)
+        } else if (result === 'missing') {
+          setRoom(previous => previous?.lobbyId === roomId ? null : previous)
+          setInvite('')
+          setMessage(t('lobbyMissing'))
+        }
+      } catch (error) {
+        if (!stillCurrent()) return
+        const outcome = classifyRosterPollFailure(
+          error instanceof LobbyHttpError ? error.status : undefined)
+        if (outcome === 'expired') {
+          forgetGuest()
+          setMessage(t('lobbySessionExpired'))
+        } else if (outcome === 'missing') {
+          setRoom(previous => previous?.lobbyId === roomId ? null : previous)
+          setInvite('')
+          setMessage(t('lobbyMissing'))
+        }
+        // 403, 429, 503 and offline are not logout evidence.
+        // Do not retry immediately or replace a mutation's status banner.
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const timer = window.setInterval(() => { void poll() }, LOBBY_ROSTER_POLL_INTERVAL_MS)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [roomId, actorId, forgetGuest, t])
 
   async function run(action: (isCurrent: () => boolean) => Promise<void>) {
     if (busyRef.current) return
@@ -405,6 +475,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     </p>
                   ))}
                 </div>
+                <p className="text-xs text-muted-foreground" data-testid="lobby-auto-refresh">
+                  {t('lobbyAutoRefresh')}
+                </p>
                 <Button
                   type="button"
                   variant="outline"

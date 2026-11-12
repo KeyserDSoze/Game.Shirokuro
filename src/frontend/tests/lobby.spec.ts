@@ -509,3 +509,88 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await page.getByTestId('lobby-sign-in').click()
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
+
+test('two guest browsers see pre-match roster changes automatically and revocation drops stale privacy', async ({ browser }) => {
+  test.setTimeout(95_000)
+  const ownerContext = await browser.newContext()
+  const guestContext = await browser.newContext()
+  try {
+    const owner = await ownerContext.newPage()
+    const guest = await guestContext.newPage()
+    await Promise.all([owner.goto('/'), guest.goto('/')])
+    await owner.getByTestId('lobby-sign-in').click()
+    await guest.getByTestId('lobby-sign-in').click()
+    await owner.getByTestId('lobby-create').click()
+    const code = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
+    const ownerReads: string[] = []
+    owner.on('request', request => {
+      if (request.url().endsWith('/api/lobbies/' + code + '/roster'))
+        ownerReads.push(request.method())
+    })
+    await guest.getByTestId('lobby-invite-input').fill(code)
+    await guest.getByTestId('lobby-join').click()
+    await guest.getByRole('button', { name: 'Seleziona Shilla' }).click()
+    await guest.getByTestId('lobby-pick-hero').click()
+    await expect(guest.getByTestId('lobby-revision')).toContainText('3')
+    await owner.bringToFront()
+
+    // No click on owner's manual Refresh. A member-scoped server GET
+    // delivers a newer revision without granting any gameplay authority.
+    await expect(owner.getByTestId('lobby-revision')).toContainText('3', { timeout: 25_000 })
+    await expect(owner.getByTestId('lobby-roster')).toContainText('Shilla')
+    expect(ownerReads.length).toBeGreaterThan(0)
+    expect(ownerReads.every(method => method === 'GET')).toBe(true)
+
+    // Revoke without using another tab's BroadcastChannel. A subsequent
+    // automatic 401 must clear owner identity, private room and invite.
+    const logout = await ownerContext.request.delete(
+      'http://127.0.0.1:5173/api/sessions/guest',
+      { headers: { Origin: 'http://127.0.0.1:5173', 'X-Shirokuro-Request': '1' } },
+    )
+    expect(logout.status()).toBe(204)
+    await expect(owner.getByTestId('lobby-sign-in')).toBeVisible({ timeout: 25_000 })
+    await expect(owner.getByTestId('lobby-room-code')).toHaveCount(0)
+    await expect(owner.getByTestId('lobby-player')).toHaveCount(0)
+    await expect(owner.getByTestId('lobby-message')).toContainText('scaduta o revocata')
+  } finally {
+    await ownerContext.close()
+    await guestContext.close()
+  }
+})
+
+test('polling transient 503 preserves guest and roster, later 404 removes only the room', async ({ page }) => {
+  test.setTimeout(75_000)
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  const code = (await page.getByTestId('lobby-room-code').textContent())!.trim()
+  let status = 503
+  let reads = 0
+  const mutations: string[] = []
+  page.on('request', request => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()))
+      mutations.push(request.url())
+  })
+  await page.route('**/api/lobbies/' + code + '/roster', async route => {
+    if (route.request().method() !== 'GET') return route.continue()
+    reads++
+    await route.fulfill({
+      status,
+      headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+  })
+
+  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(1)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await expect(page.getByTestId('lobby-message')).not.toContainText('scaduta')
+
+  status = 404
+  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(2)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-create')).toBeVisible()
+  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  expect(mutations).toEqual([])
+})

@@ -91,3 +91,34 @@ still **per process** and insufficient for distributed deployments;
 Data Protection keys and room storage require persistence and sharing.
 Remaining infrastructure work is tracked in #21. Match notifications, reconnect logic and
 PvP observations remain #9 and cannot proceed without #3/#5.
+
+## Read-only, member-scoped roster auto-refresh (#100)
+
+The pre-match React lobby shows a **15-second** read-only automatic
+roster refresh while the authenticated guest is in a room and the tab is
+visible. Every update uses the existing authenticated, member-only
+`GET /api/lobbies/{code}/roster`; the manual Refresh button remains.
+No automatic guest sign-in, room join, HTTP mutation, SignalR broadcast
+or cross-tab exchange of room codes/player IDs is introduced. The feature
+is deliberately a pre-match UX improvement, **not** the match observation
+security boundary of #9 or a substitute for server-side authorization.
+
+The browser permits at most one polling GET in flight, suspends polling
+in hidden tabs and while another guest operation is busy, and cancels
+its timer on room/identity changes or unmount. Results are fenced by the
+active guest generation, operation counter and room ID. Only a newer
+server revision with current member identity can update the roster;
+stale, same-revision, wrong-room or malformed JSON bodies are ignored.
+A server-confirmed 401 revokes local guest/roster, while 404 or verified
+loss of membership drops the private room; transient 403/429/503/offline
+preserve existing data without immediate retries or clearing user action
+feedback. These are local UI decisions; only the server authorizes access.
+
+Vitest covers revision/membership/room validation and safe error
+classification. Two-browser Playwright confirms a guest's join/hero
+appears on the other browser without clicking Refresh and that server
+revocation clears the obsolete private view. Separate E2E coverage checks
+503 preservation, 404 removal and **zero HTTP mutation requests** during
+auto-refresh. Hosting, alerting and anti-Sybil controls still belong
+to #21; game rules, hidden movement and match-scoped observations
+remain #3/#5/#9.
