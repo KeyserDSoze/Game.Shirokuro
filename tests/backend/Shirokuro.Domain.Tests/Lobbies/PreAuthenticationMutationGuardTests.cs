@@ -201,7 +201,10 @@ public sealed class PreAuthenticationMutationGuardTests
         using (var read = await guest.GetAsync("/api/sessions/me"))
             Assert.Equal(HttpStatusCode.ServiceUnavailable, read.StatusCode);
         Assert.Equal(2, cache.Reads);
-        using (var health = await guest.GetAsync("/api/health"))
+        // A genuinely anonymous liveness check never needs guest Redis.
+        // Requests carrying a cookie can still attempt authentication even
+        // on public routes; that separate behavior is outside this guard.
+        using (var health = await anonymous.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, health.StatusCode);
         Assert.Equal(2, cache.Reads);
 
