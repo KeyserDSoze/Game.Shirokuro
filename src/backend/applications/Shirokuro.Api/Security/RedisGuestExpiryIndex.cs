@@ -16,6 +16,9 @@ namespace Shirokuro.Api.Security;
 public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
 {
     public const int BatchSize = 128;
+    // Data Protection string envelopes are short Base64Url ASCII.
+    // The Redis response must never contain arbitrarily large ZSET members.
+    public const int MaxProtectedMemberBytes = 4096;
     public static readonly TimeSpan CursorLifetime = TimeSpan.FromDays(1);
     // Keep guest issuance and maintenance responsive on a stalled Redis
     // connection. Cancelling this wait cannot retract a dispatched command.
@@ -46,6 +49,13 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         end
         redis.call('SET', KEYS[2], tostring((offset + #batch) % count),
             'EX', ARGV[3])
+        -- Preserve oversized members for operator recovery, but never
+        -- send their ciphertext to .NET. Empty = unreadable/no acknowledgement.
+        for i,member in ipairs(batch) do
+            if #member > tonumber(ARGV[4]) then
+                batch[i] = ''
+            end
+        end
         return batch
         """;
 
@@ -141,6 +151,10 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
                         ":" + trustedPlayerId +
                         (trustedSessionDigest is null ? "" : ":" + trustedSessionDigest);
         var member = _protector.Protect(plaintext);
+        // Data Protection's string envelope uses Base64Url ASCII: the
+        // string length is the serialized Redis byte length.
+        if (member.Length > MaxProtectedMemberBytes)
+            throw new InvalidDataException("Invalid guest expiry work item.");
         cancellationToken.ThrowIfCancellationRequested();
         // Never report a durable expiry/revocation record on an uncertain
         // Redis result. A command already delivered to Redis may still finish.
@@ -166,7 +180,8 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             _database.ScriptEvaluateAsync(
                 RotateDueWindowScript, [_key, _cursorKey],
                 [CeilingUnixMilliseconds(dueCeiling), BatchSize,
-                 (long)CursorLifetime.TotalSeconds]), cancellationToken)
+                 (long)CursorLifetime.TotalSeconds, MaxProtectedMemberBytes]),
+            cancellationToken)
             ?? throw new InvalidDataException("Invalid guest expiry window.");
         if (members.Length > BatchSize)
             throw new InvalidDataException("Invalid guest expiry window size.");
@@ -174,17 +189,27 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         foreach (var member in members)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var protectedMember = member.ToString();
+            if (string.IsNullOrEmpty(protectedMember) ||
+                protectedMember.Length > MaxProtectedMemberBytes)
+            {
+                // The Lua sentinel has no player identity and is never
+                // acknowledged. The original Redis member remains intact.
+                result.Add(DueGuestExpiry.Unreadable(string.Empty));
+                continue;
+            }
+
             string payload;
             try
             {
-                payload = _protector.Unprotect(member.ToString());
+                payload = _protector.Unprotect(protectedMember);
             }
             catch (System.Security.Cryptography.CryptographicException)
             {
                 // Never turn an unknown or unreadable protected member into
                 // a valid player. Retain it durably for key-ring recovery,
                 // while leaving later independent members processable.
-                result.Add(DueGuestExpiry.Unreadable(member.ToString()));
+                result.Add(DueGuestExpiry.Unreadable(protectedMember));
                 continue;
             }
 
@@ -204,7 +229,7 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
                     tokenDigest.Any(c =>
                         c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))))
             {
-                result.Add(DueGuestExpiry.Unreadable(member.ToString()));
+                result.Add(DueGuestExpiry.Unreadable(protectedMember));
                 continue;
             }
 
@@ -212,7 +237,7 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             if (expiry > now &&
                 (_recoveryDueCeilingUtc is not { } ceiling || expiry > ceiling))
                 continue; // Never trust the mutable Redis score over the protected time.
-            result.Add(new DueGuestExpiry(member.ToString(), playerId,
+            result.Add(new DueGuestExpiry(protectedMember, playerId,
                 SessionTokenDigest: tokenDigest,
                 IsPreCutover: _recoveryDueCeilingUtc is { } recoveryCeiling &&
                     expiry <= recoveryCeiling));
