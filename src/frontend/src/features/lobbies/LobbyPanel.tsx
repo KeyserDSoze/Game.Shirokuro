@@ -177,6 +177,24 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     setNewTeam(own?.teamId ?? next.teamIds[0])
   }
 
+  // A copy is explicitly user-initiated; never store or publish a private
+  // lobby invitation. Ignore late permission results after identity changes.
+  async function copyInvitation() {
+    const code = room?.lobbyId
+    if (!code) return
+    const generation = sessionGenerationRef.current
+    const operation = operationRef.current
+    const isCurrent = () => generation === sessionGenerationRef.current &&
+      operation === operationRef.current
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable')
+      await navigator.clipboard.writeText(code)
+      if (isCurrent()) setMessage(t('lobbyInviteCopied'))
+    } catch {
+      if (isCurrent()) setMessage(t('lobbyInviteCopyUnavailable'))
+    }
+  }
+
   const hero = getHeroById(previewHeroId)
 
   return (
@@ -290,6 +308,15 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                 <code data-testid="lobby-room-code" className="block break-all rounded-md bg-secondary p-2 text-xs">
                   {room.lobbyId}
                 </code>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  data-testid="lobby-copy-invite"
+                  onClick={() => void copyInvitation()}
+                >
+                  {t('lobbyCopyInvite')}
+                </Button>
                 <p className="text-xs text-muted-foreground">{t('lobbyShare')}</p>
                 <p data-testid="lobby-revision" className="text-xs text-muted-foreground">
                   {t('lobbyRevision', { count: room.revision })}
