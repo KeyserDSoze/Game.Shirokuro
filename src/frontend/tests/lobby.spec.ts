@@ -65,7 +65,9 @@ test('two independent guest browsers create a room, join by invite and select he
   }
 })
 
-test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ page }) => {
+test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ page, context }) => {
+  test.setTimeout(60_000)
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
   await page.getByTestId('language-toggle').click()
@@ -84,8 +86,47 @@ test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ 
   await page.getByTestId('lobby-new-team').selectOption('black')
   await page.getByTestId('lobby-change-team').click()
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
+
+  // Reuse this already-authenticated, real member lobby rather than opening
+  // more guest sessions and exhausting the shared Development rate limit.
+  const invitation = (await page.getByTestId('lobby-room-code').textContent())!.trim()
+  expect(invitation).toMatch(/^room-[0-9a-f]{32}$/)
+  await page.getByTestId('lobby-copy-invite').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Invitation code copied')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(invitation)
+
+  // Explicit clipboard denial leaves the code manually selectable.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async () => { throw new Error('Permission denied') } },
+    })
+  })
+  await page.getByTestId('lobby-copy-invite').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Could not copy')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(invitation)
+
+  // A pending clipboard permission result must not change logout feedback.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: () => new Promise<void>(resolve => {
+          (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy = resolve
+        }),
+      },
+    })
+  })
+  await page.getByTestId('lobby-copy-invite').click()
+  await page.waitForFunction(() =>
+    typeof (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy === 'function')
   await page.getByTestId('lobby-sign-out').click()
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-message')).toContainText('signed out')
+  await page.evaluate(() =>
+    (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy?.())
+  await expect(page.getByTestId('lobby-copy-invite')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-message')).toContainText('signed out')
   await expect(page.getByTestId('world-stage')).toBeVisible()
 })
@@ -323,56 +364,4 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   // The old invite must not remain available for a newly-issued identity.
   await page.getByTestId('lobby-sign-in').click()
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
-})
-
-// Only an invited member deliberately copies this private room code. Group
-// three clipboard phases under ONE guest login to avoid saturating the shared
-// Development guest-issuance quota across concurrent E2E browser workers.
-test('member clipboard succeeds, falls back on denial and ignores late logout response', async ({ page, context }) => {
-  test.setTimeout(60_000)
-  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
-  await page.goto('/')
-  await page.getByTestId('lobby-sign-in').click()
-  await expect(page.getByTestId('lobby-create')).toBeVisible()
-  await page.getByTestId('lobby-create').click()
-  const invitation = (await page.getByTestId('lobby-room-code').textContent())!.trim()
-  expect(invitation).toMatch(/^room-[0-9a-f]{32}$/)
-
-  // Explicit user click performs the only clipboard write.
-  await page.getByTestId('lobby-copy-invite').click()
-  await expect(page.getByTestId('lobby-message')).toContainText('Codice invito copiato')
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(invitation)
-
-  // Permission failures leave the private invitation visible for manual copy.
-  await page.evaluate(() => {
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { writeText: async () => { throw new Error('Permission denied') } },
-    })
-  })
-  await page.getByTestId('lobby-copy-invite').click()
-  await expect(page.getByTestId('lobby-message')).toContainText('Copia non riuscita')
-  await expect(page.getByTestId('lobby-room-code')).toHaveText(invitation)
-
-  // In-flight clipboard completion cannot replace new-identity/logout feedback.
-  await page.evaluate(() => {
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: {
-        writeText: () => new Promise<void>(resolve => {
-          (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy = resolve
-        }),
-      },
-    })
-  })
-  await page.getByTestId('lobby-copy-invite').click()
-  await page.waitForFunction(() =>
-    typeof (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy === 'function')
-  await page.getByTestId('lobby-sign-out').click()
-  await expect(page.getByTestId('lobby-message')).toContainText('Sessione ospite terminata')
-  await page.evaluate(() =>
-    (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy?.())
-  await expect(page.getByTestId('lobby-copy-invite')).toHaveCount(0)
-  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
-  await expect(page.getByTestId('lobby-message')).toContainText('Sessione ospite terminata')
 })
