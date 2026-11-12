@@ -620,6 +620,14 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
         {
             return Results.NotFound();
         }
+        catch (LobbyReadContentionException)
+        {
+            // Another node may be advancing this room's activity/snapshot
+            // faster than the bounded read CAS can converge. Do not turn
+            // a transient authoritative-read failure into HTTP 500 or
+            // reveal a roster that has not passed an atomic heartbeat.
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
         catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
         {
             return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
