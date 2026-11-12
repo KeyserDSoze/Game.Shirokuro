@@ -1374,3 +1374,80 @@ Redis clients emit at least one finite-label connection event; cookie,
 roster, revision, logout fence and new issuance continue across the
 auto-promotion. This is **client event observability**, not a
 telemetry alert receiver or certification of split-brain safety or RPO=0.
+
+## Private Redis INFO replication telemetry, separate observer ACL (#63)
+
+Application read/write connectors **must not** enable StackExchange.Redis
+`AllowAdmin`: the .NET client rejects its `INFO` command in ordinary
+mode, even though Redis ACL permits the read-only `INFO replication`.
+Generic `ExecuteAsync` does **not** bypass this client guard. The
+production-safe solution is an **independent Redis monitoring connection**
+with a separately provisioned, intentionally read-only Redis ACL user,
+not a relaxation of the game/lobby/guest-session identities.
+
+The read-only poll is completely **OFF by default**, and always OFF in
+Development. To opt into it outside Development, configure using secure
+external deployment settings (never check in real credentials):
+
+```sh
+Security__Monitoring__RedisReplicationEnabled=true
+Security__Monitoring__RedisReplicationConnectionString='redis.internal.example:6380,ssl=true,sslHost=redis.internal.example,user=shirokuro-observer,password=<secret-manager-value>'
+```
+
+For a Sentinel deployment use the same `serviceName` as the game API,
+supply the observer's **distinct** Redis username/password, and include
+**explicit** `sentinelUser` / `sentinelPassword` for discovery; the
+library's implicit fallback to Redis application credentials is rejected.
+The observer endpoint must be TLS with a trusted CA and valid hostname.
+Startup rejects missing, invalid, duplicate game credentials, the
+`default` user, non-TLS endpoints, supplied `allowAdmin=true` and
+mismatched Sentinel service names, using a **constant, sanitized error**.
+The app does not create any listener or open `/metrics` from this flag.
+
+Provision the Redis server ACL *separately* from the game ACL: disable the
+default account, allow the observer only `INFO` plus the minimum
+connection-handshake commands required by StackExchange.Redis
+(`AUTH`, `HELLO`, `PING`, `ECHO`, `COMMAND`, limited
+`CLIENT SETNAME/SETINFO`), no access to `shirokuro:*` game keys and
+no `GET`, `SET`, `CONFIG`, `FLUSHDB` or other destructive/admin
+permissions. Use a distinct vaulted password and restrict network access
+to the API/collector trusted zones. The only `AllowAdmin=true` setting
+is on this internally owned monitor multiplexer, because the Redis
+client uses it to permit `INFO`; **Redis server ACL remains the
+authoritative security boundary**. No monitoring multiplexer is registered
+for lobby/guest application DI, and it is disposed with its sampler.
+
+Every 30 seconds the observer executes **only** `INFO replication`
+on a connected Redis server from its managed topology, with a two-second
+client wait budget. Network, Redis ACL or parsing errors produce bounded
+failure observations; they never block or alter cookie validation, lobby
+mutations, liveness or the existing fail-closed readiness. The first poll
+runs after host startup, not synchronously on the request path.
+
+The pre-existing opt-in OTLP meter `Shirokuro.Api.Multiplayer` adds:
+
+| Instrument | Kind/unit | Bounded attributes | Interpretation |
+| --- | --- | --- | --- |
+| `shirokuro.redis.replication.observations` | Counter / observation | `outcome=ok\|timeout\|invalid\|unavailable`, `role=master\|replica\|unknown`, `link=up\|down\|na` | Each attempted INFO read, including failure. A missing/failed sample **is not** a healthy zero-replica result. |
+| `shirokuro.redis.replication.connected_replicas` | Histogram / replica | No dynamic attributes | `connected_slaves` observed on a successfully sampled primary. Counts are samples, **not a current-state gauge**; no sample is recorded on a failed poll or a replica. |
+| `shirokuro.redis.replication.replica_ack_lag_seconds` | Histogram / seconds | No dynamic attributes | Maximum reported `lag` across `slaveN` rows whose state is `online`. No lag sample when no online replica exists. |
+
+Redis `INFO` includes server addresses, ports, replication IDs and even
+other potentially identifying strings. The bounded parser consumes only
+`role`, `connected_slaves`, `master_link_status` and the numeric
+`lag` of `slaveN` entries that are online. It rejects oversized
+payloads, malformed counts and invalid role/link without echoing raw
+Redis content. **Reported ACK lag is time since replica acknowledgment**;
+it is NOT replica byte-offset lag, not an end-to-end data-consistency
+proof, and cannot establish RPO=0 or failover RTO/SLA. Use independent,
+least-privilege Redis server exporter metrics, Sentinel quorum alerting,
+replication-offset/ID comparisons and backups for operational HA under
+[#21](https://github.com/KeyserDSoze/Game.Shirokuro/issues/21). An
+OTLP collector/dashboard/alert receiver is **not deployed** by this code.
+
+Verified in [CI code #43127985070](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43127985070) SUCCESS on main `27530fa`: 434 standard xUnit, 6 real Production Redis TLS, 4 scoped Redis TLS ACL, 1 ACL blue/green rotation, 1 RDB recovery, 1 manual replica promotion, 1 Sentinel automatic authenticated TLS failover, 106 Vitest, 24 Playwright, 35 Python, and .NET 10/React builds. xUnit exercises strict TLS identity separation,
+real Redis 7.4 INFO on a dedicated ACL observer, denial of game-key
+reads/writes and FLUSHDB/CONFIG even when the client-side INFO guard is
+enabled, a real Production host with opt-in worker, standalone and
+master/replica/promotion parsing, strict finite metric labels and fake
+HTTPS OTLP protobuf payload with no replica IP in telemetry.
