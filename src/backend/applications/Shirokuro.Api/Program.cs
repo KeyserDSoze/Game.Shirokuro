@@ -102,14 +102,15 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         // signed session token remains present in the server's active registry.
         options.Events.OnValidatePrincipal = async context =>
         {
-            // Public health/readiness do not read the guest principal. Let
-            // the normal authentication middleware run for every route, but
-            // avoid Redis ticket validation here: a browser may attach an
-            // unrelated guest cookie while polling liveness/readiness.
-            // This marker is attached by the server to exactly two endpoints;
-            // NEVER apply it to a route that reads HttpContext.User.
-            if (context.HttpContext.GetEndpoint()?.Metadata
-                    .GetMetadata<PublicProbeEndpoint>() is not null)
+            // Only explicitly marked, identity-independent endpoints can
+            // skip the guest Redis registry lookup: the two public deployment
+            // probes and the deterministic board preview. A browser can send
+            // a signed guest cookie to these routes even during Redis
+            // failure. Never mark a route that reads HttpContext.User,
+            // membership, a private roster or match state.
+            var metadata = context.HttpContext.GetEndpoint()?.Metadata;
+            if (metadata?.GetMetadata<PublicProbeEndpoint>() is not null ||
+                metadata?.GetMetadata<PublicBoardPreviewEndpoint>() is not null)
                 return;
 
             var principal = context.Principal;
@@ -631,7 +632,7 @@ app.MapGet("/api/preview/board", (int? radius, BoardPreviewService board) =>
         radius = requestedRadius,
         cells = board.Create(requestedRadius).Select(c => new { q = c.Q, r = c.R, s = c.S })
     });
-});
+}).WithMetadata(new PublicBoardPreviewEndpoint());
 
 app.Run();
 
