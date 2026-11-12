@@ -98,11 +98,18 @@ public sealed class RedisTlsProductionTests
             server.Services.GetRequiredService<IConnectionMultiplexer>());
         await sampler.SampleOnceAsync();
 
-        Assert.Contains(
-            capture.For(MultiplayerMetrics.RedisReplicationObservationsName),
-            sample => sample.Tags["role"] == "master" &&
-                      sample.Tags["outcome"] == "ok" &&
-                      sample.Tags["link"] == "na");
+        // Print ONLY the finite enum labels (never Redis connection
+        // details or exception messages) when a real TLS integration fails.
+        var observed = capture.For(MultiplayerMetrics.RedisReplicationObservationsName);
+        Assert.True(observed.Any(sample =>
+                sample.Tags["role"] == "master" &&
+                sample.Tags["outcome"] == "ok" &&
+                sample.Tags["link"] == "na"),
+            "Safe INFO probe status: " + string.Join("; ",
+                observed.Select(sample =>
+                    sample.Tags["role"] + "/" +
+                    sample.Tags["link"] + "/" +
+                    sample.Tags["outcome"])));
         Assert.Contains(
             capture.ForDurations(MultiplayerMetrics.RedisConnectedReplicasName),
             sample => sample.Seconds == 0 && sample.Tags.Count == 0);
