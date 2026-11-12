@@ -7,3 +7,12 @@ namespace Shirokuro.Api.Security;
 /// operations still verify the authoritative session registry.
 /// </summary>
 public sealed record PublicProbeEndpoint();
+
+/// <summary>
+/// Separate, server-owned marker for the public deterministic hex board
+/// preview. The response uses no cookie identity or private match data.
+/// Unlike protected lobby or match routes, it must not need a guest Redis
+/// authority lookup merely because the browser attaches a signed cookie.
+/// Do not use this marker for any endpoint that consumes HttpContext.User.
+/// </summary>
+public sealed record PublicBoardPreviewEndpoint();
