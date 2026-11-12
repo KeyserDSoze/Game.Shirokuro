@@ -55,7 +55,7 @@ public static class GuestLobbyEndpoints
             return await Respond(async () => Results.Ok(await lobby.JoinAsync(
                 roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
-        });
+        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
 
         route.MapPatch("/{roomId}/hero", async (string roomId, ChooseHeroRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
@@ -65,7 +65,7 @@ public static class GuestLobbyEndpoints
             return await Respond(async () => Results.Ok(await lobby.ChooseHeroAsync(
                 roomId, actor!, request.HeroId, request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
-        });
+        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
 
         route.MapPatch("/{roomId}/team", async (string roomId, ChangeTeamRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
@@ -75,7 +75,7 @@ public static class GuestLobbyEndpoints
             return await Respond(async () => Results.Ok(await lobby.ChangeTeamAsync(
                 roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
-        });
+        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
 
         route.MapDelete("/{roomId}/membership", async (string roomId, [FromBody] LeaveRoomRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
@@ -88,7 +88,7 @@ public static class GuestLobbyEndpoints
                     context.RequestAborted);
                 return Results.NoContent();
             }, context.RequestAborted);
-        });
+        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
     }
 
     private static bool TryGuest(
