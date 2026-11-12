@@ -17,6 +17,12 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
 {
     public async Task<LobbyRosterView> GetRoster(string lobbyId)
     {
+        // A cached SignalR principal may outlive revocation. Malformed room
+        // input, however, cannot be a real server-issued lobby: reject it
+        // before any guest Redis authority lookup or room storage access.
+        if (!CanonicalLobbyId.IsValid(lobbyId))
+            throw new HubException("Lobby unavailable.");
+
         var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(Context.User);
         if (trustedPlayerId is null)
         {
