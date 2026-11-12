@@ -320,7 +320,7 @@ test('guest session revoked in another tab clears private roster on focus withou
   await expect(second.getByTestId('lobby-message')).toContainText('scaduta o revocata')
 })
 
-test('401 on a lobby action resets private state, but 403/429/503 do not revoke a valid guest', async ({ page }) => {
+test('401 revokes lobby state, while 400/403/429 and transient HTTP/network errors preserve a valid guest', async ({ page }) => {
   await page.goto('/')
   await page.getByTestId('lobby-sign-in').click()
   await expect(page.getByTestId('lobby-player')).toContainText('guest-')
@@ -337,6 +337,8 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   await expect(page.getByTestId('lobby-player')).toContainText('guest-')
   await page.unroute('**/api/sessions/me')
 
+  const initialRevision = await page.getByTestId('lobby-revision').textContent()
+  const initialRoster = await page.getByTestId('lobby-roster').textContent()
   let responseStatus = 503
   await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
     await route.fulfill({
@@ -347,7 +349,10 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   })
 
   for (const [status, expected] of [
-    [503, 'server non raggiungibile'],
+    [502, 'temporaneamente non disponibile'],
+    [503, 'temporaneamente non disponibile'],
+    [504, 'temporaneamente non disponibile'],
+    [400, 'Richiesta non valida'],
     [403, 'Accesso non autorizzato'],
     [429, 'Troppe richieste'],
   ] as const) {
@@ -356,7 +361,34 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
     await expect(page.getByTestId('lobby-message')).toContainText(expected)
     await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
     await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+    await expect(page.getByTestId('lobby-revision')).toHaveText(initialRevision!)
+    await expect(page.getByTestId('lobby-roster')).toHaveText(initialRoster!)
   }
+
+  // Unlike a rejected input, a failed network fetch is not evidence of
+  // invalid guest identity or server revision. No automatic replay of the
+  // denied mutation is permitted; recovery is a separate user click.
+  await page.unroute('**/api/lobbies/' + existingRoom + '/team')
+  let abortedMutations = 0
+  await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
+    abortedMutations++
+    await route.abort('failed')
+  })
+  await page.getByTestId('lobby-new-team').selectOption('black')
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  expect(abortedMutations).toBe(1)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
+  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await expect(page.getByTestId('lobby-revision')).toHaveText(initialRevision!)
+  await expect(page.getByTestId('lobby-roster')).toHaveText(initialRoster!)
+  await page.unroute('**/api/lobbies/' + existingRoom + '/team')
+
+  // Server connectivity recovered. Only the explicit new confirmation can
+  // commit the team change; a stale response never did it in the background.
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Squadra aggiornata')
+  await expect(page.getByTestId('lobby-roster')).toContainText('black')
 
   // After a 409, an unavailable roster read must not retry the mutation or
   // fabricate a new revision. Avoid extra guest logins in parallel E2E.
