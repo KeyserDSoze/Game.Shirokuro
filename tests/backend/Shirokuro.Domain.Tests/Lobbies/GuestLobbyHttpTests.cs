@@ -1,5 +1,5 @@
 using System.Net;
-using System.Text;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -383,95 +383,99 @@ public sealed class GuestLobbyHttpTests
         Assert.Equal("no-store", health.Headers.CacheControl?.ToString());
     }
 
+    // TestServer.SendAsync(HttpContext) does not synthesize a real HTTP
+    // request body. Use HttpClient/JsonContent for realistic room mutations,
+    // while this test-only middleware injects the simulated TCP peer before
+    // the application's trusted-proxy and rate-limit pipeline.
+    private sealed class TestPeerAddressStartupFilter : IStartupFilter
+    {
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) =>
+            app =>
+            {
+                app.Use(async (context, proceed) =>
+                {
+                    if (context.Request.Headers.TryGetValue(
+                            "X-Shirokuro-Test-Peer", out var text) &&
+                        IPAddress.TryParse(text.ToString(), out var peer))
+                        context.Connection.RemoteIpAddress = peer;
+                    await proceed();
+                });
+                next(app);
+            };
+    }
+
     [Fact]
     public async Task DevelopmentQuotaUsesOneCanonicalIpForMappedIpv4OnBothPolicies()
     {
-        using var server = Server();
+        using var server = Server().WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+                services.AddSingleton<IStartupFilter, TestPeerAddressStartupFilter>()));
+        using var client = Client(server);
         var ipv4 = IPAddress.Parse("198.51.100.92");
         var mapped = IPAddress.Parse("::ffff:198.51.100.92");
         var independent = IPAddress.Parse("198.51.100.93");
         var cookies = new List<string>();
 
-        Task<HttpContext> IssueFrom(IPAddress ip) => server.Server.SendAsync(context =>
+        async Task<HttpResponseMessage> IssueFrom(IPAddress ip)
         {
-            context.Connection.RemoteIpAddress = ip;
-            context.Request.Method = "POST";
-            context.Request.Scheme = "http";
-            context.Request.Host = new HostString("localhost");
-            context.Request.Path = "/api/sessions/guest";
-            context.Request.Headers["Origin"] = "http://localhost";
-            context.Request.Headers["X-Shirokuro-Request"] = "1";
-        });
+            using var request = Write(HttpMethod.Post, "/api/sessions/guest",
+                withBody: false);
+            request.Headers.Add("X-Shirokuro-Test-Peer", ip.ToString());
+            return await client.SendAsync(request);
+        }
 
-        // Both IP representations are the same logical network peer.
-        // Switching between them must not provide a fresh guest budget.
+        // Same TCP client can be expressed as IPv4 or IPv4-mapped IPv6.
+        // Both representations must share the same guest issuance budget.
         for (var i = 0; i < 12; i++)
         {
-            var response = await IssueFrom(i % 2 == 0 ? ipv4 : mapped);
-            Assert.Equal(StatusCodes.Status200OK, response.Response.StatusCode);
+            using var response = await IssueFrom(i % 2 == 0 ? ipv4 : mapped);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             if (cookies.Count < 3)
-            {
-                var issued = response.Response.Headers.SetCookie.ToString();
-                Assert.StartsWith("Shirokuro.Session=", issued);
-                cookies.Add(issued.Split(';')[0]);
-            }
+                cookies.Add(Assert.Single(response.Headers.GetValues("Set-Cookie"))
+                    .Split(';')[0]);
         }
 
-        var limitedGuest = await IssueFrom(mapped);
-        Assert.Equal(StatusCodes.Status429TooManyRequests,
-            limitedGuest.Response.StatusCode);
-        Assert.Equal("no-store",
-            limitedGuest.Response.Headers.CacheControl.ToString());
-        Assert.True(int.TryParse(
-            limitedGuest.Response.Headers.RetryAfter.ToString(),
-            out var guestRetry));
-        Assert.InRange(guestRetry, 1, 60);
-        Assert.False(limitedGuest.Response.Headers.ContainsKey("Set-Cookie"));
-        Assert.Equal(StatusCodes.Status200OK,
-            (await IssueFrom(independent)).Response.StatusCode);
+        using (var limited = await IssueFrom(mapped))
+        {
+            Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
+            Assert.Equal("no-store", limited.Headers.CacheControl?.ToString());
+            Assert.NotNull(limited.Headers.RetryAfter?.Delta);
+            Assert.InRange(limited.Headers.RetryAfter!.Delta!.Value.TotalSeconds, 1, 60);
+            Assert.False(limited.Headers.Contains("Set-Cookie"));
+        }
+        using (var allowed = await IssueFrom(independent))
+            Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
 
-        var payload = Encoding.UTF8.GetBytes(
-            """{"teamIds":["white","black"],"teamId":"white"}""");
-        Task<HttpContext> CreateFrom(IPAddress ip, string cookie) =>
-            server.Server.SendAsync(context =>
-            {
-                context.Connection.RemoteIpAddress = ip;
-                context.Request.Method = "POST";
-                context.Request.Scheme = "http";
-                context.Request.Host = new HostString("localhost");
-                context.Request.Path = "/api/lobbies";
-                context.Request.Headers["Origin"] = "http://localhost";
-                context.Request.Headers["X-Shirokuro-Request"] = "1";
-                context.Request.Headers["Cookie"] = cookie;
-                context.Request.ContentType = "application/json";
-                context.Request.ContentLength = payload.Length;
-                context.Request.Body = new MemoryStream(payload, writable: false);
-            });
+        async Task<HttpResponseMessage> CreateFrom(IPAddress ip, string cookie)
+        {
+            using var request = Write(HttpMethod.Post, "/api/lobbies",
+                new { teamIds = new[] { "white", "black" }, teamId = "white" });
+            request.Headers.Add("X-Shirokuro-Test-Peer", ip.ToString());
+            request.Headers.Add("Cookie", cookie);
+            return await client.SendAsync(request);
+        }
 
-        // A fresh independent room policy (8/min) is separate from session
-        // issuance (12/min), but the two forms of the same IP must still
-        // share its single room-creation budget. Use separate guest creators
-        // to avoid the unrelated four-rooms-per-creator quota.
+        // The 8/min room-create policy is independent of session issuance,
+        // but still shares the canonical peer across both IP representations.
+        // Separate creators avoid the unrelated 4-room/creator budget.
         for (var i = 0; i < 8; i++)
         {
-            var response = await CreateFrom(
+            using var response = await CreateFrom(
                 i % 2 == 0 ? ipv4 : mapped, cookies[i / 4]);
-            Assert.Equal(StatusCodes.Status201Created, response.Response.StatusCode);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
-        var limitedRoom = await CreateFrom(mapped, cookies[2]);
-        Assert.Equal(StatusCodes.Status429TooManyRequests,
-            limitedRoom.Response.StatusCode);
-        Assert.Equal("no-store",
-            limitedRoom.Response.Headers.CacheControl.ToString());
-        Assert.True(int.TryParse(
-            limitedRoom.Response.Headers.RetryAfter.ToString(),
-            out var roomRetry));
-        Assert.InRange(roomRetry, 1, 60);
-        Assert.False(limitedRoom.Response.Headers.ContainsKey("Set-Cookie"));
+        using (var limited = await CreateFrom(mapped, cookies[2]))
+        {
+            Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
+            Assert.Equal("no-store", limited.Headers.CacheControl?.ToString());
+            Assert.NotNull(limited.Headers.RetryAfter?.Delta);
+            Assert.InRange(limited.Headers.RetryAfter!.Delta!.Value.TotalSeconds, 1, 60);
+            Assert.False(limited.Headers.Contains("Set-Cookie"));
+        }
 
-        // The third guest can still create a room behind a different IP.
-        Assert.Equal(StatusCodes.Status201Created,
-            (await CreateFrom(independent, cookies[2])).Response.StatusCode);
+        // A different trusted TCP peer keeps its own independent quota.
+        using var otherIpRoom = await CreateFrom(independent, cookies[2]);
+        Assert.Equal(HttpStatusCode.Created, otherIpRoom.StatusCode);
     }
 
     [Fact]
