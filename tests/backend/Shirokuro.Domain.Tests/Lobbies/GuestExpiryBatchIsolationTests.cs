@@ -172,8 +172,11 @@ public sealed class GuestExpiryBatchIsolationTests
         new(new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
             clock, lobby, index, fence);
 
-    [Fact]
-    public async Task PoisonedLobbyIndexNeverAcknowledgesGuestExpiryAndRetries()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InvalidLobbyIndexNeverAcknowledgesGuestExpiryAndRetries(
+        bool oversized)
     {
         var clock = new ManualClock();
         var guest = GuestSessions.NewPlayerId();
@@ -183,8 +186,12 @@ public sealed class GuestExpiryBatchIsolationTests
             RedisLobbyCommandTimeoutTests.IndexedRoomDatabase>();
         var fixture =
             (RedisLobbyCommandTimeoutTests.IndexedRoomDatabase)(object)database;
-        fixture.Members =
-            [(RedisValue)("guest-session:" + new string('a', 64))];
+        fixture.Members = oversized
+            ? Enumerable.Range(0, GuestLobbyCommands.MaxRooms + 1)
+                .Select(i => (RedisValue)RedisLobbyCommandTimeoutTests.IndexedKeyForRoom(
+                    "room-" + i.ToString("x32")))
+                .ToArray()
+            : [(RedisValue)("guest-session:" + new string('a', 64))];
 
         var store = new RedisLobbySnapshotStore(database, clock);
         var lobby = new RedisGuestLobbyRuntime(store, clock);

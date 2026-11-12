@@ -309,9 +309,16 @@ public sealed class RedisLobbySnapshotStore(
     public async Task<IReadOnlyList<Stored>> GetIndexedRoomsAsync(
         CancellationToken cancellationToken = default)
     {
+        // Global creation is capped at MaxRooms. Read at most one extra
+        // indexed member to detect damaged/legacy indices without accepting
+        // a partial cleanup or transferring an unbounded Redis response.
+        // ZRANGE's stop rank is inclusive.
         var members = await AwaitRedisAsync(
-            () => database.SortedSetRangeByRankAsync(GlobalIndexKey),
+            () => database.SortedSetRangeByRankAsync(
+                GlobalIndexKey, start: 0, stop: GuestLobbyCommands.MaxRooms),
             cancellationToken);
+        if (members.Length > GuestLobbyCommands.MaxRooms)
+            throw new LobbySnapshotUnavailableException();
         var result = new List<Stored>(members.Length);
         foreach (var member in members)
         {

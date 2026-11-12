@@ -355,15 +355,26 @@ public sealed class RedisLobbyCommandTimeoutTests
         public byte[]? Raw { get; set; }
         public List<string> ReadKeys { get; } = [];
         public int Writes { get; private set; }
+        public int ScanCalls { get; private set; }
+        public long? ScanStart { get; private set; }
+        public long? ScanStop { get; private set; }
 
         protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
             return method?.Name switch
             {
-                "SortedSetRangeByRankAsync" => Task.FromResult(Members),
+                "SortedSetRangeByRankAsync" => Scan(args),
                 "StringGetAsync" => Read(args),
                 _ => RejectWrite()
             };
+        }
+
+        private Task<RedisValue[]> Scan(object?[]? args)
+        {
+            ScanCalls++;
+            ScanStart = Convert.ToInt64(args![1]);
+            ScanStop = Convert.ToInt64(args[2]);
+            return Task.FromResult(Members);
         }
 
         private Task<RedisValue> Read(object?[]? args)
@@ -397,6 +408,66 @@ public sealed class RedisLobbyCommandTimeoutTests
         return (roomId, playerId, RedisLobbySnapshotCodec.Encode(
             new LobbySnapshot(state, DateTimeOffset.UtcNow,
                 playerId, QuotaTracked: true)));
+    }
+
+    [Fact]
+    public async Task AdministrativeScanIsBoundedEvenForAnEmptyIndex()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        Assert.Empty(await store.GetIndexedRoomsAsync());
+        Assert.Equal(1, fixture.ScanCalls);
+        Assert.Equal(0L, fixture.ScanStart);
+        Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Fact]
+    public async Task ExactlyMaxRoomsInIndexMayBeScannedWithoutTruncation()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = Enumerable.Range(0, GuestLobbyCommands.MaxRooms)
+            .Select(i => (RedisValue)IndexedKeyForRoom(
+                "room-" + i.ToString("x32")))
+            .ToArray();
+        // The indexed keys may disappear physically just after ZRANGE.
+        fixture.Raw = null;
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        Assert.Empty(await store.GetIndexedRoomsAsync());
+        Assert.Equal(1, fixture.ScanCalls);
+        Assert.Equal(0L, fixture.ScanStart);
+        Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
+        Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ReadKeys.Count);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Theory]
+    [InlineData(257)]
+    [InlineData(600)]
+    public async Task OversizedCapacityIndexFailsBeforeRoomReadsOrAnyCleanup(int count)
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        // A fake Redis result with >257 members additionally confirms the
+        // client never trusts the response length, even if Redis misbehaves.
+        fixture.Members = Enumerable.Range(0, count)
+            .Select(i => (RedisValue)IndexedKeyForRoom(
+                "room-" + i.ToString("x32")))
+            .ToArray();
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var error = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain("room-", error.Message);
+        Assert.DoesNotContain("Redis", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, fixture.ScanCalls);
+        Assert.Equal(0L, fixture.ScanStart);
+        Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
     }
 
     [Theory]
