@@ -47,7 +47,69 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
             return {1, tonumber(ARGV[1])}
         end
         local ttl = redis.call('PTTL', KEYS[1])
-        if tonumber(count) >= tonumber(ARGV[2]) then
+        -- Redis values are untrusted. Negative counters could grant
+        -- additional permits; absent/extended TTL violates the window.
+        -- Never mutate or reset a suspicious existing quota bucket.
+        if ttl < 1 or ttl > tonumber(ARGV[1]) or
+           #count > #ARGV[2] or
+           not string.match(count, '^[1-9][0-9]*
+        """;
+
+    public async Task<GuestMutationDecision> AcquireAsync(
+        GuestMutationRateLimit policy, IPAddress? trustedRemoteIp,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = Key(policy, trustedRemoteIp);
+        // A single Lua script serializes every participating API/node's
+        // check and increment. The bounded wait honours HTTP disconnects.
+        // Abandoning a client wait does NOT necessarily cancel a Lua script
+        // already accepted by Redis; do not retry, or assume quota was unused.
+        // No local permits/fallback are ever granted on an unknown result.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var redisResult = await database.ScriptEvaluateAsync(
+                Script, [key], [WindowMilliseconds, policy.PermitLimit])
+            .WaitAsync(timeout.Token);
+        var fields = (RedisResult[])redisResult!;
+        if (fields.Length != 2)
+            throw new InvalidDataException("Invalid distributed limit result.");
+        var status = (long)fields[0];
+        var remaining = (long)fields[1];
+        if (status is not (0 or 1) || remaining < 0 || remaining > WindowMilliseconds)
+            throw new InvalidDataException("Invalid distributed limit result.");
+        return new GuestMutationDecision(status == 1, remaining);
+    }
+
+    public static string Key(GuestMutationRateLimit policy, IPAddress? remoteIp)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        _ = policy.PermitLimit; // Fail closed on unexpected enum variants.
+        var canonicalIp = remoteIp?.IsIPv4MappedToIPv6 == true
+            ? remoteIp.MapToIPv4() : remoteIp;
+        var address = canonicalIp?.GetAddressBytes() ?? [0xff];
+        // A native IPv6 device can rotate the lower 64 interface-ID bits
+        // without changing its delegated network. Charge the stable /64
+        // instead; keep native/mapped IPv4 and missing-IP keys unchanged.
+        // Only the SHA-256 digest, never the raw prefix, enters Redis.
+        if (canonicalIp?.AddressFamily == AddressFamily.InterNetworkV6)
+            address = address[..8];
+        var digest = Convert.ToHexStringLower(SHA256.HashData(address));
+        var scope = policy.Kind == GuestMutationKind.SessionIssuance
+            ? "sessions" : "rooms";
+        return "shirokuro:ratelimit:v1:" + scope + ":" + digest;
+    }
+}
+) then
+            return {-1, 0}
+        end
+        local current = tonumber(count)
+        if not current or current > tonumber(ARGV[2]) then
+            return {-1, 0}
+        end
+        if current >= tonumber(ARGV[2]) then
             return {0, ttl}
         end
         redis.call('INCR', KEYS[1])
