@@ -199,7 +199,12 @@ builder.Services.AddRateLimiter(options =>
     };
     options.AddPolicy("guest-room-creation", context =>
         RateLimitPartition.GetFixedWindowLimiter(
-            context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
+            // Match the Redis Production limiter's canonical trusted TCP
+            // address: IPv4 and ::ffff:IPv4 MUST share one technical quota.
+            // The hashed partition also avoids retaining literal IP strings.
+            RedisGuestMutationLimiter.Key(
+                new GuestMutationRateLimit(GuestMutationKind.RoomCreation),
+                context.Connection.RemoteIpAddress),
             _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 8,
@@ -209,7 +214,9 @@ builder.Services.AddRateLimiter(options =>
             }));
     options.AddPolicy("guest-session-issuance", context =>
         RateLimitPartition.GetFixedWindowLimiter(
-            context.Connection.RemoteIpAddress?.ToString() ?? "unknown-client",
+            RedisGuestMutationLimiter.Key(
+                new GuestMutationRateLimit(GuestMutationKind.SessionIssuance),
+                context.Connection.RemoteIpAddress),
             _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 12,
