@@ -21,6 +21,9 @@ public static class RedisReplicationInfo
         RedisReplicaLink? link = null;
         int? connected = null;
         int? maxLag = null;
+        // A primary reports exactly one slaveN row per connected replica.
+        // Refuse incomplete or duplicate rows rather than reporting success.
+        var replicaIndices = new HashSet<int>();
 
         foreach (var line in info.Split('\n'))
         {
@@ -69,6 +72,10 @@ public static class RedisReplicationInfo
                         key.Length <= 5 ||
                         !key[5..].All(c => c is >= '0' and <= '9'))
                         break;
+                    if (!int.TryParse(key.AsSpan(5), NumberStyles.None,
+                            CultureInfo.InvariantCulture, out var replicaIndex) ||
+                        !replicaIndices.Add(replicaIndex))
+                        throw new FormatException(InvalidInfo);
 
                     string? state = null;
                     int? lag = null;
@@ -90,6 +97,8 @@ public static class RedisReplicationInfo
                             lag = seconds;
                         }
                     }
+                    if (string.IsNullOrEmpty(state))
+                        throw new FormatException(InvalidInfo);
                     if (state == "online")
                     {
                         if (lag is null)
@@ -103,7 +112,7 @@ public static class RedisReplicationInfo
         return role switch
         {
             RedisReplicationRole.Primary when connected is not null &&
-                link is null => new RedisReplicationSnapshot(
+                connected == replicaIndices.Count && link is null => new RedisReplicationSnapshot(
                     RedisReplicationRole.Primary,
                     RedisReplicaLink.NotApplicable, connected, maxLag),
             RedisReplicationRole.Replica when link is not null =>

@@ -93,6 +93,13 @@ public sealed class RedisReplicationMonitoringTests
     [InlineData("role:master\nconnected_slaves:0\nrole:master")]
     [InlineData("role:slave\nmaster_link_status:up\nmaster_link_status:down")]
     [InlineData("role:master\nconnected_slaves:0\nmaster_link_status:up")]
+    [InlineData("role:master\nconnected_slaves:1")]
+    [InlineData("role:master\nconnected_slaves:0\nslave0:state=online,lag=0")]
+    [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=1")]
+    [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=1\nslave0:state=online,lag=3")]
+    [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=1\nslave00:state=online,lag=3")]
+    [InlineData("role:master\nconnected_slaves:1\nslave2147483648:state=online,lag=1")]
+    [InlineData("role:master\nconnected_slaves:1\nslave0:lag=1")]
     [InlineData("role:slave\nmaster_link_status:broken")]
     public void InvalidReplicationInfoFailsWithConstantNonSensitiveMessage(string raw)
     {
@@ -173,7 +180,7 @@ public sealed class RedisReplicationMonitoringTests
     {
         using var metrics = new MultiplayerMetricCapture();
         var primary = RedisReplicationInfo.Parse(
-            "role:master\nconnected_slaves:1");
+            "role:master\nconnected_slaves:0");
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordRedisReplication(null,
                 (RedisReplicationPollOutcome)777));
