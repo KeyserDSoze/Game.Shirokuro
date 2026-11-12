@@ -1686,3 +1686,28 @@ SignalR still authorize per request; do not infer any new match rules.
 A resumed browser must explicitly sign in again after revocation.
 Playwright exercises a real 200 roster generated before logout whose
 delivery is delayed until a newly issued guest identity is visible.
+
+## Redis guest authority outage versus definite revocation (#73)
+
+The guest cookie validation path now differentiates a server-confirmed
+**inactive** guest ticket (missing, expired, mismatched or cutoff) from a
+shared Redis `IDistributedCache` **unavailable** result (exception or
+2-second GET timeout). Both reject authentication; neither restores a guest
+from local memory or trusts client-supplied status. For endpoints with
+`RequireAuthorization`, the cookie challenge returns `401` only for
+a certainly invalid guest, and sanitized **`503` + `Cache-Control:
+no-store`** for Redis authority failures. This includes HTTP member roster
+and SignalR negotiation. It never emits `Set-Cookie` or a Redis error
+message. A missing cookie remains `401` even if Redis is unhealthy.
+The shared session's existing cookie is not replaced or cleared; once
+Redis recovers the same valid cookie can authenticate again.
+
+An unavailable authority still grants **no** protected data or SignalR
+connection; this is fail-closed security with honest availability status.
+The frontend's prior #71 safeguard intentionally retains a guest/room on
+`503` and only clears them on a true `401`. A protected endpoint
+returns `503` for an unavailable Redis validation, NOT proof that the
+guest remains valid: only a subsequent healthy Redis read can grant access.
+The independent `/api/health` liveness route remains public, while
+readiness evaluates the actual Redis dependencies separately. This does
+not change Redis cluster HA requirements or ensure availability (#21).

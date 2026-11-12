@@ -28,6 +28,7 @@ public sealed class GuestSessionCacheTimeoutTests
         public int RemoveCalls => Volatile.Read(ref _removes);
         public int TotalCalls => GetCalls + SetCalls + RemoveCalls;
         public bool BlockGet { get; set; }
+        public bool FailGet { get; set; }
         public bool BlockSet { get; set; }
         public bool BlockRemove { get; set; }
 
@@ -45,6 +46,9 @@ public sealed class GuestSessionCacheTimeoutTests
             CancellationToken token = default)
         {
             Interlocked.Increment(ref _gets);
+            if (FailGet)
+                return Task.FromException<byte[]?>(
+                    new IOException("sensitive private Redis connection detail"));
             return BlockGet ? PendingGet.Task : Task.FromResult(Get(key));
         }
 
@@ -270,7 +274,7 @@ public sealed class GuestSessionCacheTimeoutTests
     }
 
     [Fact]
-    public async Task ProductionDelayedAuthorityReadDeniesCookieAndRecovers()
+    public async Task ProductionDelayedAuthorityReadReturns503AndRecoversWithSameCookie()
     {
         var cache = new StalledCache();
         using var server = Production(cache);
@@ -282,8 +286,12 @@ public sealed class GuestSessionCacheTimeoutTests
         using (var denied = await member.GetAsync("/api/sessions/me")
             .WaitAsync(TestDeadline))
         {
-            Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
             Assert.False(denied.Headers.Contains("Set-Cookie"));
+            Assert.DoesNotContain("Redis",
+                await denied.Content.ReadAsStringAsync(),
+                StringComparison.OrdinalIgnoreCase);
         }
         cache.BlockGet = false;
         using var accepted = await member.GetAsync("/api/sessions/me");
@@ -318,5 +326,95 @@ public sealed class GuestSessionCacheTimeoutTests
             Assert.Equal(HttpStatusCode.NoContent, succeeded.StatusCode);
         using var revoked = await member.GetAsync("/api/sessions/me");
         Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuthorityStatusDistinguishesAbsentTicketFromCacheFailure()
+    {
+        var cache = new StalledCache();
+        var (registry, principal) = await Registered(cache);
+        Assert.Equal(GuestSessionAuthorityStatus.Active,
+            await registry.CheckAuthorityAsync(principal));
+        Assert.Equal(GuestSessionAuthorityStatus.Inactive,
+            await registry.CheckAuthorityAsync(null));
+
+        cache.FailGet = true;
+        Assert.Equal(GuestSessionAuthorityStatus.Unavailable,
+            await registry.CheckAuthorityAsync(principal));
+        Assert.False(await registry.IsActiveAsync(principal));
+        cache.FailGet = false;
+
+        Assert.True(await registry.RevokeAsync(principal));
+        Assert.Equal(GuestSessionAuthorityStatus.Inactive,
+            await registry.CheckAuthorityAsync(principal));
+    }
+
+    [Fact]
+    public async Task ProductionAuthorityOutageNeverAuthorizesHttpOrSignalR()
+    {
+        var cache = new StalledCache();
+        using var server = Production(cache);
+        using var visitor = Client(server);
+        var cookie = await Issue(visitor);
+        using var member = Client(server, cookie);
+
+        // A previously issued cookie remains stored, but no protected data
+        // or negotiation is reachable without Redis confirming its ticket.
+        cache.FailGet = true;
+        var calls = cache.GetCalls;
+        foreach (var path in new[]
+        {
+            "/api/sessions/me",
+            "/api/lobbies/room-00000000000000000000000000000000/roster"
+        })
+        {
+            using var response = await member.GetAsync(path);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+            Assert.DoesNotContain("sensitive private Redis",
+                await response.Content.ReadAsStringAsync());
+        }
+
+        using (var negotiate = await member.PostAsync(
+            "/hubs/lobbies/negotiate?negotiateVersion=1", content: null))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, negotiate.StatusCode);
+            Assert.Equal("no-store", negotiate.Headers.CacheControl?.ToString());
+            Assert.False(negotiate.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(calls + 3, cache.GetCalls);
+
+        // A truly absent cookie is still 401 even if Redis is offline;
+        // it does not manufacture an availability check or leak its state.
+        using (var anonymous = Client(server))
+        using (var denied = await anonymous.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+        }
+        Assert.Equal(calls + 3, cache.GetCalls);
+        using (var health = await visitor.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+
+        cache.FailGet = false;
+        using var recovered = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+    }
+
+    [Fact]
+    public async Task ProductionConfirmedRevocationIsStill401NotTemporary503()
+    {
+        var cache = new StalledCache();
+        using var server = Production(cache);
+        using var visitor = Client(server);
+        var cookie = await Issue(visitor);
+        using var member = Client(server, cookie);
+        using (var logout = Mutate(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var response = await member.SendAsync(logout))
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using var denied = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
     }
 }

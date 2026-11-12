@@ -282,6 +282,16 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   await page.getByTestId('lobby-create').click()
   const existingRoom = (await page.getByTestId('lobby-room-code').textContent())!.trim()
 
+  // The same session-check API used by focus/visibility must not turn a
+  // transient Redis verification outage (503) into an apparent logout.
+  await page.route('**/api/sessions/me', async route => {
+    await route.fulfill({ status: 503, headers: { 'Cache-Control': 'no-store' } })
+  })
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
+  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await page.unroute('**/api/sessions/me')
+
   let responseStatus = 503
   await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
     await route.fulfill({

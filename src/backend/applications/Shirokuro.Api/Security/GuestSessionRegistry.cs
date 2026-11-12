@@ -6,6 +6,15 @@ using Microsoft.Extensions.Caching.Distributed;
 
 namespace Shirokuro.Api.Security;
 
+// Never confuse an unavailable shared authority with a proven invalid
+// ticket. Neither status grants access; only Active can authenticate.
+public enum GuestSessionAuthorityStatus
+{
+    Active,
+    Inactive,
+    Unavailable
+}
+
 /// <summary>
 /// A signed cookie contains a random session ID; in Production/Staging
 /// Redis is authoritative for validity/revocation across API instances.
@@ -23,6 +32,10 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     private const int ValueLength = sizeof(long) + 32; // UTC ticks + SHA-256(player ID)
     // Bounded client wait; does not cancel a Redis command already delivered.
     public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
+
+    // Per-request HttpContext.Items sentinel. Never expose availability
+    // details to the browser; the cookie challenge uses this only for 503.
+    public static readonly object UnavailableRequestMarker = new();
 
     /// <summary>Registers a random, server-issued token for local Development.</summary>
     public string Register(string trustedPlayerId, DateTimeOffset expiresUtc)
@@ -85,24 +98,39 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
     /// A shared-store outage denies access instead of trusting local memory.
     /// </summary>
     public async Task<bool> IsActiveAsync(
+        ClaimsPrincipal? principal, CancellationToken cancellationToken = default) =>
+        await CheckAuthorityAsync(principal, cancellationToken) ==
+            GuestSessionAuthorityStatus.Active;
+
+    /// <summary>
+    /// Cookie validation needs to distinguish a missing/revoked ticket from
+    /// Redis being temporarily unable to verify it. Both reject access;
+    /// only a definitively inactive ticket should trigger a 401 and client
+    /// identity reset. The older boolean API stays fail-closed for SignalR.
+    /// </summary>
+    public async Task<GuestSessionAuthorityStatus> CheckAuthorityAsync(
         ClaimsPrincipal? principal, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (sharedCache is null)
-            return IsActive(principal);
+            return IsActive(principal) ? GuestSessionAuthorityStatus.Active
+                : GuestSessionAuthorityStatus.Inactive;
         if (!TryClaims(principal, out var token, out var playerId))
-            return false;
+            return GuestSessionAuthorityStatus.Inactive;
         try
         {
             var value = await AwaitCacheAsync(
                 sharedCache.GetAsync(SharedKey(token), cancellationToken),
                 cancellationToken);
-            return Matches(value, playerId, clock.GetUtcNow());
+            return Matches(value, playerId, clock.GetUtcNow())
+                ? GuestSessionAuthorityStatus.Active
+                : GuestSessionAuthorityStatus.Inactive;
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
-            // Availability is not permission: a Redis outage is fail-closed.
-            return false;
+            // A Redis failure or command deadline is NOT proof of revocation.
+            // Still deny access; never fall back to local session tracking.
+            return GuestSessionAuthorityStatus.Unavailable;
         }
     }
 

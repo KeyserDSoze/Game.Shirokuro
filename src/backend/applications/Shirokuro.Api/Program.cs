@@ -121,14 +121,35 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
 
                 var registry = context.HttpContext.RequestServices
                     .GetRequiredService<GuestSessionRegistry>();
-                if (!await registry.IsActiveAsync(
-                        principal, context.HttpContext.RequestAborted))
+                var authority = await registry.CheckAuthorityAsync(
+                    principal, context.HttpContext.RequestAborted);
+                if (authority != GuestSessionAuthorityStatus.Active)
+                {
+                    // The ticket was not authenticated in either case.
+                    // Mark only this server-owned request, never a cookie or
+                    // a client-supplied header, for an accurate 503 challenge.
+                    if (authority == GuestSessionAuthorityStatus.Unavailable)
+                        context.HttpContext.Items[
+                            GuestSessionRegistry.UnavailableRequestMarker] = true;
                     context.RejectPrincipal();
+                }
             }
         };
         options.Events.OnRedirectToLogin = context =>
         {
-            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            // An unavailable Redis authority is neither a valid login nor a
+            // proven revoked ticket. 503 preserves the browser's signed
+            // cookie while denying every protected route and negotiation.
+            if (context.HttpContext.Items.ContainsKey(
+                    GuestSessionRegistry.UnavailableRequestMarker))
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            }
+            else
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            }
             return Task.CompletedTask;
         };
         options.Events.OnRedirectToAccessDenied = context =>
