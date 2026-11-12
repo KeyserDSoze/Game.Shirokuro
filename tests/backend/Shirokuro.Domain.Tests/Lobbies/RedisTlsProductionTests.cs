@@ -94,8 +94,24 @@ public sealed class RedisTlsProductionTests
         using (var ready = await client.GetAsync("/api/ready"))
             Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
 
-        var sampler = new RedisReplicationSampler(
-            server.Services.GetRequiredService<IConnectionMultiplexer>());
+        var redis = server.Services.GetRequiredService<IConnectionMultiplexer>();
+        var servers = redis.GetEndPoints(configuredOnly: false)
+            .Select(endpoint => redis.GetServer(endpoint)).ToArray();
+        Assert.Contains(servers, endpoint => endpoint.IsConnected);
+        var connected = servers.First(endpoint => endpoint.IsConnected);
+        try
+        {
+            // Directly assert the server-level INFO command; if a client
+            // blocks it, print ONLY a bounded exception category in CI.
+            var raw = await connected.InfoRawAsync("replication");
+            Assert.Equal(RedisReplicationRole.Primary,
+                RedisReplicationInfo.Parse(raw).Role);
+        }
+        catch (Exception ex)
+        {
+            Assert.Fail("Safe INFO command failure type: " + ex.GetType().Name);
+        }
+        var sampler = new RedisReplicationSampler(redis);
         await sampler.SampleOnceAsync();
 
         // Print ONLY the finite enum labels (never Redis connection
