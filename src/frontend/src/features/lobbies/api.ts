@@ -19,14 +19,22 @@ export class LobbyHttpError extends Error {
   }
 }
 
+/** A local input error must never be mistaken for a failed network fetch. */
+export class LobbyInputError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LobbyInputError'
+  }
+}
+
 /** Technical validation only. This is not a rule about in-game team sizes. */
 export function parseTeamIds(input: string): string[] {
-  if (input.length > 100) throw new Error('Invalid teams')
+  if (input.length > 100) throw new LobbyInputError('Invalid teams')
   const teams = input.split(',').map(value => value.trim())
   if (teams.length < 2 || teams.length > 4 ||
       teams.some(team => !/^[a-z0-9-]{1,24}$/.test(team)) ||
       new Set(teams).size !== teams.length) {
-    throw new Error('Invalid teams')
+    throw new LobbyInputError('Invalid teams')
   }
   return teams
 }
@@ -34,7 +42,7 @@ export function parseTeamIds(input: string): string[] {
 /** Reject malformed or injected invite references before issuing a request. */
 export function parseInviteCode(input: string): string {
   const code = input.trim()
-  if (!/^room-[0-9a-f]{32}$/.test(code)) throw new Error('Invalid invitation')
+  if (!/^room-[0-9a-f]{32}$/.test(code)) throw new LobbyInputError('Invalid invitation')
   return code
 }
 
