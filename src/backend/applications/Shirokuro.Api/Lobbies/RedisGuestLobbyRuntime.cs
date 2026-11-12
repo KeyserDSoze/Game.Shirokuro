@@ -115,7 +115,10 @@ public sealed class RedisGuestLobbyRuntime(
                 trustedPlayerId, cancellationToken))
                 return Project(found.Snapshot.State);
         }
-        throw new InvalidOperationException("Concurrent lobby reads exceeded retry budget.");
+        // Distinguish exhausted *read heartbeat* CAS contention from a
+        // programmer error or a user revision conflict. Never return the
+        // previously observed, possibly stale member roster after this.
+        throw new LobbyReadContentionException();
     }
 
     /// <summary>
