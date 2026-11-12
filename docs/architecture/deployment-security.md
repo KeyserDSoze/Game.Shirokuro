@@ -1521,3 +1521,31 @@ and corrupted PFX on **both** active and previous-certificate paths,
 with fixed error message, no `InnerException` and no secret path/password
 in `ToString()`. Valid key-ring rotation and portability tests are
 unchanged.
+
+## Early CSRF admission guard for guest and lobby budgets (#67)
+
+The two known, server-marked `GuestMutationRateLimit` POST routes
+(`/api/sessions/guest` and `/api/lobbies`) check the canonical Origin
+allowlist and `X-Shirokuro-Request: 1` **after authentication/authorization
+but before Redis Lua admission or the local Development limiter**. Invalid
+intents are rejected with HTTP `403`, `Cache-Control: no-store`, no
+`Retry-After` and no cookie, **without decrementing any rate-limit budget**.
+The original endpoint-level CSRF checks remain as independent defense in
+depth. Middleware selects the routes by their trusted metadata, never by
+comparing a client-provided path/case/query.
+
+Previously even a rejected cross-origin POST could consume one of the
+12 guest issuance/minute or 8 room creation/minute per-IP slots, exhausting
+the shared NAT client's allowance or turning a 403 into a 429/503 if Redis
+was slow. After this fix, **authorized** intents still go through the
+unchanged Redis-based atomically shared quota (and its 2s fail-closed
+admission timeout from #65). The Development budget also no longer counts
+invalid-origin guest attempts; 18 rejected submissions cannot exhaust its
+12/minute local threshold. xUnit TestServer regressions cover both
+Production routes, unavailable limiter, room membership, and Development.
+
+This is not a general anti-bot barrier: an automated client can forge
+its own Origin and request intent header, and cookie authentication may
+still need a shared session lookup *before* this middleware. Edge-layer
+traffic controls, identity abuse and deployment-grade observability remain
+open in #21.

@@ -233,6 +233,25 @@ if (app.Environment.IsDevelopment())
 app.UseAuthentication();
 app.UseAuthorization();
 
+// Reject invalid cookie-backed POST intents BEFORE spending the shared
+// Redis (or Development local) admission budget. Previously the endpoint
+// guard ran only after the limiter: cross-origin traffic could deplete a
+// trusted client's per-IP quota and turn a CSRF rejection into 429/503.
+// Trusted metadata, not user input or path spellings, selects the two routes.
+// Keep the endpoint's own guard as defense in depth.
+app.Use(async (context, next) =>
+{
+    if (context.GetEndpoint()?.Metadata.GetMetadata<GuestMutationRateLimit>()
+            is not null &&
+        !WebMutationGuard.Allows(context, app.Environment))
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return;
+    }
+    await next(context);
+});
+
 // Routing/authorization have already selected a trusted endpoint. Only the
 // two explicit POST endpoints carry metadata, avoiding URL/case aliases
 // bypassing a path-based filter. Redis errors deny issuance/creation (503).
