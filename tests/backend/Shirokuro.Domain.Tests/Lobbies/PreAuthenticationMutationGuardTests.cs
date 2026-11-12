@@ -280,7 +280,22 @@ public sealed class PreAuthenticationMutationGuardTests
         {
             using var probe = await guest.GetAsync(route);
             Assert.Equal(HttpStatusCode.OK, probe.StatusCode);
+            Assert.Equal("no-store", probe.Headers.CacheControl?.ToString());
             Assert.False(probe.Headers.Contains("Set-Cookie"));
+            using var body = JsonDocument.Parse(
+                await probe.Content.ReadAsStringAsync());
+            if (route == "/api/health")
+            {
+                Assert.Equal("ok", body.RootElement.GetProperty("status").GetString());
+                Assert.Equal("Shirokuro",
+                    body.RootElement.GetProperty("application").GetString());
+                Assert.Equal(2, body.RootElement.EnumerateObject().Count());
+            }
+            else
+            {
+                Assert.Equal("ready", body.RootElement.GetProperty("status").GetString());
+                Assert.Single(body.RootElement.EnumerateObject());
+            }
         }
         Assert.Equal(0, cache.Reads);
         Assert.Equal(1, limiter.Calls); // Only initial issuance.
