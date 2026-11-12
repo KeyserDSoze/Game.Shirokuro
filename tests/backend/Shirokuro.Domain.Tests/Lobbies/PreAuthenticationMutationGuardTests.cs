@@ -392,6 +392,83 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task PublicHexPreviewWithSignedGuestCookieDoesNotRequireRedisAuthority()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // The browser may attach its signed guest cookie to the completely
+        // public hex preview. Redis is unavailable, but this endpoint never
+        // consumes the principal and must not wait for guest auth validation.
+        cache.Unavailable = true;
+        foreach (var (route, radius, expectedCells) in new[]
+                 {
+                     ("/api/preview/board", 2, 19),
+                     ("/api/preview/board?radius=1", 1, 7),
+                     ("/api/preview/board?radius=6", 6, 127)
+                 })
+        {
+            using var response = await guest.GetAsync(route);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.Equal(radius, json.RootElement.GetProperty("radius").GetInt32());
+            var cells = json.RootElement.GetProperty("cells");
+            Assert.Equal(expectedCells, cells.GetArrayLength());
+            Assert.All(cells.EnumerateArray(), cell =>
+                Assert.Equal(0,
+                    cell.GetProperty("q").GetInt32() +
+                    cell.GetProperty("r").GetInt32() +
+                    cell.GetProperty("s").GetInt32()));
+            Assert.Equal(0, cache.Reads);
+            Assert.Equal(1, limiter.Calls);
+        }
+
+        // Technical query validation is still enforced on public previews.
+        foreach (var invalid in new[]
+                 {
+                     "/api/preview/board?radius=0",
+                     "/api/preview/board?radius=7",
+                     "/api/preview/board?radius=not-a-number"
+                 })
+        {
+            using var response = await guest.GetAsync(invalid);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+            Assert.Equal(0, cache.Reads);
+        }
+
+        // No transitive bypass: protected identity and member-only roster
+        // paths still consult Redis and fail closed with 503/no-store.
+        foreach (var protectedPath in new[]
+                 {
+                     "/api/sessions/me",
+                     "/api/lobbies/room-00000000000000000000000000000000/roster"
+                 })
+        {
+            using var denied = await guest.GetAsync(protectedPath);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // A real protected session read works again only when Redis authority
+        // is available; public preview never granted guest authorization.
+        cache.Unavailable = false;
+        using var me = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+        Assert.Equal(3, cache.Reads);
+    }
+
+    [Fact]
     public async Task PublicProbesWithGuestCookieNeverAskUnavailableRedisForAuthentication()
     {
         var cache = new CountingCache();
