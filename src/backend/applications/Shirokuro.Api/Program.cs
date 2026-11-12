@@ -102,6 +102,16 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         // signed session token remains present in the server's active registry.
         options.Events.OnValidatePrincipal = async context =>
         {
+            // Public health/readiness do not read the guest principal. Let
+            // the normal authentication middleware run for every route, but
+            // avoid Redis ticket validation here: a browser may attach an
+            // unrelated guest cookie while polling liveness/readiness.
+            // This marker is attached by the server to exactly two endpoints;
+            // NEVER apply it to a route that reads HttpContext.User.
+            if (context.HttpContext.GetEndpoint()?.Metadata
+                    .GetMetadata<PublicProbeEndpoint>() is not null)
+                return;
+
             var principal = context.Principal;
             var playerId = AuthenticatedPlayerIdentity.FromPrincipal(principal);
             var claimsGuestKind = principal?.FindAll(GuestSessions.SessionKindClaim).Any() == true;
@@ -270,14 +280,11 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
-// Public liveness/readiness probes never consume a principal. A browser
-// can send a stale signed guest cookie automatically; validating it against
-// Redis would delay these probes during a session-authority outage.
-// Routing resolves server-owned metadata before this conditional branch.
-// Every protected API endpoint and SignalR still uses cookie authentication.
-app.UseWhen(
-    context => context.GetEndpoint()?.Metadata.GetMetadata<PublicProbeEndpoint>() is null,
-    branch => branch.UseAuthentication());
+// Keep authentication on the root pipeline so ASP.NET Core does NOT insert
+// an additional automatic authentication middleware before the CSRF guard.
+// For the public probes, OnValidatePrincipal skips only the Redis lookup,
+// not cookie middleware or protected-route authorization.
+app.UseAuthentication();
 app.UseAuthorization();
 
 // The two explicit POST endpoints alone carry admission-budget metadata.
