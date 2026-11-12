@@ -148,6 +148,56 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task BrowserSignalRRequiresTrustedOriginButAllowsViteAndNonBrowserClients()
+    {
+        using var server = CreateServer();
+        using var member = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        const string negotiate = "/hubs/lobbies/negotiate?negotiateVersion=1";
+
+        // A browser's cross-origin Vite development client is explicitly
+        // supported. No X-Shirokuro-Request mutation header is required.
+        foreach (var allowed in new[] { "http://localhost", "http://localhost:5173",
+                                        "http://127.0.0.1:5173" })
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, negotiate);
+            request.Headers.TryAddWithoutValidation("Origin", allowed);
+            using var response = await member.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        // Existing non-browser SignalR clients may omit Origin entirely.
+        using (var noOrigin = await member.PostAsync(negotiate, null))
+            Assert.Equal(HttpStatusCode.OK, noOrigin.StatusCode);
+
+        foreach (var hostile in new[] { "https://evil.example", "null",
+                                        "http://localhost:5173/path",
+                                        "http://attacker.localhost:5173",
+                                        "http://localhost:5173, http://evil.example" })
+        {
+            foreach (var (method, path) in new[]
+                     {
+                         (HttpMethod.Post, negotiate),
+                         (HttpMethod.Get, "/hubs/lobbies")
+                     })
+            {
+                using var request = new HttpRequestMessage(method, path);
+                request.Headers.TryAddWithoutValidation("Origin", hostile);
+                using var denied = await member.SendAsync(request);
+                Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+                Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+                Assert.False(denied.Headers.Contains("Set-Cookie"));
+            }
+        }
+
+        // The browser hub fence does not spill onto ordinary member-scoped
+        // HTTP reads or the unauthenticated liveness endpoint.
+        using var me = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+        using var health = await member.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+    }
+
+    [Fact]
     public async Task SignalRNegotiateRequiresAuthenticationEvenWithSpoofedHeaders()
     {
         using var server = CreateServer();
