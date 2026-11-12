@@ -53,6 +53,83 @@ public sealed class RedisLobbyCommandTimeoutTests
             !Set.Task.IsCompleted && !Scan.Task.IsCompleted;
     }
 
+    public class RepeatedlyContendedRosterDatabase : DispatchProxy
+    {
+        public byte[] EncodedSnapshot { get; set; } = [];
+        public int ConflictsBeforeSuccess { get; set; } = int.MaxValue;
+        private int _reads;
+        private int _casCalls;
+        public int Reads => Volatile.Read(ref _reads);
+        public int CasCalls => Volatile.Read(ref _casCalls);
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            return method?.Name switch
+            {
+                "StringGetAsync" => ReadSnapshot(),
+                "ScriptEvaluateAsync" => CompareExchange(),
+                _ => throw new InvalidOperationException(
+                    "Unexpected Redis operation in contention fixture.")
+            };
+        }
+
+        private Task<RedisValue> ReadSnapshot()
+        {
+            Interlocked.Increment(ref _reads);
+            return Task.FromResult((RedisValue)EncodedSnapshot);
+        }
+
+        private Task<RedisResult> CompareExchange()
+        {
+            var count = Interlocked.Increment(ref _casCalls);
+            // Simulate an atomic Lua CAS defeated by another member read
+            // heartbeat. No non-deterministic threads or production Redis
+            // sleeps are involved in exercising the 32-attempt boundary.
+            return Task.FromResult(RedisResult.Create(
+                (RedisValue)(count <= ConflictsBeforeSuccess ? 0 : 1),
+                ResultType.Integer));
+        }
+    }
+
+    [Theory]
+    [InlineData(31, true)]
+    [InlineData(32, false)]
+    public async Task RosterReadCasRetriesAreBoundedAndNeverReturnStaleData(
+        int conflicts, bool shouldSucceed)
+    {
+        var database = DispatchProxy.Create<IDatabase, RepeatedlyContendedRosterDatabase>();
+        var controller = (RepeatedlyContendedRosterDatabase)(object)database;
+        var room = "room-" + Guid.NewGuid().ToString("N");
+        var actor = GuestSessions.NewPlayerId();
+        var state = LobbyState.Create(
+            new LobbyDefinition(room, ["white", "black"], ["kira"]))
+            .Join(actor, "white", 0);
+        controller.EncodedSnapshot = RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(state, DateTimeOffset.UtcNow, actor, QuotaTracked: true));
+        controller.ConflictsBeforeSuccess = conflicts;
+        var clock = TimeProvider.System;
+        var runtime = new RedisGuestLobbyRuntime(
+            new RedisLobbySnapshotStore(database, clock), clock);
+
+        if (shouldSucceed)
+        {
+            var verified = await runtime.ForMemberAsync(room, actor);
+            Assert.Equal(room, verified.LobbyId);
+            Assert.Single(verified.Participants);
+            Assert.Equal(actor, verified.Participants[0].PlayerId);
+        }
+        else
+        {
+            var failed = await Assert.ThrowsAsync<LobbyReadContentionException>(
+                () => runtime.ForMemberAsync(room, actor));
+            Assert.DoesNotContain(room, failed.Message);
+            Assert.DoesNotContain(actor, failed.Message);
+        }
+
+        Assert.Equal(32, controller.Reads);
+        Assert.Equal(32, controller.CasCalls);
+    }
+
     private static (IDatabase Database, NeverRespondingDatabase Controller)
         Stalled()
     {
