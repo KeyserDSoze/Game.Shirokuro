@@ -1664,3 +1664,25 @@ room on the backend. Never treat UI clearing as the authorization boundary
 or assume Web Storage can revoke a signed cookie. Existing server-side
 Redis validation, membership checks and SignalR revalidation remain the
 security boundary. Operational abuse prevention remains parent #21.
+
+## Discarding late browser responses across guest identity transitions (#72)
+
+A successful Redis-authorized HTTP roster response is not tied to the
+browser's **current** guest if an old request was already in-flight when
+another tab revoked or replaced the cookie. The UI now tracks an in-memory
+session generation and operation sequence. On logout/expiry/revocation,
+foreign guest identity, or an authoritative 401, it increments both and
+clears session/room/invite/roster and the pending-action busy state.
+Every asynchronous mutation, roster refresh, login/logout and initial or
+focus session check verifies its generation *before* applying a result,
+error or status message. An old 401 cannot clear a replacement guest;
+an old 200 roster/room update cannot be shown under the new guest. An
+outdated operation's `finally` cannot unlock a newer in-progress action.
+Neither guest tokens nor private rosters are stored in Web Storage.
+
+This is an **in-memory UI defense** against delayed HTTP callbacks, not
+a way to cancel a server command that has already executed. API and
+SignalR still authorize per request; do not infer any new match rules.
+A resumed browser must explicitly sign in again after revocation.
+Playwright exercises a real 200 roster generated before logout whose
+delivery is delayed until a newly issued guest identity is visible.

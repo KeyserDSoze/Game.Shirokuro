@@ -24,6 +24,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const [invitedTeam, setInvitedTeam] = useState('black')
   const [newTeam, setNewTeam] = useState('white')
   const sessionChannelRef = useRef<BroadcastChannel | null>(null)
+  // Every identity transition invalidates async results started under the
+  // previous guest. The operation counter also prevents an old finally from
+  // clearing the busy flag of a newer request.
+  const sessionGenerationRef = useRef(0)
+  const operationRef = useRef(0)
+  const busyRef = useRef(false)
 
   // Broadcast only an opaque "recheck" signal: NEVER a cookie, player ID,
   // invitation code, roster or session state. Other tabs ask the API.
@@ -44,6 +50,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   // Drop every locally cached private room reference if the cookie becomes
   // invalid. Only the server may issue a replacement guest identity.
   const forgetGuest = useCallback(() => {
+    sessionGenerationRef.current++
+    operationRef.current++
+    busyRef.current = false
+    setBusy(false)
     setSession(null)
     setRoom(null)
     setInvite('')
@@ -51,9 +61,17 @@ export default function LobbyPanel({ previewHeroId }: Props) {
 
   useEffect(() => {
     let active = true
-    // Read-only: never create a guest identity automatically on page load.
+    const generation = sessionGenerationRef.current
+    // An initial GET may arrive after an explicit login or a revocation:
+    // it must never overwrite a newer server-issued guest identity.
     void guestLobbyApi.session()
-      .then(identity => { if (active && identity.kind === 'guest') setSession(identity) })
+      .then(identity => {
+        if (active && generation === sessionGenerationRef.current &&
+            identity.kind === 'guest') {
+          sessionGenerationRef.current++
+          setSession(identity)
+        }
+      })
       .catch(() => { /* API may be offline when exploring the local preview. */ })
     return () => { active = false }
   }, [])
@@ -63,26 +81,29 @@ export default function LobbyPanel({ previewHeroId }: Props) {
 
     let active = true
     const recheckOnFocus = () => {
+      // A late /me response for an earlier identity must not invalidate or
+      // restore a guest who authenticated while the read was pending.
+      const generation = sessionGenerationRef.current
       // Another tab can sign out or replace the cookie while this tab keeps
       // a room visible. Query the server on focus; never auto-issue a guest.
       void guestLobbyApi.session()
         .then(identity => {
-          if (!active) return
+          if (!active || generation !== sessionGenerationRef.current) return
           if (identity.kind !== 'guest') {
             forgetGuest()
             setMessage(t('lobbySessionExpired'))
           } else if (identity.playerId !== session.playerId) {
             // Different server-issued identity must not inherit the previous
             // guest's invite, room, roster or revision.
-            setRoom(null)
-            setInvite('')
+            forgetGuest()
             setSession(identity)
             setMessage(t('lobbySessionChanged'))
           }
         })
         .catch(error => {
           // A transient offline/503/403 response is not proof of revocation.
-          if (active && error instanceof LobbyHttpError && error.status === 401) {
+          if (active && generation === sessionGenerationRef.current &&
+              error instanceof LobbyHttpError && error.status === 401) {
             forgetGuest()
             setMessage(t('lobbySessionExpired'))
           }
@@ -106,13 +127,22 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
   }, [session, forgetGuest, t])
 
-  async function run(action: () => Promise<void>) {
-    if (busy) return
+  async function run(action: (isCurrent: () => boolean) => Promise<void>) {
+    if (busyRef.current) return
+    busyRef.current = true
+    const generation = sessionGenerationRef.current
+    const operation = ++operationRef.current
+    const isCurrent = () =>
+      generation === sessionGenerationRef.current &&
+      operation === operationRef.current
     setBusy(true)
     setMessage('')
     try {
-      await action()
+      await action(isCurrent)
     } catch (error) {
+      // An old 401 must not sign out a newer guest. Neither delayed errors
+      // nor successful responses may change state after any identity switch.
+      if (!isCurrent()) return
       if (error instanceof LobbyHttpError) {
         if (error.status === 401) {
           // The authoritative guest ticket no longer exists; an old room
@@ -133,7 +163,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         setMessage(t('lobbyInvalid'))
       }
     } finally {
-      setBusy(false)
+      if (operation === operationRef.current) {
+        busyRef.current = false
+        setBusy(false)
+      }
     }
   }
 
@@ -158,8 +191,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             type="button"
             data-testid="lobby-sign-in"
             disabled={busy}
-            onClick={() => void run(async () => {
+            onClick={() => void run(async isCurrent => {
               const own = await guestLobbyApi.signIn()
+              if (!isCurrent()) return
+              sessionGenerationRef.current++
               setSession(own)
               notifySessionChange()
               setMessage(t('lobbyWelcome'))
@@ -200,8 +235,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   type="button"
                   data-testid="lobby-create"
                   disabled={busy}
-                  onClick={() => void run(async () => {
+                  onClick={() => void run(async isCurrent => {
                     const result = await guestLobbyApi.create(parseTeamIds(teamsText), creatorTeam.trim())
+                    if (!isCurrent()) return
                     showRoom(result)
                     setMessage(t('lobbyCreated'))
                   })}
@@ -237,8 +273,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     className="mt-2"
                     data-testid="lobby-join"
                     disabled={busy}
-                    onClick={() => void run(async () => {
+                    onClick={() => void run(async isCurrent => {
                       const result = await guestLobbyApi.join(parseInviteCode(invite), invitedTeam.trim())
+                      if (!isCurrent()) return
                       showRoom(result)
                       setMessage(t('lobbyJoined'))
                     })}
@@ -271,8 +308,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   data-testid="lobby-refresh"
                   disabled={busy}
-                  onClick={() => void run(async () => {
-                    showRoom(await guestLobbyApi.read(room.lobbyId))
+                  onClick={() => void run(async isCurrent => {
+                    const result = await guestLobbyApi.read(room.lobbyId)
+                    if (!isCurrent()) return
+                    showRoom(result)
                     setMessage(t('lobbyRefreshed'))
                   })}
                 >
@@ -282,8 +321,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   type="button"
                   data-testid="lobby-pick-hero"
                   disabled={busy}
-                  onClick={() => void run(async () => {
-                    showRoom(await guestLobbyApi.chooseHero(room.lobbyId, previewHeroId, room.revision))
+                  onClick={() => void run(async isCurrent => {
+                    const result = await guestLobbyApi.chooseHero(
+                      room.lobbyId, previewHeroId, room.revision)
+                    if (!isCurrent()) return
+                    showRoom(result)
                     setMessage(t('lobbyHeroSaved', { name: hero?.name ?? previewHeroId }))
                   })}
                 >
@@ -306,8 +348,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   data-testid="lobby-change-team"
                   disabled={busy}
-                  onClick={() => void run(async () => {
-                    showRoom(await guestLobbyApi.changeTeam(room.lobbyId, newTeam, room.revision))
+                  onClick={() => void run(async isCurrent => {
+                    const result = await guestLobbyApi.changeTeam(
+                      room.lobbyId, newTeam, room.revision)
+                    if (!isCurrent()) return
+                    showRoom(result)
                     setMessage(t('lobbyTeamSaved'))
                   })}
                 >
@@ -318,8 +363,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   data-testid="lobby-leave"
                   disabled={busy}
-                  onClick={() => void run(async () => {
+                  onClick={() => void run(async isCurrent => {
                     await guestLobbyApi.leave(room.lobbyId, room.revision)
+                    if (!isCurrent()) return
                     setRoom(null)
                     setMessage(t('lobbyLeft'))
                   })}
@@ -334,8 +380,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
               variant="outline"
               data-testid="lobby-sign-out"
               disabled={busy}
-              onClick={() => void run(async () => {
+              onClick={() => void run(async isCurrent => {
                 await guestLobbyApi.signOut()
+                if (!isCurrent()) return
                 forgetGuest()
                 notifySessionChange()
                 setMessage(t('lobbySignedOut'))

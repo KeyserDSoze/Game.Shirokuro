@@ -215,6 +215,24 @@ test('guest session revoked in another tab clears private roster on focus withou
   await expect(second.getByTestId('lobby-room-code')).toHaveText(oldRoom)
   await expect(second.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
 
+  // Capture an actual server-authorized 200 roster *before* logout, then
+  // withhold its delivery until a DIFFERENT guest has explicitly signed in.
+  // React must ignore the obsolete response rather than display old privacy-
+  // scoped room data or its old success message under the new identity.
+  let captured!: () => void
+  let releaseOldResponse!: () => void
+  const oldResponseReady = new Promise<void>(resolve => { captured = resolve })
+  const deliveryAllowed = new Promise<void>(resolve => { releaseOldResponse = resolve })
+  await second.route('**/api/lobbies/' + oldRoom + '/roster', async route => {
+    const original = await route.fetch()
+    expect(original.status()).toBe(200)
+    captured()
+    await deliveryAllowed
+    await route.fulfill({ response: original })
+  })
+  await second.getByTestId('lobby-refresh').click()
+  await oldResponseReady
+
   await owner.bringToFront()
   await owner.getByTestId('lobby-sign-out').click()
   await expect(owner.getByTestId('lobby-sign-in')).toBeVisible()
@@ -234,6 +252,16 @@ test('guest session revoked in another tab clears private roster on focus withou
   expect((await second.getByTestId('lobby-player').textContent())!.trim()).not.toBe(oldIdentity)
   await expect(second.getByTestId('lobby-invite-input')).toHaveValue('')
   await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
+  const deliveredOld = second.waitForResponse(response =>
+    response.url().endsWith('/api/lobbies/' + oldRoom + '/roster') &&
+    response.status() === 200)
+  releaseOldResponse()
+  const oldReply = await deliveredOld
+  await oldReply.finished()
+  await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(second.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-message')).not.toContainText('Roster aggiornato')
 
   // After the explicit new login, re-use this guest to cover focus-only
   // recovery without adding another rate-limited sign-in to the CI suite.
