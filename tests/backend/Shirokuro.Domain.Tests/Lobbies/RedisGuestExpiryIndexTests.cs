@@ -172,8 +172,8 @@ public sealed class RedisGuestExpiryIndexTests
 
             // Remaining work is still unreadable after the healthy entry
             // is acknowledged and the cursor advances.
-            Assert.Single((await otherNodeIndex.ReadDueAsync())
-                .Where(x => x.ProtectedMember == ""));
+            Assert.Single(await otherNodeIndex.ReadDueAsync(),
+                x => x.ProtectedMember == "");
             Assert.True(await a.GetDatabase().SortedSetRemoveAsync(key, poisoned));
             Assert.True(await a.GetDatabase().SortedSetRemoveAsync(key, boundary));
             Assert.Equal(0, await worker.SweepOnceAsync());
