@@ -13,6 +13,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Hubs;
+using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Xunit;
