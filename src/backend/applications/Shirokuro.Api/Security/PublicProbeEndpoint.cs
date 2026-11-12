@@ -1,8 +1,9 @@
 namespace Shirokuro.Api.Security;
 
 /// <summary>
-/// Server-owned opt-out of optional cookie auth for public liveness/readiness
-/// probes that never use a principal. Never attach to player routes:
-/// protected APIs and SignalR must always verify the guest registry.
+/// Server-owned marker for public liveness/readiness endpoints that never
+/// consume the authenticated principal. Cookie validation skips the optional
+/// guest Redis lookup ONLY on these endpoints; all protected API and SignalR
+/// operations still verify the authoritative session registry.
 /// </summary>
 public sealed record PublicProbeEndpoint();
