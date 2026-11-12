@@ -213,8 +213,11 @@ public sealed class DistributedGuestRateLimitTests
                 Guid.NewGuid().ToString("N")[..4] + "::1");
             var db = a.GetDatabase();
             var key = RedisGuestMutationLimiter.Key(policy, ip);
-            TimeSpan? expiry = extendedTtl ? TimeSpan.FromMinutes(2) : null;
-            Assert.True(await db.StringSetAsync(key, "1", expiry));
+            if (extendedTtl)
+                Assert.True(await db.StringSetAsync(
+                    key, "1", TimeSpan.FromMinutes(2)));
+            else
+                Assert.True(await db.StringSetAsync(key, "1"));
 
             var ex = await Assert.ThrowsAsync<InvalidDataException>(() =>
                 new RedisGuestMutationLimiter(b.GetDatabase())
