@@ -359,23 +359,41 @@ public sealed class RedisLobbyCommandTimeoutTests
         public int ScanCalls { get; private set; }
         public long? ScanStart { get; private set; }
         public long? ScanStop { get; private set; }
+        public long? MaxMemberBytes { get; private set; }
+        // A fake server may violate the request's bound. The application
+        // must still reject its oversized response before any room GET.
+        public bool ReturnUnboundedResult { get; set; }
 
         protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
             return method?.Name switch
             {
-                "SortedSetRangeByRankAsync" => Scan(args),
+                "ScriptEvaluateAsync" => Scan(args),
                 "StringGetAsync" => Read(args),
                 _ => RejectWrite()
             };
         }
 
-        private Task<RedisValue[]> Scan(object?[]? args)
+        private Task<RedisResult> Scan(object?[]? args)
         {
             ScanCalls++;
-            ScanStart = Convert.ToInt64(args![1]);
-            ScanStop = Convert.ToInt64(args[2]);
-            return Task.FromResult(Members);
+            var script = Assert.IsType<string>(args![0]);
+            Assert.Contains("'ZRANGE', KEYS[1], 0, tonumber(ARGV[1])",
+                script, StringComparison.Ordinal);
+            var keys = Assert.IsType<RedisKey[]>(args[1]);
+            Assert.EndsWith(":capacity:all", Assert.Single(keys).ToString());
+            var values = Assert.IsType<RedisValue[]>(args[2]);
+            ScanStart = 0;
+            ScanStop = (long)values[0];
+            MaxMemberBytes = (long)values[1];
+            var batch = ReturnUnboundedResult
+                ? Members
+                : Members.Take(checked((int)ScanStop.Value + 1)).ToArray();
+            // Emulate the Lua-side byte bound before returning to .NET.
+            var bounded = batch.Select(member =>
+                Encoding.UTF8.GetByteCount(member.ToString()) > MaxMemberBytes.Value
+                    ? (RedisValue)string.Empty : member).ToArray();
+            return Task.FromResult(RedisResult.Create(bounded));
         }
 
         private Task<RedisValue> Read(object?[]? args)
@@ -421,6 +439,8 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.Equal(1, fixture.ScanCalls);
         Assert.Equal(0L, fixture.ScanStart);
         Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
+        Assert.Equal(IndexedKeyForRoom("room-0").Length,
+            fixture.MaxMemberBytes);
         Assert.Empty(fixture.ReadKeys);
         Assert.Equal(0, fixture.Writes);
     }
@@ -452,8 +472,9 @@ public sealed class RedisLobbyCommandTimeoutTests
     {
         var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
         var fixture = (IndexedRoomDatabase)(object)database;
-        // A fake Redis result with >257 members additionally confirms the
-        // client never trusts the response length, even if Redis misbehaves.
+        // Simulate an invalid response from a fake Redis that ignores the
+        // rank bound, in addition to the legitimate 257-item response.
+        fixture.ReturnUnboundedResult = count > GuestLobbyCommands.MaxRooms + 1;
         fixture.Members = Enumerable.Range(0, count)
             .Select(i => (RedisValue)IndexedKeyForRoom(
                 "room-" + i.ToString("x32")))
@@ -504,6 +525,49 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.DoesNotContain(key, ex.Message);
         Assert.DoesNotContain("Redis", ex.Message,
             StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Fact]
+    public async Task OversizedIndexMemberIsStrippedBeforeTransportAndNoRoomIsRead()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        var valid = IndexedKeyForRoom("room-healthy");
+        fixture.Members = [
+            (RedisValue)valid,
+            (RedisValue)new string('Z', 64 * 1024)
+        ];
+        fixture.Raw = new byte[] { 1, 2, 3 };
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var error = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain("ZZZZ", error.Message);
+        Assert.Empty(fixture.ReadKeys);
+        Assert.Equal(1, fixture.ScanCalls);
+        Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
+        Assert.Equal(valid.Length, fixture.MaxMemberBytes);
+        Assert.Equal(0, fixture.Writes);
+        Assert.Equal(2, fixture.Members.Length); // No implicit repair.
+    }
+
+    [Fact]
+    public async Task MixedIndexWithLaterMalformedShortKeyFailsBeforeAnyRoomRead()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = [
+            (RedisValue)IndexedKeyForRoom("room-healthy"),
+            (RedisValue)"guest-session:untrusted"
+        ];
+        fixture.Raw = new byte[] { 1, 2, 3 };
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+
         Assert.Empty(fixture.ReadKeys);
         Assert.Equal(0, fixture.Writes);
     }
