@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { getHeroById } from '@/features/heroes/catalog'
 import {
-  guestLobbyApi, LobbyHttpError, parseInviteCode, parseTeamIds,
+  guestLobbyApi, LobbyHttpError, LobbyInputError, parseInviteCode, parseTeamIds,
   type GuestSession, type LobbyRoster,
 } from './api'
 
@@ -200,10 +200,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           'lobbyInvalid'
         setMessage(t(key))
       } else {
-        // A network/fetch failure does not prove that the signed guest
-        // session or the cached roster is invalid. Never replay a mutation.
-        // Let the player explicitly retry after connectivity recovers.
-        setMessage(t('lobbyUnavailable'))
+        // Local validation runs before fetch: an invalid invite/teams input
+        // must not be reported as a connectivity outage. Only unexpected
+        // network/fetch failures retain the valid guest and roster and invite
+        // a deliberate retry; no mutation is replayed automatically.
+        setMessage(t(error instanceof LobbyInputError
+          ? 'lobbyInvalid' : 'lobbyUnavailable'))
       }
     } finally {
       if (operation === operationRef.current) {
