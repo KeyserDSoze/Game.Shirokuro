@@ -29,6 +29,7 @@ public sealed class RedisTlsSentinelFailoverTests
     private const string OldMaster = "shirokuro-ci-sentinel-master";
     private const string Replica = "shirokuro-ci-sentinel-replica";
     private const string Sentinel = "shirokuro-ci-sentinel-1";
+    private const string DockerCommandFailure = "Sentinel CI Docker command failed.";
     private static string? SentinelConnection =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_SENTINEL_TLS");
 
@@ -129,8 +130,79 @@ public sealed class RedisTlsSentinelFailoverTests
         var value = await stdout;
         _ = await stderr;
         if (process.ExitCode != 0)
-            throw new InvalidOperationException("Sentinel CI Docker command failed.");
+            throw new InvalidOperationException(DockerCommandFailure);
         return value.Trim();
+    }
+
+    /// <summary>
+    /// Redis CLI connections to a replica can briefly fail while Sentinel
+    /// promotes it. Retry only the expected sanitized CLI exit failure in a
+    /// bounded window; permanent failures must still fail the integration.
+    /// Neither the exception nor raw CLI stderr may enter CI output.
+    /// </summary>
+    private static async Task<bool> AwaitPromotionAsync(
+        Func<Task<string>> readElection, Func<Task<string>> readReplicaRole,
+        int attempts, TimeSpan delay)
+    {
+        for (var i = 0; i < attempts; i++)
+        {
+            try
+            {
+                var elected = await readElection();
+                var role = await readReplicaRole();
+                if (elected.Contains("6385", StringComparison.Ordinal) &&
+                    role.Contains("role:master", StringComparison.Ordinal))
+                    return true;
+            }
+            catch (InvalidOperationException error) when (
+                error.Message == DockerCommandFailure)
+            {
+                // The Docker container can be alive while redis-cli reports
+                // a temporarily failed TLS connection during role promotion.
+                // Never turn this into success without independently seeing
+                // both the Sentinel election and the promoted replica role.
+            }
+            if (i + 1 < attempts)
+                await Task.Delay(delay);
+        }
+        return false;
+    }
+
+    [Fact]
+    public async Task PromotionPollRetriesTransientCliFailuresAndWaitsForBothSignals()
+    {
+        var sentinels = 0;
+        var replicas = 0;
+        var promoted = await AwaitPromotionAsync(
+            () => { sentinels++; return Task.FromResult("127.0.0.1 6385"); },
+            () =>
+            {
+                replicas++;
+                return replicas == 1
+                    ? Task.FromException<string>(
+                        new InvalidOperationException(DockerCommandFailure))
+                    : Task.FromResult(replicas == 2 ? "role:slave" : "role:master");
+            }, 3, TimeSpan.Zero);
+        Assert.True(promoted);
+        Assert.Equal(3, sentinels);
+        Assert.Equal(3, replicas);
+    }
+
+    [Fact]
+    public async Task PromotionPollDoesNotHidePermanentCliOutage()
+    {
+        var calls = 0;
+        var promoted = await AwaitPromotionAsync(
+            () =>
+            {
+                calls++;
+                return Task.FromException<string>(
+                    new InvalidOperationException(DockerCommandFailure));
+            },
+            () => Task.FromResult("role:master"),
+            4, TimeSpan.Zero);
+        Assert.False(promoted);
+        Assert.Equal(4, calls);
     }
 
     private static Task<string> CliAsync(string container, int port,
@@ -313,20 +385,11 @@ public sealed class RedisTlsSentinelFailoverTests
         // and promote the replica: this test NEVER sends REPLICAOF NO ONE.
         await DockerAsync("stop", "-t", "1", OldMaster);
 
-        var converged = false;
-        for (var i = 0; i < 110; i++)
-        {
-            var elected = await CliAsync(Sentinel, 26380,
-                "SENTINEL", "get-master-addr-by-name", "shirokuro-main");
-            var role = await CliAsync(Replica, 6385, "INFO", "replication");
-            if (elected.Contains("6385", StringComparison.Ordinal) &&
-                role.Contains("role:master", StringComparison.Ordinal))
-            {
-                converged = true;
-                break;
-            }
-            await Task.Delay(500);
-        }
+        var converged = await AwaitPromotionAsync(
+            () => CliAsync(Sentinel, 26380, "SENTINEL",
+                "get-master-addr-by-name", "shirokuro-main"),
+            () => CliAsync(Replica, 6385, "INFO", "replication"),
+            110, TimeSpan.FromMilliseconds(500));
         Assert.True(converged, "Sentinel quorum failed to promote a new primary.");
 
         // The original API instances must eventually learn the new managed
