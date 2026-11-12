@@ -1,4 +1,5 @@
 using System.IO;
+using System.Reflection;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
@@ -58,6 +59,132 @@ public sealed class RedisGuestExpiryIndexTests
         public Task<LobbyRosterView> ForMemberAsync(string room, string id,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class OversizedProtector : IDataProtector
+    {
+        public IDataProtector CreateProtector(string purpose) => this;
+        public byte[] Protect(byte[] plaintext) =>
+            new byte[RedisGuestExpiryIndex.MaxProtectedMemberBytes * 2];
+        public byte[] Unprotect(byte[] protectedData) =>
+            throw new NotSupportedException();
+    }
+
+    public class NoRedisCommands : DispatchProxy
+    {
+        public int Calls { get; private set; }
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            Calls++;
+            throw new InvalidOperationException(
+                "Oversized work must be rejected before Redis.");
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OversizedServerProtectedWorkIsRejectedBeforeRedisWrite(
+        bool revoked)
+    {
+        var db = DispatchProxy.Create<IDatabase, NoRedisCommands>();
+        var fake = (NoRedisCommands)(object)db;
+        var index = new RedisGuestExpiryIndex(
+            db, new OversizedProtector(), TimeProvider.System,
+            namespaceName: "oversized-output");
+        var player = GuestSessions.NewPlayerId();
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            revoked ? index.ScheduleRevokedAsync(player)
+                : index.ScheduleAsync(player, DateTimeOffset.UtcNow.AddHours(1)));
+        Assert.Equal("Invalid guest expiry work item.", error.Message);
+        Assert.Null(error.InnerException);
+        Assert.Equal(0, fake.Calls);
+    }
+
+    [Fact]
+    public async Task OversizedRedisMemberCannotBlockHealthyGuestOrLeakCiphertext()
+    {
+        if (RedisAddress is null) return;
+        using var a = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        using var b = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var dir = Path.Combine(Path.GetTempPath(),
+            "shirokuro-oversized-expiry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var keys = KeyRing(dir);
+            var clock = new ManualClock();
+            var ns = "oversized-" + Guid.NewGuid().ToString("N");
+            var index = new RedisGuestExpiryIndex(a.GetDatabase(),
+                keys.GetRequiredService<IDataProtectionProvider>(), clock, ns);
+            var otherNodeIndex = new RedisGuestExpiryIndex(b.GetDatabase(),
+                keys.GetRequiredService<IDataProtectionProvider>(), clock, ns);
+            var store = new RedisLobbySnapshotStore(b.GetDatabase(), clock,
+                namespaceName: ns);
+            var lobby = new RedisGuestLobbyRuntime(store, clock);
+            var alice = GuestSessions.NewPlayerId();
+            var bob = GuestSessions.NewPlayerId();
+            var room = await lobby.CreateAsync(
+                alice, ["white", "black"], "white");
+            await lobby.JoinAsync(room.LobbyId, bob, "black", room.Revision);
+            var before = (await store.ReadAsync(room.LobbyId))!.Snapshot;
+            await index.ScheduleRevokedAsync(alice);
+
+            var key = "shirokuro:guest-expiry:{" + ns + "}:v1:pending";
+            var poisoned = new string('X',
+                RedisGuestExpiryIndex.MaxProtectedMemberBytes + 1);
+            var boundary = new string('Y',
+                RedisGuestExpiryIndex.MaxProtectedMemberBytes);
+            var dueScore = clock.GetUtcNow().ToUnixTimeMilliseconds();
+            Assert.True(await a.GetDatabase().SortedSetAddAsync(
+                key, poisoned, dueScore));
+            Assert.True(await a.GetDatabase().SortedSetAddAsync(
+                key, boundary, dueScore));
+
+            // 4096 bytes reaches the authentication check, while 4097 bytes
+            // is converted to an empty marker inside Lua before transport.
+            var due = await otherNodeIndex.ReadDueAsync();
+            Assert.Equal(3, due.Count);
+            Assert.Single(due, x => !x.IsUnreadable && x.PlayerId == alice);
+            var unreadable = due.Where(x => x.IsUnreadable).ToArray();
+            Assert.Equal(2, unreadable.Length);
+            Assert.Contains(unreadable, x => x.ProtectedMember == boundary);
+            Assert.Contains(unreadable, x => x.ProtectedMember == "");
+            Assert.All(unreadable, x => Assert.Empty(x.PlayerId));
+            Assert.DoesNotContain(due, x => x.ProtectedMember == poisoned);
+
+            using var worker = new GuestSessionExpiryWorker(
+                new GuestSessionRegistry(clock), new InMemoryLobbyCoordinator(clock),
+                clock, lobby, otherNodeIndex, store);
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => worker.SweepOnceAsync());
+            Assert.Equal("Guest expiry maintenance has retryable items.",
+                error.Message);
+            Assert.DoesNotContain(alice, error.ToString());
+            var after = (await store.ReadAsync(room.LobbyId))!.Snapshot;
+            Assert.Equal(bob, Assert.Single(after.State.Participants).PlayerId);
+            Assert.Equal(before.LastActivityUtc, after.LastActivityUtc);
+            var remaining = await a.GetDatabase().SortedSetRangeByRankAsync(key);
+            Assert.Equal(2, remaining.Length);
+            Assert.Contains(remaining, x => x.ToString() == poisoned);
+            Assert.Contains(remaining, x => x.ToString() == boundary);
+
+            // Remaining work is still unreadable after the healthy entry
+            // is acknowledged and the cursor advances.
+            Assert.Single((await otherNodeIndex.ReadDueAsync())
+                .Where(x => x.ProtectedMember == ""));
+            Assert.True(await a.GetDatabase().SortedSetRemoveAsync(key, poisoned));
+            Assert.True(await a.GetDatabase().SortedSetRemoveAsync(key, boundary));
+            Assert.Equal(0, await worker.SweepOnceAsync());
+            Assert.Empty(await otherNodeIndex.ReadDueAsync());
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     [Fact]
