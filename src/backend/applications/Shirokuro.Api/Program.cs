@@ -290,6 +290,18 @@ if (app.Environment.IsDevelopment())
 app.Use(async (context, next) =>
 {
     var metadata = context.GetEndpoint()?.Metadata;
+    var roomGuard = metadata?.GetMetadata<CanonicalLobbyIdRequired>();
+    if (roomGuard is not null &&
+        (!context.Request.RouteValues.TryGetValue(roomGuard.RouteParameter, out var raw) ||
+         raw is not string roomId || !CanonicalLobbyId.IsValid(roomId)))
+    {
+        // Malformed IDs can never name a real room. Return the same opaque
+        // missing-room status without authenticating the guest in Redis,
+        // looking up a roster or acquiring a mutation quota.
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
     if ((metadata?.GetMetadata<WebMutationGuardRequired>() is not null &&
             !WebMutationGuard.Allows(context, app.Environment)) ||
         (metadata?.GetMetadata<CookieSocketOriginGuardRequired>() is not null &&
@@ -616,7 +628,8 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
         {
             return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
-    }).RequireAuthorization();
+    }).RequireAuthorization()
+    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"));
 
 // Server-owned guest room mutations, with CSRF and revision controls.
 app.MapGuestLobbyEndpoints();
