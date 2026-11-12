@@ -76,6 +76,47 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     return () => { active = false }
   }, [])
 
+  // A tab opened before another tab's guest sign-in has no session yet.
+  // It still needs to hear the opaque cross-tab signal (or regain focus)
+  // and ask the server for the browser's current cookie identity. Never
+  // auto-issue a guest or accept identity/room data from BroadcastChannel.
+  useEffect(() => {
+    if (session) return
+
+    let active = true
+    const recheckWithoutSession = () => {
+      const generation = sessionGenerationRef.current
+      void guestLobbyApi.session()
+        .then(identity => {
+          if (!active || generation !== sessionGenerationRef.current ||
+              identity.kind !== 'guest') return
+          // Invalidate old /me or sign-in completions before adopting the
+          // newly verified guest; no private room state crosses this boundary.
+          sessionGenerationRef.current++
+          setRoom(null)
+          setInvite('')
+          setSession(identity)
+          setMessage(t('lobbySessionChanged'))
+        })
+        // 401: still signed out; 503/offline: no proof of any identity.
+        // Keep the explicit guest sign-in button without creating a cookie.
+        .catch(() => {})
+    }
+    const onVisible = () => {
+      if (!document.hidden) recheckWithoutSession()
+    }
+    const channel = sessionChannelRef.current
+    window.addEventListener('focus', recheckWithoutSession)
+    document.addEventListener('visibilitychange', onVisible)
+    channel?.addEventListener('message', recheckWithoutSession)
+    return () => {
+      active = false
+      window.removeEventListener('focus', recheckWithoutSession)
+      document.removeEventListener('visibilitychange', onVisible)
+      channel?.removeEventListener('message', recheckWithoutSession)
+    }
+  }, [session, t])
+
   useEffect(() => {
     if (!session) return
 
