@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 test('two independent guest browsers create a room, join by invite and select heroes safely', async ({ browser }) => {
   // End-to-end scenario exercises many real UI/API roundtrips plus R3F across
   // two browser contexts. Give only this long test a realistic CI budget.
-  test.setTimeout(90_000)
+  test.setTimeout(115_000)
   const firstContext = await browser.newContext()
   const secondContext = await browser.newContext()
   try {
@@ -53,7 +53,10 @@ test('two independent guest browsers create a room, join by invite and select he
     await second.getByRole('button', { name: 'Seleziona Shilla' }).click()
     await second.getByTestId('lobby-pick-hero').click()
     await expect(second.getByTestId('lobby-message')).toContainText('Eroe Shilla salvato')
-    await first.getByTestId('lobby-refresh').click()
+    // Automatic, authenticated, read-only GET: no user click on Refresh.
+    // The owner sees the other browser's newer hero/roster revision.
+    await first.bringToFront()
+    await expect(first.getByTestId('lobby-revision')).toContainText('4', { timeout: 25_000 })
     await expect(first.getByTestId('lobby-roster')).toContainText('Shilla')
     await expect(first.getByTestId('lobby-roster')).toContainText('Kira')
 
@@ -510,67 +513,37 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
 
-test('two guest browsers see pre-match roster changes automatically and revocation drops stale privacy', async ({ browser }) => {
-  test.setTimeout(95_000)
-  const ownerContext = await browser.newContext()
-  const guestContext = await browser.newContext()
-  try {
-    const owner = await ownerContext.newPage()
-    const guest = await guestContext.newPage()
-    await Promise.all([owner.goto('/'), guest.goto('/')])
-    await owner.getByTestId('lobby-sign-in').click()
-    await guest.getByTestId('lobby-sign-in').click()
-    await owner.getByTestId('lobby-create').click()
-    const code = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
-    const ownerReads: string[] = []
-    owner.on('request', request => {
-      if (request.url().endsWith('/api/lobbies/' + code + '/roster'))
-        ownerReads.push(request.method())
-    })
-    await guest.getByTestId('lobby-invite-input').fill(code)
-    await guest.getByTestId('lobby-join').click()
-    await guest.getByRole('button', { name: 'Seleziona Shilla' }).click()
-    await guest.getByTestId('lobby-pick-hero').click()
-    await expect(guest.getByTestId('lobby-revision')).toContainText('3')
-    await owner.bringToFront()
-
-    // No click on owner's manual Refresh. A member-scoped server GET
-    // delivers a newer revision without granting any gameplay authority.
-    await expect(owner.getByTestId('lobby-revision')).toContainText('3', { timeout: 25_000 })
-    await expect(owner.getByTestId('lobby-roster')).toContainText('Shilla')
-    expect(ownerReads.length).toBeGreaterThan(0)
-    expect(ownerReads.every(method => method === 'GET')).toBe(true)
-
-    // Revoke without using another tab's BroadcastChannel. A subsequent
-    // automatic 401 must clear owner identity, private room and invite.
-    const logout = await ownerContext.request.delete(
-      'http://127.0.0.1:5173/api/sessions/guest',
-      { headers: { Origin: 'http://127.0.0.1:5173', 'X-Shirokuro-Request': '1' } },
-    )
-    expect(logout.status()).toBe(204)
-    await expect(owner.getByTestId('lobby-sign-in')).toBeVisible({ timeout: 25_000 })
-    await expect(owner.getByTestId('lobby-room-code')).toHaveCount(0)
-    await expect(owner.getByTestId('lobby-player')).toHaveCount(0)
-    await expect(owner.getByTestId('lobby-message')).toContainText('scaduta o revocata')
-  } finally {
-    await ownerContext.close()
-    await guestContext.close()
+test('auto-sync retains private view on 503, clears room on 404 and guest on 401 without writes', async ({ page }) => {
+  test.setTimeout(85_000)
+  const code = 'room-' + 'e'.repeat(32)
+  const playerId = 'guest-browser-poll'
+  const roster = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId, teamId: 'white', heroId: null }],
   }
-})
 
-test('polling transient 503 preserves guest and roster, later 404 removes only the room', async ({ page }) => {
-  test.setTimeout(75_000)
-  await page.goto('/')
-  await page.getByTestId('lobby-sign-in').click()
-  await page.getByTestId('lobby-create').click()
-  const code = (await page.getByTestId('lobby-room-code').textContent())!.trim()
+  // The full suite runs parallel real logins against a shared Development
+  // limiter. This transport-failure test needs no extra guest issuance:
+  // use deterministic HTTP responses while the separate two-real-browser
+  // test above verifies authenticated cross-client roster updates.
+  let signedIn = false
+  await page.route('**/api/sessions/me', async route => {
+    await route.fulfill(signedIn
+      ? { status: 200, json: { playerId, kind: 'guest' } }
+      : { status: 401 })
+  })
+  await page.route('**/api/sessions/guest', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    await route.fulfill({ status: 200, json: { playerId, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    await route.fulfill({ status: 201, json: roster })
+  })
+
   let status = 503
   let reads = 0
-  const mutations: string[] = []
-  page.on('request', request => {
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()))
-      mutations.push(request.url())
-  })
   await page.route('**/api/lobbies/' + code + '/roster', async route => {
     if (route.request().method() !== 'GET') return route.continue()
     reads++
@@ -580,17 +553,41 @@ test('polling transient 503 preserves guest and roster, later 404 removes only t
       body: '{}',
     })
   })
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+
+  const mutations: string[] = []
+  page.on('request', request => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()))
+      mutations.push(request.url())
+  })
 
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(1)
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
-  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
   await expect(page.getByTestId('lobby-message')).not.toContainText('scaduta')
+  expect(mutations).toEqual([])
 
   status = 404
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(2)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-create')).toBeVisible()
-  await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  expect(mutations).toEqual([])
+
+  // Reuse the mocked guest to check a later 401 without exceeding any
+  // shared real-IP issuance quota or accepting an unauthenticated roster.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  mutations.length = 0
+  status = 401
+  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(3)
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
   expect(mutations).toEqual([])
 })

@@ -115,10 +115,12 @@ preserve existing data without immediate retries or clearing user action
 feedback. These are local UI decisions; only the server authorizes access.
 
 Vitest covers revision/membership/room validation and safe error
-classification. Two-browser Playwright confirms a guest's join/hero
-appears on the other browser without clicking Refresh and that server
-revocation clears the obsolete private view. Separate E2E coverage checks
-503 preservation, 404 removal and **zero HTTP mutation requests** during
-auto-refresh. Hosting, alerting and anti-Sybil controls still belong
+classification. Existing two-real-browser Playwright now checks that the second guest's
+new hero/roster revision appears in the first browser **without clicking
+Refresh or creating extra guest sessions**. A separate deterministic
+browser HTTP simulation covers 503 preservation, 404 room removal,
+401 guest revocation, and **zero HTTP mutation requests** during each
+polling interval. Other real-browser tests already verify server-side
+revocation across copied guest cookies and private lobby endpoints. Hosting, alerting and anti-Sybil controls still belong
 to #21; game rules, hidden movement and match-scoped observations
 remain #3/#5/#9.
