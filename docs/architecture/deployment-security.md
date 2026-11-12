@@ -1524,6 +1524,32 @@ attacker who owns many IPv4 addresses, multiple IPv6 /64 prefixes or a
 distributed network. Keep WAF/edge controls, proxy configuration, detection
 and account-grade identity policy under the open umbrella issue #21.
 
+## Size-bounded encrypted guest expiry work (#97)
+
+The Redis guest-expiry queue rotates through at most 128 due items per
+maintenance pass. Each item now additionally has a **4096-byte bound** on
+its encrypted Data Protection Base64Url member. Server issuance rejects
+oversized output before the Redis write, rather than claiming to have
+scheduled a work item that the worker could not later safely read.
+
+Redis's selection Lua script replaces an oversized persisted/legacy ZSET
+member with an **empty unreadable sentinel before returning the batch**.
+This bounds the transmitted response size even when the stored member is
+huge. The script does not delete, truncate or change the original member
+or score; round-robin fairness and processing of other healthy items in
+the same batch remain intact. C# never attempts to decrypt or acknowledge
+the marker. The background worker reports degraded maintenance and records
+unreadable metrics, but can still fence, clean and acknowledge healthy
+entries independently.
+
+A permanently damaged member stays durably queued and requires authorized
+operational investigation: verify/restore Data Protection key rings and
+inspect Redis integrity, then reconcile or delete the original affected
+entry only under an approved incident runbook. Never log, echo or export
+raw ciphertext, guest identities, session tokens or invitation data.
+This limit constrains network and worker allocations, not Redis's storage
+capacity or the need for edge controls and observability tracked under #21.
+
 ## Corrupt Redis guest admission buckets fail closed (#96)
 
 An existing Redis quota bucket is persisted input, not trusted merely because
