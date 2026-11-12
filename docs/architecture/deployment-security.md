@@ -1610,3 +1610,28 @@ may then encounter an already revoked/unauthorized cookie. No optimistic
 fallback, immediate command retry or claim of rollback is introduced.
 This reduces stalled request costs; it is not a Redis deployment SLA and
 does not replace independent Redis server ACL/TLS/HA/alerts (#21).
+
+## Bounded Redis lobby I/O and cancellation (#70)
+
+The Redis-authoritative lobby snapshot store now has a **2-second .NET wait
+limit per Redis command**, linked to the HTTP `RequestAborted`, SignalR
+`ConnectionAborted` or worker stop token. The boundary covers direct room
+reads/creates, shared-capacity Lua create, compare-and-exchange, deletion,
+guest-revocation tombstones, indexed-room scan and individual indexed reads.
+The runtime propagates the caller token across join, hero/team changes,
+leave, member roster reads, quota-controlled creates and session revocation/
+expiry cleanup, including version-conflict re-reads. Pre-cancelled requests
+do not dispatch commands. Stalled lobby reads/mutations fail closed: HTTP
+returns sanitized `503` with `no-store`, and SignalR reports only
+`Lobby unavailable.`. Invalid/hidden rooms and unauthorized members
+continue to share `404`; the new guard does not reveal rosters or IDs.
+
+**Operational limitation:** cancelling the application's wait cannot
+retract a Redis Lua script or SET command already accepted by the server.
+A timeout must never be counted as a successful CAS, room creation or
+revocation fence, and the client should not replay an uncertain mutation
+automatically. The existing server-side atomic quotas, fencing, member
+checks and idempotent cleanup remain authoritative. The 2-second limit
+applies **to each Redis command**, not to the total duration of a multi-
+step operation or cleanup across multiple rooms. Independently monitored
+Redis TLS/ACL/HA and anti-abuse protections remain under umbrella #21.
