@@ -1711,3 +1711,24 @@ guest remains valid: only a subsequent healthy Redis read can grant access.
 The independent `/api/health` liveness route remains public, while
 readiness evaluates the actual Redis dependencies separately. This does
 not change Redis cluster HA requirements or ensure availability (#21).
+
+## Development lobby cancellation parity (#74)
+
+The Development/Vite in-memory `LocalGuestLobbyRuntime` now observes the
+same pre-dispatch `CancellationToken` contract as the Redis Production
+runtime for **all seven** methods: Create, Join, ChooseHero, ChangeTeam,
+Leave, ForMember and RemovePlayerFromAllRooms. A cancelled HTTP request,
+disconnected SignalR invocation or stopped guest expiry worker cannot
+create a room, alter a member/roster revision or remove members *after*
+its caller has already cancelled. A new request with an uncancelled token
+continues to work normally, including explicit guest sign-in and roster
+reads. The authoritative domain coordinator and its quotas are unchanged.
+
+Because Development operations are synchronous under the coordinator's
+lock, cancellation is checked immediately **before** each operation. It
+cannot retract a synchronous mutation already begun, just as #70 cannot
+retract a Redis Lua command already dispatched. No new game rules, account
+types, per-IP quota or network fallback have been introduced. xUnit
+covers seven already-cancelled calls, invariance of room quota/revision/
+participants, cancelled worker cleanup and normal valid-token behavior.
+Production Redis deadlines and guest session authorization are unchanged.
