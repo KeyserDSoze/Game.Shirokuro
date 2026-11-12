@@ -11,6 +11,8 @@ namespace Shirokuro.Api.Security;
 public static class GuestSessionRedisConfiguration
 {
     public const string ConnectionStringKey = "Security:GuestSessions:RedisConnectionString";
+    public const string InvalidConnection =
+        "Guest-session Redis configuration requires a valid TLS connection.";
 
     public static void Configure(
         IServiceCollection services, IConfiguration configuration,
@@ -37,6 +39,10 @@ public static class GuestSessionRedisConfiguration
             options.ConnectionMultiplexerFactory = async () =>
             {
                 var current = options.ConfigurationOptions ?? parsed;
+                // Validate the effective, potentially later-overridden options
+                // before any socket opens. Only the separately ACL-scoped INFO
+                // observer (#63) may use client-side AllowAdmin.
+                EnsureGameConnectionSecurity(current);
                 var connection = await ConnectionMultiplexer.ConnectAsync(current.Clone());
                 return RedisConnectionMetrics.Observe(
                     connection, RedisConnector.GuestSessions);
@@ -63,17 +69,24 @@ public static class GuestSessionRedisConfiguration
         try
         {
             parsed = ConfigurationOptions.Parse(value);
-            if (!parsed.Ssl || parsed.EndPoints.Count == 0)
-                throw new InvalidOperationException();
+            EnsureGameConnectionSecurity(parsed);
         }
         catch (Exception)
         {
             // Do not include connection strings/passwords in exception messages.
-            throw new InvalidOperationException(
-                "Guest-session Redis configuration requires a valid TLS connection.");
+            throw new InvalidOperationException(InvalidConnection);
         }
 
         return parsed;
     }
 
+    // The same validator is applied during startup and immediately before
+    // connecting the lazy guest cache, including options replaced by DI.
+    // Never expose raw options in error messages or use administrative Redis
+    // commands from guest or lobby clients, regardless of operator input.
+    private static void EnsureGameConnectionSecurity(ConfigurationOptions options)
+    {
+        if (!options.Ssl || options.EndPoints.Count == 0 || options.AllowAdmin)
+            throw new InvalidOperationException(InvalidConnection);
+    }
 }

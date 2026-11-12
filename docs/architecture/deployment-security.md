@@ -1451,3 +1451,27 @@ reads/writes and FLUSHDB/CONFIG even when the client-side INFO guard is
 enabled, a real Production host with opt-in worker, standalone and
 master/replica/promotion parsing, strict finite metric labels and fake
 HTTPS OTLP protobuf payload with no replica IP in telemetry.
+
+## Gameplay Redis TLS and client admin-mode guard (#64)
+
+Both Production multiplayer Redis connectors (lobby and the independent
+guest-session `IDistributedCache`) always require TLS and
+`AllowAdmin=false`. A configured `allowAdmin=true` is rejected at
+startup, even when a Redis server ACL also denies admin commands.
+The rule applies equally to direct Redis TLS and Sentinel discovery.
+Administrative client operations such as `INFO` are reserved for the
+**separate, opt-in, server-ACL-scoped observer** of #63, never the app.
+
+Microsoft's Redis cache can receive an operator/test DI override of
+`RedisCacheOptions.ConfigurationOptions` after initial registration.
+The lazy `ConnectionMultiplexerFactory` therefore rechecks **effective
+options** before opening the socket: disabled SSL, empty endpoints or
+`AllowAdmin=true` are refused with a fixed sanitized error. A properly
+configured TLS override still works and is not silently replaced with
+the startup connection. Keep server Redis ACL restrictions (including
+`-@admin`) independently: disabling StackExchange.Redis client admin
+mode **does not** confer server-side least privilege. Existing real
+Redis TLS ACL/Sentinel/rotation/recovery CI exercises the valid path;
+new xUnit regressions reject unsafe startup and late overrides without
+requiring a network connection. Production edge policies and HA/SLA
+remain under #21.
