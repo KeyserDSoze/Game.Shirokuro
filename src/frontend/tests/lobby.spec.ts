@@ -35,9 +35,13 @@ test('two independent guest browsers create a room, join by invite and select he
     // Owner's cached revision is stale after the other player joined.
     await first.getByRole('button', { name: 'Seleziona Kira' }).click()
     await first.getByTestId('lobby-pick-hero').click()
-    await expect(first.getByTestId('lobby-message')).toContainText('aggiorna il roster')
-    await first.getByTestId('lobby-refresh').click()
+    await expect(first.getByTestId('lobby-message')).toContainText('roster aggiornato')
+    await expect(first.getByTestId('lobby-revision')).toContainText('2')
     await expect(first.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+    // The server rejected the stale hero change. The automatic GET must
+    // not silently retry it or increase the roster revision to 3.
+    await expect(first.getByTestId('lobby-roster')).not.toContainText('Kira')
+    await expect(second.getByTestId('lobby-revision')).toContainText('2')
     await first.getByTestId('lobby-pick-hero').click()
     await expect(first.getByTestId('lobby-message')).toContainText('Eroe Kira salvato')
 
@@ -354,7 +358,32 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
     await expect(page.getByTestId('lobby-player')).toContainText('guest-')
   }
 
-  responseStatus = 401
+  // After a 409, an unavailable roster read must not retry the mutation or
+  // fabricate a new revision. Avoid extra guest logins in parallel E2E.
+  responseStatus = 409
+  let conflictReads = 0
+  let rejectedWrites = 0
+  await page.unroute('**/api/lobbies/' + existingRoom + '/team')
+  await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
+    rejectedWrites++
+    await route.fulfill({ status: 409, headers: { 'Cache-Control': 'no-store' } })
+  })
+  await page.route('**/api/lobbies/' + existingRoom + '/roster', async route => {
+    conflictReads++
+    await route.fulfill({ status: 503, headers: { 'Cache-Control': 'no-store' } })
+  })
+  const priorRevision = await page.getByTestId('lobby-revision').textContent()
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('aggiorna il roster')
+  await expect(page.getByTestId('lobby-revision')).toHaveText(priorRevision!)
+  expect(conflictReads).toBe(1)
+  expect(rejectedWrites).toBe(1)
+  await page.unroute('**/api/lobbies/' + existingRoom + '/roster')
+  await page.unroute('**/api/lobbies/' + existingRoom + '/team')
+
+  await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
+    await route.fulfill({ status: 401, headers: { 'Cache-Control': 'no-store' } })
+  })
   await page.getByTestId('lobby-change-team').click()
   await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
