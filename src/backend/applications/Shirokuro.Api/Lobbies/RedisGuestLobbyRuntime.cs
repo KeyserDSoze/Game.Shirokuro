@@ -65,7 +65,10 @@ public sealed class RedisGuestLobbyRuntime(
                 throw new LobbyRevisionConflictException(expectedRevision.Value,
                     (await store.ReadAsync(roomId, cancellationToken))?.Snapshot.State.Revision ?? before.Revision);
         }
-        throw new InvalidOperationException("Concurrent lobby updates exceeded retry budget.");
+        // An invitation join has no client-selected revision to conflict
+        // with. Exhausted CAS retries are transient unavailability, not a
+        // successful membership or an actionable 409 revision conflict.
+        throw new LobbyJoinContentionException();
     }
 
     public Task<LobbyRosterView> ChooseHeroAsync(

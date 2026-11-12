@@ -132,6 +132,101 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.Equal(32, controller.CasCalls);
     }
 
+    [Theory]
+    [InlineData(31, true)]
+    [InlineData(32, false)]
+    public async Task UnversionedInvitationJoinCasRetriesReturnOnlyConfirmedMembership(
+        int conflicts, bool shouldSucceed)
+    {
+        var database = DispatchProxy.Create<IDatabase, RepeatedlyContendedRosterDatabase>();
+        var controller = (RepeatedlyContendedRosterDatabase)(object)database;
+        var room = "room-" + Guid.NewGuid().ToString("N");
+        var creator = GuestSessions.NewPlayerId();
+        var joiner = GuestSessions.NewPlayerId();
+        var state = LobbyState.Create(
+            new LobbyDefinition(room, ["white", "black"], ["kira"]))
+            .Join(creator, "white", 0);
+        controller.EncodedSnapshot = RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(state, DateTimeOffset.UtcNow, creator, QuotaTracked: true));
+        controller.ConflictsBeforeSuccess = conflicts;
+        var clock = TimeProvider.System;
+        var runtime = new RedisGuestLobbyRuntime(
+            new RedisLobbySnapshotStore(database, clock), clock);
+
+        if (shouldSucceed)
+        {
+            var roster = await runtime.JoinAsync(room, joiner, "black", null);
+            Assert.Equal(2, roster.Revision);
+            Assert.Equal(2, roster.Participants.Count);
+            Assert.Contains(roster.Participants, p => p.PlayerId == joiner &&
+                p.TeamId == "black");
+        }
+        else
+        {
+            var failure = await Assert.ThrowsAsync<LobbyJoinContentionException>(
+                () => runtime.JoinAsync(room, joiner, "black", null));
+            Assert.Null(failure.InnerException);
+            Assert.DoesNotContain(room, failure.Message);
+            Assert.DoesNotContain(creator, failure.Message);
+            Assert.DoesNotContain(joiner, failure.Message);
+        }
+
+        Assert.Equal(32, controller.Reads);
+        Assert.Equal(32, controller.CasCalls);
+    }
+
+    [Fact]
+    public async Task ProductionInvitationJoinContentionReturnsSanitized503ButRevisionConflictRemains409()
+    {
+        var database = DispatchProxy.Create<IDatabase, RepeatedlyContendedRosterDatabase>();
+        var controller = (RepeatedlyContendedRosterDatabase)(object)database;
+        var room = "room-" + Guid.NewGuid().ToString("N");
+        var creator = GuestSessions.NewPlayerId();
+        var state = LobbyState.Create(
+            new LobbyDefinition(room, ["white", "black"], ["kira"]))
+            .Join(creator, "white", 0);
+        controller.EncodedSnapshot = RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(state, DateTimeOffset.UtcNow, creator, QuotaTracked: true));
+
+        using var host = Production(database);
+        using var visitor = Client(host);
+        var cookie = await Login(visitor);
+        using var guest = Client(host, cookie);
+
+        using (var request = new HttpRequestMessage(HttpMethod.Post,
+                   "/api/lobbies/" + room + "/join"))
+        {
+            request.Headers.Add("Origin", "https://game.example");
+            request.Headers.Add("X-Shirokuro-Request", "1");
+            request.Content = JsonContent.Create(new { teamId = "black" });
+            using var response = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+            var body = await response.Content.ReadAsStringAsync();
+            Assert.DoesNotContain(room, body);
+            Assert.DoesNotContain(creator, body);
+            Assert.DoesNotContain("Redis", body, StringComparison.OrdinalIgnoreCase);
+        }
+        Assert.Equal(32, controller.Reads);
+        Assert.Equal(32, controller.CasCalls);
+
+        using (var request = new HttpRequestMessage(HttpMethod.Post,
+                   "/api/lobbies/" + room + "/join"))
+        {
+            request.Headers.Add("Origin", "https://game.example");
+            request.Headers.Add("X-Shirokuro-Request", "1");
+            request.Content = JsonContent.Create(new
+                { teamId = "black", expectedRevision = 1L });
+            using var response = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.Contains("revision_conflict", await response.Content.ReadAsStringAsync());
+        }
+        Assert.Equal(34, controller.Reads);
+        Assert.Equal(33, controller.CasCalls);
+    }
+
     public class CorruptSnapshotDatabase : DispatchProxy
     {
         public byte[] Raw { get; set; } = [];

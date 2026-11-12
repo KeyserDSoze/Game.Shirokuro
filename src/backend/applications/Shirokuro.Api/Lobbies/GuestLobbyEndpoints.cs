@@ -133,6 +133,12 @@ public static class GuestLobbyEndpoints
             // be attempted or acknowledged without a verified snapshot.
             return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
+        catch (LobbyJoinContentionException)
+        {
+            // The unversioned invitation join exhausted all bounded Redis
+            // CAS attempts. It is unavailable, not a user revision conflict.
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             // Never confirm a Redis mutation whose result is unknown.

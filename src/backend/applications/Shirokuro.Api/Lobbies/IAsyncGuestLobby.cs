@@ -45,6 +45,14 @@ public sealed class LobbyReadContentionException()
     : Exception("Lobby roster temporarily unavailable under contention.");
 
 /// <summary>
+/// An invitation join without an explicit expected revision could not win
+/// any of its bounded atomic CAS attempts. Not a user revision conflict;
+/// no join was confirmed and nothing from the observed roster is returned.
+/// </summary>
+public sealed class LobbyJoinContentionException()
+    : Exception("Lobby join temporarily unavailable under contention.");
+
+/// <summary>
 /// Redis returned persisted lobby bytes that cannot be decoded as an
 /// authoritative, versioned room snapshot. Do not attach the decoder
 /// exception, key, ID or raw bytes to transport-visible diagnostics.
