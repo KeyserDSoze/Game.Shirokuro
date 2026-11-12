@@ -239,6 +239,69 @@ test('guest lobby shows a safe message when creation is rate-limited', async ({ 
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
 })
 
+test('cross-tab recheck signals are strict and burst-coalesced without guest issuance', async ({ page }) => {
+  // This intentionally never creates a guest, so it cannot spend the
+  // per-IP 12/min issuance budget shared with other CI browser scenarios.
+  let issuancePosts = 0
+  page.on('request', request => {
+    if (request.method() === 'POST' &&
+        request.url().endsWith('/api/sessions/guest'))
+      issuancePosts++
+  })
+  const anonymousReady = page.waitForResponse(response =>
+    response.url().endsWith('/api/sessions/me') && response.status() === 401)
+  await page.goto('/')
+  await anonymousReady
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+
+  let checks = 0
+  let release!: () => void
+  const hold = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/sessions/me', async route => {
+    checks++
+    await hold
+    await route.fulfill({
+      status: 401,
+      headers: { 'Cache-Control': 'no-store' },
+    })
+  })
+
+  // Non-protocol payloads, even a plausible object with a recheck field,
+  // must never trigger the Redis-backed authenticated session endpoint.
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    for (let i = 0; i < 50; i++) {
+      channel.postMessage({ action: 'recheck', playerId: 'spoofed' })
+      channel.postMessage('recheck ' + i)
+      channel.postMessage(null)
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+    channel.close()
+  })
+  expect(checks).toBe(0)
+
+  // 50 real notifications plus a focus event have to share ONE live GET.
+  // At most one trailing GET checks an identity change after that response.
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    for (let i = 0; i < 50; i++) channel.postMessage('recheck')
+    window.dispatchEvent(new Event('focus'))
+    await new Promise(resolve => setTimeout(resolve, 150))
+    channel.close()
+  })
+  await expect.poll(() => checks).toBe(1)
+  release()
+  await expect.poll(() => checks).toBe(2)
+  // No additional fan-out after the single trailing read has completed.
+  await page.waitForTimeout(150)
+  expect(checks).toBe(2)
+  expect(issuancePosts).toBe(0)
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+})
+
 test('guest session revoked in another tab clears private roster on focus without auto-login', async ({ context }) => {
   // Two real guest issuances, shared between cross-tab + standalone focus
   // regressions, avoid exhausting Development's per-IP fixed-window quota.
