@@ -110,6 +110,31 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task SignalRDoesNotExposeUndecodableRedisRoomOrUnverifiedRoster()
+    {
+        var database = System.Reflection.DispatchProxy.Create<
+            StackExchange.Redis.IDatabase,
+            RedisLobbyCommandTimeoutTests.CorruptSnapshotDatabase>();
+        var corrupt = (RedisLobbyCommandTimeoutTests.CorruptSnapshotDatabase)(object)database;
+        corrupt.Raw = System.Text.Encoding.UTF8.GetBytes("{bad-snapshot}");
+        var clock = TimeProvider.System;
+        var runtime = new RedisGuestLobbyRuntime(
+            new RedisLobbySnapshotStore(database, clock), clock);
+        var hub = new LobbyRosterHub(
+            new LobbyRosterReader(new InMemoryLobbyCoordinator()),
+            lobby: runtime)
+        {
+            Context = new FakeHubContext(Principal("alice"))
+        };
+
+        var error = await Assert.ThrowsAsync<HubException>(
+            () => hub.GetRoster(RoomA));
+        Assert.Equal("Lobby unavailable.", error.Message);
+        Assert.Equal(1, corrupt.Reads);
+        Assert.Equal(0, corrupt.Mutations);
+    }
+
+    [Fact]
     public async Task ContendedAuthenticatedHttpRosterReturnsUncachedSanitized503()
     {
         var contended = new ContendedLobby();
