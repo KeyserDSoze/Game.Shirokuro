@@ -346,8 +346,14 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-app.MapGet("/api/health", () => Results.Ok(new { status = "ok", application = "Shirokuro" }))
-    .WithMetadata(new PublicProbeEndpoint());
+// Liveness is intentionally independent of Redis, the key ring and guests.
+// Never allow a browser/proxy/monitor to reuse an old positive probe after
+// a process has gone away. Readiness uses the same uncached HTTP contract.
+app.MapGet("/api/health", (HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(new { status = "ok", application = "Shirokuro" });
+}).WithMetadata(new PublicProbeEndpoint());
 
 // Liveness above is intentionally independent of Redis; the readiness route
 // is for load balancers and checks BOTH Redis connections plus Data Protection.
