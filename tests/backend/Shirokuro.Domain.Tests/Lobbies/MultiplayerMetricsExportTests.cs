@@ -177,6 +177,11 @@ public sealed class MultiplayerMetricsExportTests
             RedisConnector.Lobby, RedisConnectionTransition.Failed);
         MultiplayerMetrics.RecordRedisConnection(
             RedisConnector.GuestSessions, RedisConnectionTransition.Restored);
+        MultiplayerMetrics.RecordRedisReplication(
+            RedisReplicationInfo.Parse(
+                "role:master\nconnected_slaves:1\n" +
+                "slave0:ip=private.example,port=6386,state=online,lag=4"),
+            RedisReplicationPollOutcome.Ok);
 
         Assert.True(meter.ForceFlush(5_000));
         Assert.NotEmpty(collector.Calls);
@@ -200,6 +205,10 @@ public sealed class MultiplayerMetricsExportTests
         Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
         Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectionEventsName, payload);
+        Assert.Contains(MultiplayerMetrics.RedisReplicationObservationsName, payload);
+        Assert.Contains(MultiplayerMetrics.RedisConnectedReplicasName, payload);
+        Assert.Contains(MultiplayerMetrics.RedisReplicaAckLagSecondsName, payload);
+        Assert.DoesNotContain("private.example", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("password=", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("guest-private", payload, StringComparison.OrdinalIgnoreCase);
     }

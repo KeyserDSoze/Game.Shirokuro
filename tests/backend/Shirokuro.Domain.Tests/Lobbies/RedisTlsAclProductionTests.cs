@@ -25,7 +25,8 @@ public sealed class RedisTlsAclProductionTests
     private static string? Connection =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_TLS_ACL");
 
-    private static WebApplicationFactory<Program> Server()
+    private static WebApplicationFactory<Program> Server(
+        string? monitorConnection = null)
     {
         var connection = Connection
             ?? throw new InvalidOperationException("ACL Redis CI endpoint is required.");
@@ -35,10 +36,19 @@ public sealed class RedisTlsAclProductionTests
             TestDataProtectionConfiguration.Apply(builder);
             builder.UseSetting(GuestSessionRedisConfiguration.ConnectionStringKey,
                 connection);
+            if (monitorConnection is not null)
+            {
+                builder.UseSetting(RedisReplicationMonitoring.EnabledKey, "true");
+                builder.UseSetting(RedisReplicationMonitoring.ConnectionStringKey,
+                    monitorConnection);
+            }
             builder.ConfigureAppConfiguration((_, config) =>
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     [GuestSessionRedisConfiguration.ConnectionStringKey] = connection,
+                    [RedisReplicationMonitoring.EnabledKey] =
+                        monitorConnection is null ? "false" : "true",
+                    [RedisReplicationMonitoring.ConnectionStringKey] = monitorConnection,
                     ["AllowedHosts"] = "game.example",
                     ["Security:AllowedOrigins:0"] = "https://game.example"
                 }));
@@ -83,6 +93,36 @@ public sealed class RedisTlsAclProductionTests
         using var json = JsonDocument.Parse(
             await response.Content.ReadAsStringAsync());
         return (json.RootElement.GetProperty("playerId").GetString()!, cookie);
+    }
+
+    [Fact]
+    public async Task OptInProductionWorkerUsesPrivateObserverAndNeverChangesGameReadiness()
+    {
+        if (Connection is null) return;
+        var observer = Environment.GetEnvironmentVariable(
+            "SHIROKURO_TEST_REDIS_TLS_MONITOR");
+        Assert.False(string.IsNullOrWhiteSpace(observer));
+        using var samples = new MultiplayerMetricCapture();
+        using var server = Server(observer);
+        using var visitor = Client(server);
+
+        // The real Production host starts both Redis-authoritative clients
+        // and the separate INFO worker. No fake DI or telemetry exporter.
+        using (var ready = await visitor.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
+        var sampler = server.Services.GetRequiredService<RedisReplicationSampler>();
+        await sampler.SampleOnceAsync();
+        Assert.Contains(samples.For(MultiplayerMetrics.RedisReplicationObservationsName),
+            x => x.Tags["outcome"] == "ok" && x.Tags["role"] == "master");
+
+        using (var missing = await visitor.GetAsync("/metrics"))
+            Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        using (var login = Mutation(HttpMethod.Post, "/api/sessions/guest"))
+        using (var reply = await visitor.SendAsync(login))
+        {
+            Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+            Assert.True(reply.Headers.Contains("Set-Cookie"));
+        }
     }
 
     [Fact]
