@@ -89,24 +89,43 @@ public sealed class RedisTlsAclProductionTests
     public async Task ScopedTlsAclCanReadReplicationInfoWithoutAdminOrKeys()
     {
         if (Connection is null) return;
-        var options = ConfigurationOptions.Parse(Connection);
+        var monitor = Environment.GetEnvironmentVariable(
+            "SHIROKURO_TEST_REDIS_TLS_MONITOR");
+        Assert.False(string.IsNullOrWhiteSpace(monitor));
+        var settings = new ConfigurationBuilder().AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [GuestSessionRedisConfiguration.ConnectionStringKey] = Connection,
+                [RedisReplicationMonitoring.ConnectionStringKey] = monitor,
+                [RedisReplicationMonitoring.EnabledKey] = "true"
+            }).Build();
+        var options = RedisReplicationMonitoring.ReadRestrictedOptions(settings);
         Assert.True(options.Ssl);
         Assert.False(options.AllowAdmin);
+        Assert.Equal("shirokuro-observer", options.User);
+        Assert.NotEqual(ConfigurationOptions.Parse(Connection).Password, options.Password);
+
+        // Only the independent observer enables client-side INFO. Its
+        // Redis ACL has no access to game keys, writes or admin commands.
+        options.AllowAdmin = true;
         using var connection = await ConnectionMultiplexer.ConnectAsync(options);
         using var capture = new MultiplayerMetricCapture();
         await new RedisReplicationSampler(connection).SampleOnceAsync();
-        // Print ONLY the finite enum labels (never Redis connection
-        // details or exception messages) when a real TLS integration fails.
-        var observed = capture.For(MultiplayerMetrics.RedisReplicationObservationsName);
-        Assert.True(observed.Any(sample =>
-                sample.Tags["role"] == "master" &&
-                sample.Tags["outcome"] == "ok" &&
-                sample.Tags["link"] == "na"),
-            "Safe INFO probe status: " + string.Join("; ",
-                observed.Select(sample =>
-                    sample.Tags["role"] + "/" +
-                    sample.Tags["link"] + "/" +
-                    sample.Tags["outcome"])));
+        var events = capture.For(MultiplayerMetrics.RedisReplicationObservationsName);
+        Assert.True(events.Any(sample => sample.Tags["role"] == "master" &&
+                     sample.Tags["outcome"] == "ok" && sample.Tags["link"] == "na"),
+            "Safe observer INFO state: " + string.Join("; ",
+                events.Select(e => e.Tags["role"] + "/" + e.Tags["outcome"])));
+
+        var db = connection.GetDatabase();
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.StringGetAsync("shirokuro:guest-session:secret"));
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.StringSetAsync("shirokuro:observer-must-not-write", "1"));
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.ExecuteAsync("FLUSHDB"));
+        await Assert.ThrowsAsync<RedisServerException>(() =>
+            db.ExecuteAsync("CONFIG", "GET", "maxmemory"));
     }
 
     [Fact]

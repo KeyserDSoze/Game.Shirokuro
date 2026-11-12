@@ -94,7 +94,12 @@ public sealed class RedisTlsProductionTests
         using (var ready = await client.GetAsync("/api/ready"))
             Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
 
-        var redis = server.Services.GetRequiredService<IConnectionMultiplexer>();
+        // The standalone fixture has no ACL; use a disposable test-only
+        // observation mux, NEVER enable AllowAdmin on the game client.
+        var observerOptions = ConfigurationOptions.Parse(Connection);
+        Assert.False(observerOptions.AllowAdmin);
+        observerOptions.AllowAdmin = true;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(observerOptions);
         var servers = redis.GetEndPoints(configuredOnly: false)
             .Select(endpoint => redis.GetServer(endpoint)).ToArray();
         Assert.Contains(servers, endpoint => endpoint.IsConnected);

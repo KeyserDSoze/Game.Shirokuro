@@ -118,10 +118,13 @@ jobs:
           acldir="$(mktemp -d /tmp/shirokuro-ci-redis-acl-XXXXXX)"
           echo "SHIROKURO_TEST_REDIS_ACL_DIR=$acldir" >> "$GITHUB_ENV"
           password="$(openssl rand -hex 24)"
+          observer_password="$(openssl rand -hex 24)"
           echo "::add-mask::$password"
+          echo "::add-mask::$observer_password"
           cat > "$acldir/users.acl" <<EOF
           user default off
           user shirokuro-ci on >$password ~shirokuro:* +@read +@write +@connection +@scripting +@pubsub +@transaction -@dangerous -@admin +info +command +client +time
+          user shirokuro-observer on >$observer_password ~__no_keys__:* resetchannels -@all +auth +hello +ping +echo +info +command +client|setname +client|setinfo
           EOF
           chmod 755 "$acldir"
           chmod 644 "$acldir/users.acl"
@@ -141,6 +144,7 @@ jobs:
 
           # The password is masked, and never printed by redis-cli or shell.
           echo "SHIROKURO_TEST_REDIS_TLS_ACL=localhost:6386,ssl=true,sslHost=localhost,user=shirokuro-ci,password=$password,abortConnect=true,connectTimeout=3000,connectRetry=0" >> "$GITHUB_ENV"
+          echo "SHIROKURO_TEST_REDIS_TLS_MONITOR=localhost:6386,ssl=true,sslHost=localhost,user=shirokuro-observer,password=$observer_password,abortConnect=true,connectTimeout=3000,connectRetry=0" >> "$GITHUB_ENV"
           for i in $(seq 1 60); do
             if docker exec -e "REDISCLI_AUTH=$password" \
                 shirokuro-ci-redis-acl redis-cli --tls \
