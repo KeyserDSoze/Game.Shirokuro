@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -9,6 +9,7 @@ import {
 } from './api'
 
 type Props = { previewHeroId: string }
+const SESSION_CHANGE_CHANNEL = 'shirokuro:guest-session-changed'
 
 /** The room is pre-match only; the hex map remains an independent local preview. */
 export default function LobbyPanel({ previewHeroId }: Props) {
@@ -22,6 +23,23 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const [creatorTeam, setCreatorTeam] = useState('white')
   const [invitedTeam, setInvitedTeam] = useState('black')
   const [newTeam, setNewTeam] = useState('white')
+  const sessionChannelRef = useRef<BroadcastChannel | null>(null)
+
+  // Broadcast only an opaque "recheck" signal: NEVER a cookie, player ID,
+  // invitation code, roster or session state. Other tabs ask the API.
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return
+    const channel = new BroadcastChannel(SESSION_CHANGE_CHANNEL)
+    sessionChannelRef.current = channel
+    return () => {
+      sessionChannelRef.current = null
+      channel.close()
+    }
+  }, [])
+
+  const notifySessionChange = () => {
+    sessionChannelRef.current?.postMessage('recheck')
+  }
 
   // Drop every locally cached private room reference if the cookie becomes
   // invalid. Only the server may issue a replacement guest identity.
@@ -70,10 +88,21 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           }
         })
     }
+    // Headless/embedded browsers may not reliably fire window.focus when
+    // tabs switch; visibilitychange and same-origin credential-free notices
+    // cover those cases without polling or persisting identity in storage.
+    const onVisible = () => {
+      if (!document.hidden) recheckOnFocus()
+    }
+    const channel = sessionChannelRef.current
     window.addEventListener('focus', recheckOnFocus)
+    document.addEventListener('visibilitychange', onVisible)
+    channel?.addEventListener('message', recheckOnFocus)
     return () => {
       active = false
       window.removeEventListener('focus', recheckOnFocus)
+      document.removeEventListener('visibilitychange', onVisible)
+      channel?.removeEventListener('message', recheckOnFocus)
     }
   }, [session, forgetGuest, t])
 
@@ -132,6 +161,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             onClick={() => void run(async () => {
               const own = await guestLobbyApi.signIn()
               setSession(own)
+              notifySessionChange()
               setMessage(t('lobbyWelcome'))
             })}
           >
@@ -306,8 +336,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
               disabled={busy}
               onClick={() => void run(async () => {
                 await guestLobbyApi.signOut()
-                setSession(null)
-                setRoom(null)
+                forgetGuest()
+                notifySessionChange()
                 setMessage(t('lobbySignedOut'))
               })}
             >

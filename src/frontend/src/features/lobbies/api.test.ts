@@ -79,6 +79,16 @@ describe('guest lobby client boundaries', () => {
     expect(new LobbyHttpError(404).status).toBe(404)
   })
 
+  it.each([401, 403, 429, 503])('propagates HTTP %i without inventing a new identity', async status => {
+    const mocked = vi.fn().mockResolvedValue({ ok: false, status })
+    vi.stubGlobal('fetch', mocked)
+    await expect(guestLobbyApi.read(roomCode)).rejects.toMatchObject({
+      name: 'LobbyHttpError', status,
+    })
+    expect(mocked).toHaveBeenCalledOnce()
+    expect((mocked.mock.calls[0][1] as RequestInit).method).toBe('GET')
+  })
+
   it('sign-in performs no magic persistence or browser-side identity generation', async () => {
     const mocked = vi.fn().mockResolvedValue({
       ok: true, status: 200,

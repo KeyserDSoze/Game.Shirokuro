@@ -271,3 +271,19 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   await page.getByTestId('lobby-sign-in').click()
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
+
+test('guest focus revalidation discards stale room after cookie disappears without cross-tab notice', async ({ page, context }) => {
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toBeVisible()
+
+  // Simulate an expired/revoked browser cookie without any BroadcastChannel
+  // sender. Explicitly dispatch focus for deterministic headless coverage.
+  await context.clearCookies()
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
+})

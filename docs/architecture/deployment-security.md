@@ -1643,8 +1643,14 @@ only while it has a valid server guest identity. Authenticated operations
 still rely on Redis to authorize every request: a response of **401** means
 the browser must clear its cached guest identity, private room, invite,
 roster and revision, and offer an **explicit** guest sign-in action.
-A guest tab also makes a **read-only** `GET /api/sessions/me` when it
-regains window focus. If the server returns 401, a non-guest identity or a
+A guest tab also makes a **read-only** `GET /api/sessions/me` on
+window focus, visibility restoration or a same-origin `BroadcastChannel`
+notification after another tab explicitly signs in/out. Channel messages
+contain only the fixed string `recheck`, **not** user identity, invite,
+roster or any cookie; no browser storage, persistent credential or auto-login
+is introduced. This keeps a background tab recoverable even when its
+browser does not emit a reliable focus event. If the server returns 401,
+a non-guest identity or a
 different guest ID, it discards the old guest's private room before any
 further action. No new cookie is silently minted; the user must click sign
 in. Transient failures and other HTTP statuses (403/429/503) do not falsely
