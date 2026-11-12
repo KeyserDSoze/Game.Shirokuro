@@ -55,6 +55,12 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
             // Indistinguishable responses to hidden/absent lobbies and non-members.
             throw new HubException("Lobby unavailable.");
         }
+        catch (LobbySnapshotUnavailableException)
+        {
+            // Corrupted/incompatible authoritative Redis room data must
+            // look exactly like any other unavailable lobby to the socket.
+            throw new HubException("Lobby unavailable.");
+        }
         catch (LobbyReadContentionException)
         {
             // The caller must not receive an unverifiable stale roster or
