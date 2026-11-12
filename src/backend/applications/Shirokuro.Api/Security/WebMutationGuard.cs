@@ -11,6 +11,15 @@ namespace Shirokuro.Api.Security;
 public sealed record WebMutationGuardRequired();
 
 /// <summary>
+/// Lobby SignalR endpoints are read-only but browsers can attach signed
+/// same-site cookies to cross-origin WebSocket handshakes. Unlike fetch,
+/// WebSocket does not enforce CORS. Server-generated metadata fences only
+/// this hub before guest Redis validation, without adding a mutation intent
+/// header requirement or blocking non-browser clients without Origin.
+/// </summary>
+public sealed record CookieSocketOriginGuardRequired();
+
+/// <summary>
 /// Cookie-backed write protection. An arbitrary HTTP Host or forwarded Host
 /// is never a trust source: production origins require explicit configuration.
 /// </summary>
@@ -29,8 +38,23 @@ public static class WebMutationGuard
     {
         var request = context.Request;
         if (!request.Headers.TryGetValue(RequestHeaderName, out var intent) ||
-            intent.Count != 1 || intent[0] != RequestHeaderValue ||
-            !request.Headers.TryGetValue("Origin", out var origins) ||
+            intent.Count != 1 || intent[0] != RequestHeaderValue)
+            return false;
+
+        return AllowsBrowserOrigin(context, environment);
+    }
+
+    /// <summary>
+    /// Origin validation shared by cookie-backed browser mutations and the
+    /// browser-facing SignalR lobby transport. Host and forwarded headers
+    /// never grant Origin trust; Production uses Security:AllowedOrigins.
+    /// Callers decide whether an Origin header is mandatory: mutations
+    /// require it; non-browser realtime clients may omit it.
+    /// </summary>
+    public static bool AllowsBrowserOrigin(HttpContext context, IHostEnvironment environment)
+    {
+        var request = context.Request;
+        if (!request.Headers.TryGetValue("Origin", out var origins) ||
             origins.Count != 1 ||
             !TryParseOrigin(origins[0], out var origin))
             return false;
