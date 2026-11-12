@@ -12,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
+using Shirokuro.Application.Lobbies;
 using Shirokuro.Domain.Lobbies;
 using StackExchange.Redis;
 using Xunit;
