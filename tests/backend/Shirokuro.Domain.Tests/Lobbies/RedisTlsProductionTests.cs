@@ -364,8 +364,13 @@ public sealed class RedisTlsProductionTests
             using (var deniedA = await aliceA.GetAsync("/api/sessions/me"))
             using (var deniedB = await bobB.GetAsync("/api/sessions/me"))
             {
-                Assert.Equal(HttpStatusCode.Unauthorized, deniedA.StatusCode);
-                Assert.Equal(HttpStatusCode.Unauthorized, deniedB.StatusCode);
+                // The Redis authority is unavailable, not a proven
+                // revoked ticket. Preserve the same signed cookie for retry
+                // while denying all access during the outage.
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, deniedA.StatusCode);
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, deniedB.StatusCode);
+                Assert.Equal("no-store", deniedA.Headers.CacheControl?.ToString());
+                Assert.False(deniedA.Headers.Contains("Set-Cookie"));
                 Assert.DoesNotContain(aliceId, await deniedA.Content.ReadAsStringAsync(),
                     StringComparison.Ordinal);
             }

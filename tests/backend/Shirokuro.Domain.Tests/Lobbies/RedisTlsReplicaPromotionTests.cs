@@ -276,8 +276,10 @@ public sealed class RedisTlsReplicaPromotionTests
         using (var deniedA = await aliceOnB.GetAsync("/api/sessions/me"))
         using (var deniedB = await bobOnB.GetAsync("/api/sessions/me"))
         {
-            Assert.Equal(HttpStatusCode.Unauthorized, deniedA.StatusCode);
-            Assert.Equal(HttpStatusCode.Unauthorized, deniedB.StatusCode);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, deniedA.StatusCode);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, deniedB.StatusCode);
+            Assert.Equal("no-store", deniedA.Headers.CacheControl?.ToString());
+            Assert.False(deniedA.Headers.Contains("Set-Cookie"));
         }
 
         Assert.Equal("OK", await RedisCliAsync(ReplicaContainer,

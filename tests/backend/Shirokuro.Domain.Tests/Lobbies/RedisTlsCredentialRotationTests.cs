@@ -230,7 +230,13 @@ public sealed class RedisTlsCredentialRotationTests
         using (var health = await visitorBlueA.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, health.StatusCode);
         using (var oldCookie = await aliceBlue.GetAsync("/api/sessions/me"))
-            Assert.Equal(HttpStatusCode.Unauthorized, oldCookie.StatusCode);
+        {
+            // Disabled/evicted ACL credentials make Redis unverifiable,
+            // NOT proof that the formerly issued guest ticket was revoked.
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, oldCookie.StatusCode);
+            Assert.Equal("no-store", oldCookie.Headers.CacheControl?.ToString());
+            Assert.False(oldCookie.Headers.Contains("Set-Cookie"));
+        }
 
         // Green remains fully active across the blue eviction, and logout
         // fences even requests that validated an old guest cookie earlier.
