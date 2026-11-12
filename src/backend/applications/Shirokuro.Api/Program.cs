@@ -620,6 +620,12 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
         {
             return Results.NotFound();
         }
+        catch (LobbySnapshotUnavailableException)
+        {
+            // Never reveal corrupted/incompatible Redis room bytes or
+            // pretend a member roster was successfully authorized.
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
         catch (LobbyReadContentionException)
         {
             // Another node may be advancing this room's activity/snapshot
