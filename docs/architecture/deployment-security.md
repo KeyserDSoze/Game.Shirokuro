@@ -1635,3 +1635,26 @@ checks and idempotent cleanup remain authoritative. The 2-second limit
 applies **to each Redis command**, not to the total duration of a multi-
 step operation or cleanup across multiple rooms. Independently monitored
 Redis TLS/ACL/HA and anti-abuse protections remain under umbrella #21.
+
+## Browser recovery after guest session revocation (#71)
+
+The React pre-match lobby keeps a private local room/invite/roster snapshot
+only while it has a valid server guest identity. Authenticated operations
+still rely on Redis to authorize every request: a response of **401** means
+the browser must clear its cached guest identity, private room, invite,
+roster and revision, and offer an **explicit** guest sign-in action.
+A guest tab also makes a **read-only** `GET /api/sessions/me` when it
+regains window focus. If the server returns 401, a non-guest identity or a
+different guest ID, it discards the old guest's private room before any
+further action. No new cookie is silently minted; the user must click sign
+in. Transient failures and other HTTP statuses (403/429/503) do not falsely
+delete a known-valid guest state. IT/EN statuses are accessible via the
+existing live-region message.
+
+The authoritative server invalidates cookies immediately on logout: a
+background or unfocused browser may still visually hold an old snapshot
+until its next focus/request, but it cannot access or mutate the revoked
+room on the backend. Never treat UI clearing as the authorization boundary
+or assume Web Storage can revoke a signed cookie. Existing server-side
+Redis validation, membership checks and SignalR revalidation remain the
+security boundary. Operational abuse prevention remains parent #21.

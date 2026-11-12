@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -23,6 +23,14 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const [invitedTeam, setInvitedTeam] = useState('black')
   const [newTeam, setNewTeam] = useState('white')
 
+  // Drop every locally cached private room reference if the cookie becomes
+  // invalid. Only the server may issue a replacement guest identity.
+  const forgetGuest = useCallback(() => {
+    setSession(null)
+    setRoom(null)
+    setInvite('')
+  }, [])
+
   useEffect(() => {
     let active = true
     // Read-only: never create a guest identity automatically on page load.
@@ -32,6 +40,43 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     return () => { active = false }
   }, [])
 
+  useEffect(() => {
+    if (!session) return
+
+    let active = true
+    const recheckOnFocus = () => {
+      // Another tab can sign out or replace the cookie while this tab keeps
+      // a room visible. Query the server on focus; never auto-issue a guest.
+      void guestLobbyApi.session()
+        .then(identity => {
+          if (!active) return
+          if (identity.kind !== 'guest') {
+            forgetGuest()
+            setMessage(t('lobbySessionExpired'))
+          } else if (identity.playerId !== session.playerId) {
+            // Different server-issued identity must not inherit the previous
+            // guest's invite, room, roster or revision.
+            setRoom(null)
+            setInvite('')
+            setSession(identity)
+            setMessage(t('lobbySessionChanged'))
+          }
+        })
+        .catch(error => {
+          // A transient offline/503/403 response is not proof of revocation.
+          if (active && error instanceof LobbyHttpError && error.status === 401) {
+            forgetGuest()
+            setMessage(t('lobbySessionExpired'))
+          }
+        })
+    }
+    window.addEventListener('focus', recheckOnFocus)
+    return () => {
+      active = false
+      window.removeEventListener('focus', recheckOnFocus)
+    }
+  }, [session, forgetGuest, t])
+
   async function run(action: () => Promise<void>) {
     if (busy) return
     setBusy(true)
@@ -40,7 +85,14 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       await action()
     } catch (error) {
       if (error instanceof LobbyHttpError) {
-        // A stale/expired private room must not remain presented as current.
+        if (error.status === 401) {
+          // The authoritative guest ticket no longer exists; an old room
+          // must not stay visible or prevent explicit reauthentication.
+          forgetGuest()
+          setMessage(t('lobbySessionExpired'))
+          return
+        }
+        // A missing room is stale, but 403/429/503 do NOT prove logout.
         if (error.status === 404) setRoom(null)
         const key = error.status === 409 ? 'lobbyConflict' :
           error.status === 404 ? 'lobbyMissing' :

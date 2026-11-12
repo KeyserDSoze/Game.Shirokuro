@@ -193,3 +193,81 @@ test('guest lobby shows a safe message when creation is rate-limited', async ({ 
   await expect(page.getByTestId('lobby-create')).toBeVisible()
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
 })
+
+test('guest session revoked in another tab clears private roster on focus without auto-login', async ({ context }) => {
+  const owner = await context.newPage()
+  await owner.goto('/')
+  await owner.getByTestId('lobby-sign-in').click()
+  await expect(owner.getByTestId('lobby-player')).toContainText('guest-')
+  const oldIdentity = (await owner.getByTestId('lobby-player').textContent())!.trim()
+  await owner.getByTestId('lobby-create').click()
+  const oldRoom = (await owner.getByTestId('lobby-room-code').textContent())!.trim()
+
+  const second = await context.newPage()
+  await second.goto('/')
+  await expect(second.getByTestId('lobby-player')).toHaveText(oldIdentity)
+  await second.getByTestId('lobby-invite-input').fill(oldRoom)
+  await second.getByTestId('lobby-join-team').fill('white')
+  await second.getByTestId('lobby-join').click()
+  await expect(second.getByTestId('lobby-room-code')).toHaveText(oldRoom)
+  await expect(second.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+
+  await owner.bringToFront()
+  await owner.getByTestId('lobby-sign-out').click()
+  await expect(owner.getByTestId('lobby-sign-in')).toBeVisible()
+
+  await second.bringToFront()
+  await expect(second.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-player')).toHaveCount(0)
+  await expect(second.getByTestId('lobby-message')).toContainText('scaduta o revocata')
+
+  // React did not mint another identity during focus. The user must opt in.
+  const check = await second.request.get('/api/sessions/me')
+  expect(check.status()).toBe(401)
+  await second.getByTestId('lobby-sign-in').click()
+  await expect(second.getByTestId('lobby-player')).toContainText('guest-')
+  expect((await second.getByTestId('lobby-player').textContent())!.trim()).not.toBe(oldIdentity)
+  await expect(second.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(second.getByTestId('lobby-room-code')).toHaveCount(0)
+})
+
+test('401 on a lobby action resets private state, but 403/429/503 do not revoke a valid guest', async ({ page }) => {
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  const existingRoom = (await page.getByTestId('lobby-room-code').textContent())!.trim()
+
+  let responseStatus = 503
+  await page.route('**/api/lobbies/' + existingRoom + '/team', async route => {
+    await route.fulfill({
+      status: responseStatus,
+      headers: { 'Cache-Control': 'no-store' },
+      body: '',
+    })
+  })
+
+  for (const [status, expected] of [
+    [503, 'server non raggiungibile'],
+    [403, 'Accesso non autorizzato'],
+    [429, 'Troppe richieste'],
+  ] as const) {
+    responseStatus = status
+    await page.getByTestId('lobby-change-team').click()
+    await expect(page.getByTestId('lobby-message')).toContainText(expected)
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
+    await expect(page.getByTestId('lobby-player')).toContainText('guest-')
+  }
+
+  responseStatus = 401
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+  // The old invite must not remain available for a newly-issued identity.
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+})
