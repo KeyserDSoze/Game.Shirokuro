@@ -183,7 +183,17 @@ builder.Services.AddRateLimiter(options =>
             .GetMetadata<GuestMutationRateLimit>();
         if (rule is not null)
             MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Limited);
-        rejection.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        // This rejection occurs BEFORE the guest-session or lobby handler:
+        // private responses must not be stored by a proxy or browser.
+        var response = rejection.HttpContext.Response;
+        response.Headers.CacheControl = "no-store";
+        // FixedWindowRateLimiter knows the server-side retry interval. Do
+        // not derive it from an untrusted header or invent one if absent.
+        if (rejection.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retry))
+            response.Headers.RetryAfter = Math.Max(1L,
+                (long)Math.Ceiling(retry.TotalSeconds)).ToString(
+                    System.Globalization.CultureInfo.InvariantCulture);
+        response.StatusCode = StatusCodes.Status429TooManyRequests;
         return ValueTask.CompletedTask;
     };
     options.AddPolicy("guest-room-creation", context =>
