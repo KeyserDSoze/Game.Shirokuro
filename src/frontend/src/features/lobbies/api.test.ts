@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  guestLobbyApi, LobbyHttpError, parseInviteCode, parseTeamIds,
+  guestLobbyApi, LobbyHttpError, LobbyInputError, parseInviteCode, parseTeamIds,
 } from './api'
 
 const roomCode = 'room-' + 'a'.repeat(32)
@@ -30,6 +30,14 @@ describe('guest lobby client boundaries', () => {
       '../api/sessions/me', roomCode + '/roster', roomCode + '?playerId=alice']) {
       expect(() => parseInviteCode(input)).toThrow()
     }
+  })
+
+  it('classifies local input errors separately from HTTP and network failures', () => {
+    expect(() => parseTeamIds('white,white')).toThrow(LobbyInputError)
+    expect(() => parseInviteCode('../../admin')).toThrow(LobbyInputError)
+    expect(() => parseTeamIds('white,black')).not.toThrow()
+    expect(new LobbyHttpError(503)).not.toBeInstanceOf(LobbyInputError)
+    expect(new TypeError('Failed to fetch')).not.toBeInstanceOf(LobbyInputError)
   })
 
   it('never supplies a playerId when creating and joining the room', async () => {
