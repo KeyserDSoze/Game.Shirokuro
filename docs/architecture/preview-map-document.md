@@ -45,3 +45,22 @@ Gameplay maps must use separately versioned, server-validated schemas after
 design approval in #3/#5, never accept this client-side validation as
 authorization. Importing terrain does not reveal hidden state.
 
+
+## Local undo/redo history (#99)
+
+The terrain palette now provides **Undo / Redo** controls (Italian and
+English, keyboard and mobile accessible). Painting an individual hex,
+resetting the preview, and importing a fully validated 19-cell JSON
+document are each **one atomic and reversible local edit**. No-op paints,
+resets and identical imports do not push history or clear a redo branch.
+An invalid JSON import changes neither the map nor the edit history.
+Performing a real edit after undo discards the previous redo branch.
+
+The pure, immutable `terrainHistory.ts` module keeps at most **32 past
+and 32 redo snapshots**, compares the effective 19-cell terrain layout,
+and clones inputs from imports. No user data, terrain changes, hero
+positions or hidden routes are ever stored on a server, in cookies, or
+in localStorage as part of this feature. Undo/redo is preview-only and
+does not authorize game movement, reveal private information, or affect
+the pre-match guest lobby. The rules, map ownership and match replay
+remain dependencies of the approved game design (#3/#5/#9).

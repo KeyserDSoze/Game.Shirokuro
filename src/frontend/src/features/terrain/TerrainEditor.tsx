@@ -14,11 +14,18 @@ type Props = {
   onBrushChange: (brush: TerrainId) => void
   onPaint: () => void
   onReset: () => void
+  canUndo: boolean
+  canRedo: boolean
+  onUndo: () => void
+  onRedo: () => void
 }
 
 const SWATCH_SIZE = 48
 
-export default function TerrainEditor({ selectedTerrain, brush, onBrushChange, onPaint, onReset }: Props) {
+export default function TerrainEditor({
+  selectedTerrain, brush, onBrushChange, onPaint, onReset,
+  canUndo, canRedo, onUndo, onRedo,
+}: Props) {
   const { t } = useTranslation()
   return (
     <Card>
@@ -67,6 +74,8 @@ export default function TerrainEditor({ selectedTerrain, brush, onBrushChange, o
         <div className="flex flex-wrap gap-2">
           <Button type="button" size="sm" onClick={onPaint} data-testid="terrain-paint">{t('terrainApply')}</Button>
           <Button type="button" size="sm" variant="outline" onClick={onReset} data-testid="terrain-reset">{t('terrainReset')}</Button>
+          <Button type="button" size="sm" variant="outline" onClick={onUndo} disabled={!canUndo} data-testid="terrain-undo">{t('terrainUndo')}</Button>
+          <Button type="button" size="sm" variant="outline" onClick={onRedo} disabled={!canRedo} data-testid="terrain-redo">{t('terrainRedo')}</Button>
         </div>
         <p className="text-xs text-muted-foreground">{t('terrainLocalNotice')}</p>
       </CardContent>

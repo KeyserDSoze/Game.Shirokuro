@@ -10,7 +10,10 @@ import LobbyPanel from '@/features/lobbies/LobbyPanel'
 import { heroRoster } from '@/features/heroes/catalog'
 import TerrainEditor from '@/features/terrain/TerrainEditor'
 import MapDocumentEditor from '@/features/terrain/MapDocumentEditor'
-import { paintTerrainCell, terrainAtCell, type TerrainId, type TerrainOverrides } from '@/game/terrain'
+import { paintTerrainCell, terrainAtCell, type TerrainId } from '@/game/terrain'
+import {
+  commitTerrainEdit, createTerrainHistory, redoTerrainEdit, undoTerrainEdit,
+} from '@/game/terrainHistory'
 import type { HexCoordinate } from '@/game/hex'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -42,7 +45,8 @@ export default function App() {
   const [selectedHeroId, setSelectedHeroId] = useState(heroRoster[0].id)
   const selectedHero = heroRoster.find((hero) => hero.id === selectedHeroId) ?? heroRoster[0]
   const [terrainBrush, setTerrainBrush] = useState<TerrainId>('water')
-  const [terrainOverrides, setTerrainOverrides] = useState<TerrainOverrides>({})
+  const [terrainHistory, setTerrainHistory] = useState(() => createTerrainHistory())
+  const terrainOverrides = terrainHistory.present
   const selectedTerrain = terrainAtCell(selected, terrainOverrides)
 
   useEffect(() => { document.documentElement.lang = i18n.language }, [i18n.language])
@@ -135,10 +139,18 @@ export default function App() {
             selectedTerrain={selectedTerrain}
             brush={terrainBrush}
             onBrushChange={setTerrainBrush}
-            onPaint={() => setTerrainOverrides(previous => paintTerrainCell(previous, selected, terrainBrush))}
-            onReset={() => setTerrainOverrides({})}
+            onPaint={() => setTerrainHistory(previous => commitTerrainEdit(
+              previous, paintTerrainCell(previous.present, selected, terrainBrush)))}
+            onReset={() => setTerrainHistory(previous => commitTerrainEdit(previous, {}))}
+            canUndo={terrainHistory.past.length > 0}
+            canRedo={terrainHistory.future.length > 0}
+            onUndo={() => setTerrainHistory(undoTerrainEdit)}
+            onRedo={() => setTerrainHistory(redoTerrainEdit)}
           />
-          <MapDocumentEditor overrides={terrainOverrides} onImport={setTerrainOverrides} />
+          <MapDocumentEditor
+            overrides={terrainOverrides}
+            onImport={next => setTerrainHistory(previous => commitTerrainEdit(previous, next))}
+          />
           <Card>
             <CardHeader>
               <div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-secondary"><EyeOff className="size-5" /></div>

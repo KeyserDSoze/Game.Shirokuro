@@ -287,3 +287,78 @@ test('original movement cards render on English mobile dark mode without network
   expect(mutations).toEqual([])
 })
 
+
+test('local map editor undo/redo spans paint, reset and validated import without network writes', async ({ page }) => {
+  const mutations: string[] = []
+  page.on('request', request => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()))
+      mutations.push(request.url())
+  })
+  await page.goto('/')
+  const undo = page.getByTestId('terrain-undo')
+  const redo = page.getByTestId('terrain-redo')
+  await expect(undo).toBeDisabled()
+  await expect(redo).toBeDisabled()
+
+  await page.getByTestId('terrain-brush-water').click()
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+  await undo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  await expect(undo).toBeDisabled()
+  await redo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+  await expect(redo).toBeDisabled()
+
+  await page.getByTestId('map-export').click()
+  const saved = await page.getByTestId('map-document').inputValue()
+  await page.getByTestId('terrain-reset').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  await undo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+  await redo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+
+  await page.getByTestId('map-document').fill(saved)
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Acqua')
+  await undo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+
+  // Branching from undo invalidates redo; repainting the same effective
+  // terrain or failing import must not create extra history entries.
+  await page.getByTestId('terrain-brush-black').click()
+  await page.getByTestId('terrain-paint').click()
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Nero')
+  await expect(redo).toBeDisabled()
+  await page.getByTestId('map-document').fill('{broken')
+  await page.getByTestId('map-import').click()
+  await expect(page.getByTestId('map-document-status')).toContainText('non valido')
+  await undo.click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Città')
+  expect(mutations).toEqual([])
+})
+
+test('undo and redo are keyboard-accessible and translated on English mobile dark mode', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+  await page.getByTestId('language-toggle').click()
+  await page.getByTestId('theme-toggle').click()
+  await expect(page.getByTestId('terrain-undo')).toHaveText('Undo')
+  await expect(page.getByTestId('terrain-redo')).toHaveText('Redo')
+  await expect(page.getByTestId('terrain-undo')).toBeDisabled()
+  await page.getByTestId('terrain-brush-sand').click()
+  await page.getByTestId('terrain-paint').click()
+  await expect(page.getByTestId('terrain-current')).toContainText('Sand')
+
+  await page.getByTestId('terrain-undo').focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('terrain-current')).toContainText('City')
+  await expect(page.getByTestId('terrain-undo')).toBeDisabled()
+
+  await page.getByTestId('terrain-redo').focus()
+  await page.keyboard.press('Space')
+  await expect(page.getByTestId('terrain-current')).toContainText('Sand')
+  await expect(page.getByTestId('world-stage')).toBeVisible()
+})
