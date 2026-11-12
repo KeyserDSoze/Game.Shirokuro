@@ -195,11 +195,15 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         const key = error.status === 409 ? 'lobbyConflict' :
           error.status === 404 ? 'lobbyMissing' :
           error.status === 429 ? 'lobbyLimited' :
-          error.status === 401 || error.status === 403 ? 'lobbyDenied' :
+          error.status === 403 ? 'lobbyDenied' :
+          [502, 503, 504].includes(error.status) ? 'lobbyUnavailable' :
           'lobbyInvalid'
         setMessage(t(key))
       } else {
-        setMessage(t('lobbyInvalid'))
+        // A network/fetch failure does not prove that the signed guest
+        // session or the cached roster is invalid. Never replay a mutation.
+        // Let the player explicitly retry after connectivity recovers.
+        setMessage(t('lobbyUnavailable'))
       }
     } finally {
       if (operation === operationRef.current) {
