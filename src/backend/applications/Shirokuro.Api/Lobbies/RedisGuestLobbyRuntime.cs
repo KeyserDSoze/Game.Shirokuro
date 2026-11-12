@@ -32,7 +32,7 @@ public sealed class RedisGuestLobbyRuntime(
                 trustedPlayerId, initialTeam, 0);
             var snapshot = new LobbySnapshot(state, clock.GetUtcNow(), trustedPlayerId);
             if (await store.CreateBoundedAsync(snapshot, GuestLobbyCommands.MaxRooms,
-                    GuestLobbyCommands.MaxRoomsPerCreator))
+                    GuestLobbyCommands.MaxRoomsPerCreator, cancellationToken))
                 return Project(state);
         }
         throw new InvalidOperationException("Unable to allocate a lobby.");
@@ -49,7 +49,7 @@ public sealed class RedisGuestLobbyRuntime(
         for (var attempt = 0; attempt < RetryLimit; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var found = await Find(roomId);
+            var found = await Find(roomId, cancellationToken);
             var before = found.Snapshot.State;
             if (expectedRevision.HasValue && before.Revision != expectedRevision.Value)
                 throw new LobbyRevisionConflictException(expectedRevision.Value, before.Revision);
@@ -59,11 +59,11 @@ public sealed class RedisGuestLobbyRuntime(
             var next = before.Join(trustedPlayerId, teamId, before.Revision);
             if (await store.CompareExchangeAsync(found,
                 found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
-                trustedPlayerId))
+                trustedPlayerId, cancellationToken))
                 return Project(next);
             if (expectedRevision.HasValue)
                 throw new LobbyRevisionConflictException(expectedRevision.Value,
-                    (await store.ReadAsync(roomId))?.Snapshot.State.Revision ?? before.Revision);
+                    (await store.ReadAsync(roomId, cancellationToken))?.Snapshot.State.Revision ?? before.Revision);
         }
         throw new InvalidOperationException("Concurrent lobby updates exceeded retry budget.");
     }
@@ -87,17 +87,17 @@ public sealed class RedisGuestLobbyRuntime(
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var found = await Find(roomId);
+        var found = await Find(roomId, cancellationToken);
         EnsureMember(found.Snapshot.State, trustedPlayerId);
         var next = found.Snapshot.State.Leave(trustedPlayerId, expectedRevision);
         var success = next.Participants.Count == 0
-            ? await store.DeleteIfCurrentAsync(found, trustedPlayerId)
+            ? await store.DeleteIfCurrentAsync(found, trustedPlayerId, cancellationToken)
             : await store.CompareExchangeAsync(found,
                 found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
-                trustedPlayerId);
+                trustedPlayerId, cancellationToken);
         if (!success)
             throw new LobbyRevisionConflictException(expectedRevision,
-                (await store.ReadAsync(roomId))?.Snapshot.State.Revision ?? expectedRevision);
+                (await store.ReadAsync(roomId, cancellationToken))?.Snapshot.State.Revision ?? expectedRevision);
     }
 
     public async Task<LobbyRosterView> ForMemberAsync(
@@ -108,11 +108,11 @@ public sealed class RedisGuestLobbyRuntime(
         for (var attempt = 0; attempt < RetryLimit; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var found = await Find(roomId);
+            var found = await Find(roomId, cancellationToken);
             EnsureMember(found.Snapshot.State, trustedPlayerId);
             if (await store.CompareExchangeAsync(found,
                 found.Snapshot with { LastActivityUtc = NextActivity(found) },
-                trustedPlayerId))
+                trustedPlayerId, cancellationToken))
                 return Project(found.Snapshot.State);
         }
         throw new InvalidOperationException("Concurrent lobby reads exceeded retry budget.");
@@ -129,23 +129,25 @@ public sealed class RedisGuestLobbyRuntime(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
         var removed = 0;
-        var rooms = await store.GetIndexedRoomsAsync();
+        var rooms = await store.GetIndexedRoomsAsync(cancellationToken);
         foreach (var item in rooms)
         {
             var roomId = item.Snapshot.State.Definition.LobbyId;
             for (var attempt = 0; attempt < RetryLimit; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var current = await store.ReadAsync(roomId);
+                var current = await store.ReadAsync(roomId, cancellationToken);
                 if (current is null || !IsMember(current.Snapshot.State, trustedPlayerId))
                     break;
 
                 var next = current.Snapshot.State.Leave(
                     trustedPlayerId, current.Snapshot.State.Revision);
                 var success = next.Participants.Count == 0
-                    ? await store.DeleteIfCurrentAsync(current)
+                    ? await store.DeleteIfCurrentAsync(
+                        current, cancellationToken: cancellationToken)
                     : await store.CompareExchangeAsync(current,
-                        current.Snapshot with { State = next });
+                        current.Snapshot with { State = next },
+                        cancellationToken: cancellationToken);
                 if (success)
                 {
                     removed++;
@@ -163,20 +165,21 @@ public sealed class RedisGuestLobbyRuntime(
         Func<LobbyState, LobbyState> mutation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var found = await Find(roomId);
+        var found = await Find(roomId, cancellationToken);
         EnsureMember(found.Snapshot.State, actor);
         var next = mutation(found.Snapshot.State);
         if (!await store.CompareExchangeAsync(found,
             found.Snapshot with { State = next, LastActivityUtc = NextActivity(found) },
-            actor))
+            actor, cancellationToken))
             throw new LobbyRevisionConflictException(revision,
-                (await store.ReadAsync(roomId))?.Snapshot.State.Revision ?? revision);
+                (await store.ReadAsync(roomId, cancellationToken))?.Snapshot.State.Revision ?? revision);
         return Project(next);
     }
 
-    private async Task<RedisLobbySnapshotStore.Stored> Find(string roomId)
+    private async Task<RedisLobbySnapshotStore.Stored> Find(
+        string roomId, CancellationToken cancellationToken)
     {
-        var found = await store.ReadAsync(roomId);
+        var found = await store.ReadAsync(roomId, cancellationToken);
         if (found is null || !found.Snapshot.QuotaTracked)
             throw new KeyNotFoundException("Lobby unavailable.");
         return found;
