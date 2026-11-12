@@ -158,7 +158,7 @@ jobs:
           exit 1
 
       - name: Test authenticated Production Redis TLS ACL and namespace isolation
-        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsAclProductionTests'
+        run: dotnet test Shirokuro.slnx -c Release --no-build --filter 'FullyQualifiedName~RedisTlsAclProductionTests|FullyQualifiedName~DeploymentReadinessTests.ActualRedisSessionCacheAndIndependentLobbyConnectorAreBothReady'
 
       - name: Destroy isolated Redis TLS ACL fixture and credentials
         if: always()

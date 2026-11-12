@@ -84,7 +84,8 @@ public sealed class DeploymentReadinessTests
 
     private static WebApplicationFactory<Program> Production(
         IConnectionMultiplexer redis, ToggleSessionStore sessions,
-        ManualClock clock, bool brokenKeys = false, bool realSessions = false) =>
+        ManualClock clock, bool brokenKeys = false, bool realSessions = false,
+        string? realSessionConnection = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -110,7 +111,9 @@ public sealed class DeploymentReadinessTests
                         // not just Configuration: ConfigurationOptions takes
                         // precedence in StackExchangeRedisCache.
                         options.ConfigurationOptions =
-                            ConfigurationOptions.Parse(RedisAddress!);
+                            ConfigurationOptions.Parse(realSessionConnection
+                                ?? throw new InvalidOperationException(
+                                    "Dedicated test Redis TLS connection is required."));
                         options.InstanceName = "shirokuro-readiness-test:";
                     });
                 else
@@ -287,10 +290,16 @@ public sealed class DeploymentReadinessTests
     [Fact]
     public async Task ActualRedisSessionCacheAndIndependentLobbyConnectorAreBothReady()
     {
-        if (RedisAddress is null) return;
-        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        // This integration is deliberately hosted by the dedicated TLS+ACL
+        // CI fixture instead of the plaintext standard Redis test service.
+        // The game cache must never bypass TLS to satisfy a test override.
+        var redisTls = Environment.GetEnvironmentVariable(
+            "SHIROKURO_TEST_REDIS_TLS_ACL");
+        if (redisTls is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(redisTls);
         using var server = Production(redis, new ToggleSessionStore(),
-            new ManualClock(), realSessions: true);
+            new ManualClock(), realSessions: true,
+            realSessionConnection: redisTls);
         // The production Redis cache starts a lazy independent connection.
         // Warm it explicitly so this test verifies healthy steady-state
         // readiness rather than timing the initial connection establishment.
