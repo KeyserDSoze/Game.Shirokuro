@@ -1475,3 +1475,25 @@ Redis TLS ACL/Sentinel/rotation/recovery CI exercises the valid path;
 new xUnit regressions reject unsafe startup and late overrides without
 requiring a network connection. Production edge policies and HA/SLA
 remain under #21.
+
+## Bounded distributed guest mutation admission (#65)
+
+The shared Redis Lua rate limiter for guest session issuance (**12 per minute
+per trusted client IP**) and room creation (**8 per minute per trusted
+client IP**) now bounds the **client wait** to 2 seconds, combined with the
+actual HTTP request's cancellation token. On timeout/Redis outage, a
+still-connected guest receives a sanitized `503` with `Cache-Control:
+no-store` and **no guest cookie or new lobby**. If the HTTP client has
+disconnected, its cancellation stops the server wait instead of inventing
+a successful decision. No local rate-limit allowance, optimistic reply,
+or automatic retry exists.
+
+Redis Lua still serializes the counter update across nodes. Cancelling the
+.NET await **does not necessarily interrupt a Lua script already sent to
+Redis**: a request that got 503 may still consume one quota permit. Clients
+must not assume an unconsumed permit and operators should not infer exact
+successful issuance counts from admission counters. Retrying automatically
+would risk double-counting and is deliberately avoided. This bounded
+admission check is separate from downstream guest/session/lobby Redis
+availability, from the read-only observer (#63), and from the real-world
+network HA/abuse controls still open in #21.

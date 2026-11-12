@@ -37,6 +37,7 @@ public interface IGuestMutationLimiter
 public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutationLimiter
 {
     public const long WindowMilliseconds = 60_000;
+    public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
 
     private const string Script = """
         local count = redis.call('GET', KEYS[1])
@@ -60,9 +61,16 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         cancellationToken.ThrowIfCancellationRequested();
         var key = Key(policy, trustedRemoteIp);
         // A single Lua script serializes every participating API/node's
-        // check and increment. No sliding TTL on accepted/rejected hits.
+        // check and increment. The bounded wait honours HTTP disconnects.
+        // Abandoning a client wait does NOT necessarily cancel a Lua script
+        // already accepted by Redis; do not retry, or assume quota was unused.
+        // No local permits/fallback are ever granted on an unknown result.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
         var redisResult = await database.ScriptEvaluateAsync(
-            Script, [key], [WindowMilliseconds, policy.PermitLimit]);
+                Script, [key], [WindowMilliseconds, policy.PermitLimit])
+            .WaitAsync(timeout.Token);
         var fields = (RedisResult[])redisResult!;
         if (fields.Length != 2)
             throw new InvalidDataException("Invalid distributed limit result.");
