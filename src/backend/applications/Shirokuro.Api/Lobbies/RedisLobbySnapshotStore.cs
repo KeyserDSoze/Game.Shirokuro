@@ -204,7 +204,18 @@ public sealed class RedisLobbySnapshotStore(
         if (raw.IsNull)
             return null;
         var bytes = (byte[])raw!;
-        var snapshot = RedisLobbySnapshotCodec.Decode(bytes, lobbyId);
+        LobbySnapshot snapshot;
+        try
+        {
+            snapshot = RedisLobbySnapshotCodec.Decode(bytes, lobbyId);
+        }
+        catch (InvalidDataException)
+        {
+            // A stored payload may be damaged or written by an incompatible
+            // schema. Never return a partial roster, modify its TTL or
+            // expose the decoder's potentially sensitive inner exception.
+            throw new LobbySnapshotUnavailableException();
+        }
         return Remaining(snapshot) > TimeSpan.Zero
             ? new Stored(snapshot, bytes)
             : null;
