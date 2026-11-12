@@ -57,7 +57,7 @@ public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
             // endpoints on failover. Never display the selected endpoint.
             // Production ACL already allows INFO; do NOT enable AllowAdmin.
             var servers = redis.GetEndPoints(configuredOnly: false)
-                .Select(redis.GetServer)
+                .Select(endpoint => redis.GetServer(endpoint))
                 .Where(server => server.IsConnected)
                 .ToArray();
             var current = servers.FirstOrDefault(server => !server.IsReplica)
