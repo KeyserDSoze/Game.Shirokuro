@@ -325,40 +325,39 @@ test('401 on a lobby action resets private state, but 403/429/503 do not revoke 
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
 
-// Only the invited member deliberately copies this private opaque room code.
-test('a lobby member can copy the invitation and the control disappears on logout', async ({ page, context }) => {
+// Only an invited member deliberately copies this private room code. Group
+// three clipboard phases under ONE guest login to avoid saturating the shared
+// Development guest-issuance quota across concurrent E2E browser workers.
+test('member clipboard succeeds, falls back on denial and ignores late logout response', async ({ page, context }) => {
+  test.setTimeout(60_000)
   await context.grantPermissions(['clipboard-read', 'clipboard-write'])
   await page.goto('/')
   await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-create')).toBeVisible()
   await page.getByTestId('lobby-create').click()
   const invitation = (await page.getByTestId('lobby-room-code').textContent())!.trim()
   expect(invitation).toMatch(/^room-[0-9a-f]{32}$/)
+
+  // Explicit user click performs the only clipboard write.
   await page.getByTestId('lobby-copy-invite').click()
   await expect(page.getByTestId('lobby-message')).toContainText('Codice invito copiato')
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(invitation)
-  await page.getByTestId('lobby-sign-out').click()
-  await expect(page.getByTestId('lobby-copy-invite')).toHaveCount(0)
-  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
-})
 
-test('clipboard rejection offers manual copy without hiding the private invitation', async ({ page }) => {
-  await page.addInitScript(() => {
+  // Permission failures leave the private invitation visible for manual copy.
+  await page.evaluate(() => {
     Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
       value: { writeText: async () => { throw new Error('Permission denied') } },
     })
   })
-  await page.goto('/')
-  await page.getByTestId('lobby-sign-in').click()
-  await page.getByTestId('lobby-create').click()
-  const invitation = (await page.getByTestId('lobby-room-code').textContent())!.trim()
   await page.getByTestId('lobby-copy-invite').click()
   await expect(page.getByTestId('lobby-message')).toContainText('Copia non riuscita')
   await expect(page.getByTestId('lobby-room-code')).toHaveText(invitation)
-})
 
-test('a delayed clipboard response cannot overwrite feedback after sign out', async ({ page }) => {
-  await page.addInitScript(() => {
+  // In-flight clipboard completion cannot replace new-identity/logout feedback.
+  await page.evaluate(() => {
     Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
       value: {
         writeText: () => new Promise<void>(resolve => {
           (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy = resolve
@@ -366,9 +365,6 @@ test('a delayed clipboard response cannot overwrite feedback after sign out', as
       },
     })
   })
-  await page.goto('/')
-  await page.getByTestId('lobby-sign-in').click()
-  await page.getByTestId('lobby-create').click()
   await page.getByTestId('lobby-copy-invite').click()
   await page.waitForFunction(() =>
     typeof (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy === 'function')
@@ -377,5 +373,6 @@ test('a delayed clipboard response cannot overwrite feedback after sign out', as
   await page.evaluate(() =>
     (window as Window & { finishInviteCopy?: () => void }).finishInviteCopy?.())
   await expect(page.getByTestId('lobby-copy-invite')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-message')).toContainText('Sessione ospite terminata')
 })
