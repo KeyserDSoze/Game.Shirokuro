@@ -104,6 +104,19 @@ public sealed class RedisLobbySnapshotStore(
     // Guest cookie TTL is 8h. Keep a hashed actor tombstone no longer than
     // that duration after revocation; a new guest has a different random ID.
     public static readonly TimeSpan RevocationFenceTtl = TimeSpan.FromHours(8);
+    public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
+
+    // Abandon only the .NET wait, not an already-dispatched Redis command.
+    // An uncertain Lua mutation must never be retried or treated as success.
+    private static async Task<T> AwaitRedisAsync<T>(
+        Func<Task<T>> command, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        return await command().WaitAsync(timeout.Token);
+    }
 
     /// <summary>
     /// After revocation (or natural session expiry), mark this server-issued
@@ -121,21 +134,25 @@ public sealed class RedisLobbySnapshotStore(
                 nameof(trustedGuestId));
 
         // No raw identity/session token in either key or value.
-        await database.StringSetAsync(RevokedGuestKey(trustedGuestId),
-            "1", expiry: RevocationFenceTtl, when: When.NotExists);
+        await AwaitRedisAsync(() => database.StringSetAsync(
+            RevokedGuestKey(trustedGuestId), "1",
+            expiry: RevocationFenceTtl, when: When.NotExists),
+            cancellationToken);
     }
 
     /// <summary>Unindexed low-level create retained for #34 compatibility.</summary>
-    public async Task<bool> CreateAsync(LobbySnapshot snapshot)
+    public async Task<bool> CreateAsync(
+        LobbySnapshot snapshot, CancellationToken cancellationToken = default)
     {
         if (snapshot.QuotaTracked)
             throw new ArgumentException(
                 "Quota-tracked snapshots require bounded creation.", nameof(snapshot));
         var ttl = DeadlineMilliseconds(snapshot);
-        return await database.StringSetAsync(
+        return await AwaitRedisAsync(() => database.StringSetAsync(
             RoomKey(snapshot.State.Definition.LobbyId),
             RedisLobbySnapshotCodec.Encode(snapshot),
-            expiry: TimeSpan.FromMilliseconds(ttl), when: When.NotExists);
+            expiry: TimeSpan.FromMilliseconds(ttl), when: When.NotExists),
+            cancellationToken);
     }
 
     /// <summary>
@@ -143,7 +160,8 @@ public sealed class RedisLobbySnapshotStore(
     /// creator limits. Never called with an actor supplied by the browser.
     /// </summary>
     public async Task<bool> CreateBoundedAsync(
-        LobbySnapshot snapshot, int maxRooms, int maxRoomsPerCreator)
+        LobbySnapshot snapshot, int maxRooms, int maxRoomsPerCreator,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentException.ThrowIfNullOrWhiteSpace(snapshot.CreatorId);
@@ -156,12 +174,14 @@ public sealed class RedisLobbySnapshotStore(
 
         var bounded = snapshot with { QuotaTracked = true };
         var ttl = DeadlineMilliseconds(bounded);
-        var result = (long)await database.ScriptEvaluateAsync(
-            BoundedCreateScript,
-            [RoomKey(bounded.State.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(bounded.CreatorId!), RevokedGuestKey(bounded.CreatorId!)],
-            [RedisLobbySnapshotCodec.Encode(bounded), ttl,
-             maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()]);
+        var result = (long)await AwaitRedisAsync(() =>
+            database.ScriptEvaluateAsync(
+                BoundedCreateScript,
+                [RoomKey(bounded.State.Definition.LobbyId), GlobalIndexKey,
+                 CreatorIndexKey(bounded.CreatorId!), RevokedGuestKey(bounded.CreatorId!)],
+                [RedisLobbySnapshotCodec.Encode(bounded), ttl,
+                 maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()]),
+            cancellationToken);
         if (result == -3)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is -1 or -2)
@@ -175,9 +195,12 @@ public sealed class RedisLobbySnapshotStore(
     /// Internal read only: never refreshes Redis TTL, and is not an HTTP
     /// roster response. API layers must authorize membership first.
     /// </summary>
-    public async Task<Stored?> ReadAsync(string lobbyId)
+    public async Task<Stored?> ReadAsync(
+        string lobbyId, CancellationToken cancellationToken = default)
     {
-        var raw = await database.StringGetAsync(RoomKey(lobbyId));
+        var raw = await AwaitRedisAsync(
+            () => database.StringGetAsync(RoomKey(lobbyId)),
+            cancellationToken);
         if (raw.IsNull)
             return null;
         var bytes = (byte[])raw!;
@@ -192,7 +215,8 @@ public sealed class RedisLobbySnapshotStore(
     /// update the room plus both quota-index deadlines in the same script.
     /// </summary>
     public async Task<bool> CompareExchangeAsync(
-        Stored expected, LobbySnapshot updated, string? trustedActor = null)
+        Stored expected, LobbySnapshot updated, string? trustedActor = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(updated);
@@ -222,14 +246,15 @@ public sealed class RedisLobbySnapshotStore(
         if (ttl <= TimeSpan.Zero)
             return false;
         var bytes = RedisLobbySnapshotCodec.Encode(updated);
-        var result = (long)await database.ScriptEvaluateAsync(
-            CompareExchangeScript,
-            [RoomKey(newState.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(updated.CreatorId),
-             RevokedGuestKey(trustedActor ?? "administrative")],
-            [expected.RawBytes, bytes, DeadlineMilliseconds(updated),
-             IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0,
-             trustedActor is null ? 0 : 1]);
+        var result = (long)await AwaitRedisAsync(() =>
+            database.ScriptEvaluateAsync(
+                CompareExchangeScript,
+                [RoomKey(newState.Definition.LobbyId), GlobalIndexKey,
+                 CreatorIndexKey(updated.CreatorId),
+                 RevokedGuestKey(trustedActor ?? "administrative")],
+                [expected.RawBytes, bytes, DeadlineMilliseconds(updated),
+                 IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0,
+                 trustedActor is null ? 0 : 1]), cancellationToken);
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is not (0 or 1))
@@ -238,17 +263,19 @@ public sealed class RedisLobbySnapshotStore(
     }
 
     public async Task<bool> DeleteIfCurrentAsync(
-        Stored expected, string? trustedActor = null)
+        Stored expected, string? trustedActor = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ValidateExpected(expected);
-        var result = (long)await database.ScriptEvaluateAsync(
-            DeleteIfCurrentScript,
-            [RoomKey(expected.Snapshot.State.Definition.LobbyId), GlobalIndexKey,
-             CreatorIndexKey(expected.Snapshot.CreatorId),
-             RevokedGuestKey(trustedActor ?? "administrative")],
-            [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0,
-             trustedActor is null ? 0 : 1]);
+        var result = (long)await AwaitRedisAsync(() =>
+            database.ScriptEvaluateAsync(
+                DeleteIfCurrentScript,
+                [RoomKey(expected.Snapshot.State.Definition.LobbyId), GlobalIndexKey,
+                 CreatorIndexKey(expected.Snapshot.CreatorId),
+                 RevokedGuestKey(trustedActor ?? "administrative")],
+                [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0,
+                 trustedActor is null ? 0 : 1]), cancellationToken);
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is not (0 or 1))
@@ -268,14 +295,19 @@ public sealed class RedisLobbySnapshotStore(
     /// Hashed keys are fetched internally; no invitation or roster is
     /// returned without independent authenticated membership authorization.
     /// </summary>
-    public async Task<IReadOnlyList<Stored>> GetIndexedRoomsAsync()
+    public async Task<IReadOnlyList<Stored>> GetIndexedRoomsAsync(
+        CancellationToken cancellationToken = default)
     {
-        var members = await database.SortedSetRangeByRankAsync(GlobalIndexKey);
+        var members = await AwaitRedisAsync(
+            () => database.SortedSetRangeByRankAsync(GlobalIndexKey),
+            cancellationToken);
         var result = new List<Stored>(members.Length);
         foreach (var member in members)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var key = (RedisKey)member.ToString();
-            var raw = await database.StringGetAsync(key);
+            var raw = await AwaitRedisAsync(
+                () => database.StringGetAsync(key), cancellationToken);
             if (raw.IsNull)
                 continue; // Redis expiry can race this maintenance scan.
             var bytes = (byte[])raw!;
