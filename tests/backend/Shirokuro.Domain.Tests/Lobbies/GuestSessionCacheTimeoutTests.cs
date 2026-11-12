@@ -202,7 +202,9 @@ public sealed class GuestSessionCacheTimeoutTests
         }
         else await AssertCanceledSoon(pending);
 
-        Assert.Equal(operation == "register" ? 0 : 1, registry.StoredSessionCount);
+        // The previously registered guest remains tracked; a timed-out new
+        // registration must never create a second local tracking entry.
+        Assert.Equal(1, registry.StoredSessionCount);
         Assert.False(cache.PendingSet.Task.IsCompleted);
         Assert.False(cache.PendingRemove.Task.IsCompleted);
         Assert.False(cache.PendingGet.Task.IsCompleted);
