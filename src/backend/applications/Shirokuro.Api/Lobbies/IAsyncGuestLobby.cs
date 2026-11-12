@@ -34,3 +34,12 @@ public interface IAsyncGuestLobby
     Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
         CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// No verified roster can be returned when the shared Redis heartbeat CAS
+/// loses every bounded retry to concurrent changes. This is availability,
+/// not a revision conflict (HTTP 409) and not a valid stale roster.
+/// Deliberately contains no guest ID, lobby ID, Redis details or snapshot.
+/// </summary>
+public sealed class LobbyReadContentionException()
+    : Exception("Lobby roster temporarily unavailable under contention.");
