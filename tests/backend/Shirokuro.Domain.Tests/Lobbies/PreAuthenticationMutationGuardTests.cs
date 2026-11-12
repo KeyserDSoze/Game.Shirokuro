@@ -156,7 +156,7 @@ public sealed class PreAuthenticationMutationGuardTests
         using var server = Production(cache, limiter);
         using var anonymous = Client(server);
         var cookie = await Issue(anonymous, "https://game.example");
-        using var guest = Client(server, cookie);
+        using var guest = Client(server, cookie: cookie);
         Assert.Equal(0, cache.Reads);
         Assert.Equal(1, limiter.Calls);
 
