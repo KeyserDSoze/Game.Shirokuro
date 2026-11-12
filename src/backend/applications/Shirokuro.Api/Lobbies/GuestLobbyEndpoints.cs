@@ -127,6 +127,12 @@ public static class GuestLobbyEndpoints
         {
             return Results.Conflict(new { code = "lobby_state_conflict" });
         }
+        catch (LobbySnapshotUnavailableException)
+        {
+            // An authoritative room record is undecodable: no mutation may
+            // be attempted or acknowledged without a verified snapshot.
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             // Never confirm a Redis mutation whose result is unknown.
