@@ -259,7 +259,7 @@ public sealed class RedisLobbyCommandTimeoutTests
         using var visitor = Client(host);
         var cookie = await Login(visitor);
         using var client = Client(host, cookie);
-        using var response = await client.GetAsync("/api/lobbies/room-secret/roster")
+        using var response = await client.GetAsync("/api/lobbies/room-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/roster")
             .WaitAsync(TimeSpan.FromSeconds(8));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
