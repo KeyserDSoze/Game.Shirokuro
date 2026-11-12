@@ -99,6 +99,20 @@ public sealed class RedisLobbySnapshotStore(
         return 1
         """;
 
+    // The administrative index is persisted data. A single corrupt ZSET
+    // member can be enormous even when the scan is limited to 257 entries.
+    // Strip oversized values inside Redis before returning any bytes.
+    // Lua is read-only; no index entry is repaired or acknowledged here.
+    private const string BoundedIndexScanScript = """
+        local members = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]))
+        for i,member in ipairs(members) do
+            if #member > tonumber(ARGV[2]) then
+                members[i] = ''
+            end
+        end
+        return members
+        """;
+
     public sealed record Stored(LobbySnapshot Snapshot, byte[] RawBytes);
 
     // Guest cookie TTL is 8h. Keep a hashed actor tombstone no longer than
@@ -310,25 +324,33 @@ public sealed class RedisLobbySnapshotStore(
         CancellationToken cancellationToken = default)
     {
         // Global creation is capped at MaxRooms. Read at most one extra
-        // indexed member to detect damaged/legacy indices without accepting
-        // a partial cleanup or transferring an unbounded Redis response.
-        // ZRANGE's stop rank is inclusive.
-        var members = await AwaitRedisAsync(
-            () => database.SortedSetRangeByRankAsync(
-                GlobalIndexKey, start: 0, stop: GuestLobbyCommands.MaxRooms),
-            cancellationToken);
+        // indexed member to detect oversized/legacy indices. ZRANGE stop
+        // rank is inclusive (0..256). Lua replaces oversized member bytes
+        // with an invalid opaque marker before any network transfer.
+        var members = (RedisResult[]?)await AwaitRedisAsync(
+            () => database.ScriptEvaluateAsync(
+                BoundedIndexScanScript, [GlobalIndexKey],
+                [GuestLobbyCommands.MaxRooms, _prefix.Length + "room:".Length + 64]),
+            cancellationToken) ?? throw new LobbySnapshotUnavailableException();
         if (members.Length > GuestLobbyCommands.MaxRooms)
             throw new LobbySnapshotUnavailableException();
-        var result = new List<Stored>(members.Length);
+
+        // Validate the ENTIRE index before any GET, so a corrupted member
+        // cannot cause even a partial room read or successful cleanup/ack.
+        var keys = new List<string>(members.Length);
         foreach (var member in members)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var key = member.ToString();
-            // This ZSET is persisted data, not authority to read arbitrary
-            // Redis keys. Check our exact room-key grammar before GET.
+            var key = member?.ToString() ?? string.Empty;
             if (!IsIndexedRoomKey(key))
                 throw new LobbySnapshotUnavailableException();
+            keys.Add(key);
+        }
 
+        var result = new List<Stored>(keys.Count);
+        foreach (var key in keys)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             var raw = await AwaitRedisAsync(
                 () => database.StringGetAsync((RedisKey)key), cancellationToken);
             if (raw.IsNull)
