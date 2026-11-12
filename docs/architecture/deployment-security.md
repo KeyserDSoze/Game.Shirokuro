@@ -1524,6 +1524,33 @@ attacker who owns many IPv4 addresses, multiple IPv6 /64 prefixes or a
 distributed network. Keep WAF/edge controls, proxy configuration, detection
 and account-grade identity policy under the open umbrella issue #21.
 
+## Byte-bounded administrative lobby index enumeration (#98)
+
+The Production/Staging administrative `capacity:all` Redis index is
+persisted data, not permission to read arbitrary room snapshots. Earlier
+safeguards (#93/#94) limited room-key **grammar and total count** (at most
+256 indexed rooms plus one overflow sentinel). A compromised/stale sorted
+set could still contain a single enormous member, causing an excessive
+network reply during expiry cleanup or explicit guest logout.
+
+The index scanner now uses a single **read-only Lua ZRANGE** (ranks 0..256)
+that substitutes an empty invalid sentinel for any member longer than the
+**exact namespace-specific room-key byte length** *before returning it*
+to the API. It never deletes or modifies the original key, score or TTL.
+The API still refuses the entire result if it exceeds 256 members or
+contains any invalid/null/oversized key, and it now validates **all keys
+before any room GET**. No partially-read index may result in guest-expiry
+ACK, roster mutation, or false cleanup success.
+
+A damaged index is an availability incident: the API/worker fails closed
+with a sanitized error, leaving encrypted expiry work for retry. Operators
+must inspect Redis integrity, determine which original sorted-set members
+are legitimate, and reconcile/remove corrupt entries under an authorized
+runbook. Never log raw keys, hashes, invitations or room snapshots.
+Bounded responses mitigate network and API allocation pressure; they do
+not remove oversized values from Redis memory or replace edge HA and
+monitoring/alerting requirements in parent issue #21.
+
 ## Size-bounded encrypted guest expiry work (#97)
 
 The Redis guest-expiry queue rotates through at most 128 due items per
