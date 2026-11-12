@@ -231,16 +231,17 @@ public sealed class GuestSessionTests
         using var anonymous = Client(server);
         var (guestId, cookie) = await Issue(anonymous);
         var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
-        coordinator.Create("invited-room", ["white", "black"]);
+        const string lobbyId = "room-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        coordinator.Create(lobbyId, ["white", "black"]);
 
         using var guest = Client(server, cookie);
-        using (var before = await guest.GetAsync("/api/lobbies/invited-room/roster"))
+        using (var before = await guest.GetAsync("/api/lobbies/" + lobbyId + "/roster"))
             Assert.Equal(HttpStatusCode.NotFound, before.StatusCode);
 
         // The server, not the client's supplied playerId, authorizes admission.
-        coordinator.Join("invited-room", guestId, "white", 0);
+        coordinator.Join(lobbyId, guestId, "white", 0);
         using var after = await guest.GetAsync(
-            "/api/lobbies/invited-room/roster?playerId=another-user");
+            "/api/lobbies/" + lobbyId + "/roster?playerId=another-user");
         Assert.Equal(HttpStatusCode.OK, after.StatusCode);
         var body = await after.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(body);
