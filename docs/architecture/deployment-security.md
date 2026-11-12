@@ -1549,3 +1549,33 @@ its own Origin and request intent header, and cookie authentication may
 still need a shared session lookup *before* this middleware. Edge-layer
 traffic controls, identity abuse and deployment-grade observability remain
 open in #21.
+
+## Bounded encrypted guest expiry/revocation queue operations (#68)
+
+Outside Development, guest session issuance and revocation depend on an
+**encrypted, Redis-shared due-work index** so membership cleanup survives
+issuer crashes and works across API instances. Previously the index checked
+its CancellationToken only at method entry; a queued Redis `ZADD`,
+`ScriptEvaluate` rotating read or `ZREM` acknowledgement could hold a
+request/maintenance sweep after host shutdown or client disconnect.
+
+Every index Redis command now has a **2-second bounded client wait** linked
+to its caller's cancellation token: natural issuance `ScheduleAsync`,
+revocation `ScheduleRevokedAsync`, batch `ReadDueAsync`, and
+`AcknowledgeAsync`. Already-cancelled calls do not send a command. A
+stalled write never reports a confirmed durable work item, so normal guest
+issuance continues to **fail closed** (no cookie) and its existing rollback
+path applies. A stalled read cannot authorize/fabricate a cleanup item.
+An uncertain acknowledgement is not considered successful; the worker
+reports a retryable sweep and can re-run idempotent fencing/lobby cleanup
+later. No automatic immediate write retries are introduced.
+
+As with the bounded admission limiter (#65), interrupting the .NET await
+**does not cancel a Redis command already sent to the server**. A timed-out
+`ZADD` may eventually persist an orphan protected work item; a timed-out
+`ZREM` may still remove an item. Neither outcome authorizes a guest or
+exposes its identity. The existing encrypted payload, durable replay,
+rotation and independent cleanup tests remain required. This is not an
+operational HA/queue-lag SLA or proof that every Redis outage is 2 seconds
+long; real monitoring/alerting, distributed identity and deployment remain
+in parent #21.

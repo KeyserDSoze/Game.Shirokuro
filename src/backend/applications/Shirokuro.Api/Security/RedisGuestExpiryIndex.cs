@@ -17,6 +17,9 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
 {
     public const int BatchSize = 128;
     public static readonly TimeSpan CursorLifetime = TimeSpan.FromDays(1);
+    // Keep guest issuance and maintenance responsive on a stalled Redis
+    // connection. Cancelling this wait cannot retract a dispatched command.
+    public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
 
     // Atomic selection + shared round-robin offset. A permanently failing
     // group of >=128 due entries cannot monopolize every 5-minute sweep.
@@ -108,7 +111,7 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
             digest = Convert.ToHexStringLower(
                 SHA256.HashData(Encoding.ASCII.GetBytes(trustedSessionToken)));
         }
-        await SaveAsync(trustedPlayerId, expiresUtc, digest);
+        await SaveAsync(trustedPlayerId, expiresUtc, cancellationToken, digest);
     }
 
     /// <summary>
@@ -124,11 +127,12 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         if (!ValidGuestId(trustedPlayerId))
             throw new ArgumentException("Invalid trusted guest identity.",
                 nameof(trustedPlayerId));
-        return await SaveAsync(trustedPlayerId, _clock.GetUtcNow());
+        return await SaveAsync(trustedPlayerId, _clock.GetUtcNow(),
+            cancellationToken);
     }
 
     private async Task<string> SaveAsync(string trustedPlayerId, DateTimeOffset dueUtc,
-        string? trustedSessionDigest = null)
+        CancellationToken cancellationToken, string? trustedSessionDigest = null)
     {
         // The sealed payload supports legacy expiry:guest and the newer
         // expiry:guest:sha256(token). The digest is not a reusable token.
@@ -137,8 +141,11 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
                         ":" + trustedPlayerId +
                         (trustedSessionDigest is null ? "" : ":" + trustedSessionDigest);
         var member = _protector.Protect(plaintext);
-        await _database.SortedSetAddAsync(
-            _key, member, CeilingUnixMilliseconds(dueUtc));
+        cancellationToken.ThrowIfCancellationRequested();
+        // Never report a durable expiry/revocation record on an uncertain
+        // Redis result. A command already delivered to Redis may still finish.
+        await AwaitRedisAsync(_database.SortedSetAddAsync(
+            _key, member, CeilingUnixMilliseconds(dueUtc)), cancellationToken);
         return member;
     }
 
@@ -155,10 +162,11 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         // due timestamp is validated below before any cleanup.
         var dueCeiling = _recoveryDueCeilingUtc is { } recovery &&
             recovery > now ? recovery : now;
-        var members = (RedisResult[]?)await _database.ScriptEvaluateAsync(
-            RotateDueWindowScript, [_key, _cursorKey],
-            [CeilingUnixMilliseconds(dueCeiling), BatchSize,
-             (long)CursorLifetime.TotalSeconds])
+        var members = (RedisResult[]?)await AwaitRedisAsync(
+            _database.ScriptEvaluateAsync(
+                RotateDueWindowScript, [_key, _cursorKey],
+                [CeilingUnixMilliseconds(dueCeiling), BatchSize,
+                 (long)CursorLifetime.TotalSeconds]), cancellationToken)
             ?? throw new InvalidDataException("Invalid guest expiry window.");
         if (members.Length > BatchSize)
             throw new InvalidDataException("Invalid guest expiry window size.");
@@ -217,7 +225,21 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(protectedMember);
-        await _database.SortedSetRemoveAsync(_key, protectedMember);
+        await AwaitRedisAsync(
+            _database.SortedSetRemoveAsync(_key, protectedMember),
+            cancellationToken);
+    }
+
+    // Cancel the caller's wait, not Redis's already-sent operation.
+    // In particular, an uncertain ack is never treated as successful:
+    // the next sweep may retry its idempotent cleanup/ack safely.
+    private static async Task<T> AwaitRedisAsync<T>(
+        Task<T> operation, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        return await operation.WaitAsync(timeout.Token);
     }
 
     // The Redis score has millisecond precision, while UTC times retain
