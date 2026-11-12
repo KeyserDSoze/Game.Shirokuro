@@ -51,13 +51,24 @@ public sealed class RedisReplicationSampler(IConnectionMultiplexer redis)
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // INFO is read-only and supported by the existing scoped Redis
-            // application ACL. Never use CONFIG, ROLE mutation or admin auth.
-            // StackExchange.Redis routes this command via its managed
-            // Sentinel-aware multiplexer after a primary switch.
-            var result = await redis.GetDatabase().ExecuteAsync(
-                "INFO", "replication").WaitAsync(limit.Token);
-            var observation = RedisReplicationInfo.Parse(result.ToString());
+            // INFO is a *server-level* command, not an IDatabase command.
+            // Find a connected server from the managed multiplexer, preferring
+            // its known primary. Sentinel transparently updates discovered
+            // endpoints on failover. Never display the selected endpoint.
+            // Production ACL already allows INFO; do NOT enable AllowAdmin.
+            var servers = redis.GetEndPoints(configuredOnly: false)
+                .Select(redis.GetServer)
+                .Where(server => server.IsConnected)
+                .ToArray();
+            var current = servers.FirstOrDefault(server => !server.IsReplica)
+                ?? servers.FirstOrDefault();
+            if (current is null)
+                throw new InvalidOperationException(
+                    "Redis replication metadata unavailable.");
+
+            var raw = await current.InfoRawAsync("replication")
+                .WaitAsync(limit.Token);
+            var observation = RedisReplicationInfo.Parse(raw);
             MultiplayerMetrics.RecordRedisReplication(
                 observation, RedisReplicationPollOutcome.Ok);
         }
