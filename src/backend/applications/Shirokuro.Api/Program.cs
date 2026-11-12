@@ -147,13 +147,13 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         };
         options.Events.OnRedirectToLogin = context =>
         {
-            // An unavailable Redis authority is neither a valid login nor a
-            // proven revoked ticket. 503 preserves the browser's signed
-            // cookie while denying every protected route and negotiation.
+            // Challenges run before the endpoint handler can set its own
+            // privacy/cache headers. Never let a client or intermediary cache
+            // a stale 401 or a 503 caused by unavailable Redis authority.
+            context.Response.Headers.CacheControl = "no-store";
             if (context.HttpContext.Items.ContainsKey(
                     GuestSessionRegistry.UnavailableRequestMarker))
             {
-                context.Response.Headers.CacheControl = "no-store";
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             }
             else
@@ -164,6 +164,8 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         };
         options.Events.OnRedirectToAccessDenied = context =>
         {
+            // ForbidAsync may also run before a private resource handler.
+            context.Response.Headers.CacheControl = "no-store";
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return Task.CompletedTask;
         };
