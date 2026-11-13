@@ -113,12 +113,26 @@ public sealed class RedisLobbySnapshotStore(
         return members
         """;
 
+    // All room snapshots are untrusted persisted bytes. Bound the Redis reply
+    // BEFORE sending it across the network, including administrative scans.
+    // The empty sentinel is deliberately invalid for the strict codec;
+    // nil is reserved for a genuinely missing key. No writes or TTL changes.
+    private const string BoundedSnapshotReadScript = """
+        local raw = redis.call('GET', KEYS[1])
+        if not raw then return nil end
+        if #raw > tonumber(ARGV[1]) then return '' end
+        return raw
+        """;
+
     // Read-only, atomic fenced GET for the periodic member roster poll.
     // Unlike a heartbeat CAS this cannot refresh the snapshot or its TTL.
     // A revoked actor sees the same absent result as a missing lobby.
     private const string ReadFencedWithoutHeartbeatScript = """
         if redis.call('EXISTS', KEYS[2]) == 1 then return nil end
-        return redis.call('GET', KEYS[1])
+        local raw = redis.call('GET', KEYS[1])
+        if not raw then return nil end
+        if #raw > tonumber(ARGV[1]) then return '' end
+        return raw
         """;
 
     public sealed record Stored(LobbySnapshot Snapshot, byte[] RawBytes);
@@ -220,11 +234,16 @@ public sealed class RedisLobbySnapshotStore(
     public async Task<Stored?> ReadAsync(
         string lobbyId, CancellationToken cancellationToken = default)
     {
-        var raw = await AwaitRedisAsync(
-            () => database.StringGetAsync(RoomKey(lobbyId)),
-            cancellationToken);
+        var raw = await ReadBoundedSnapshotBytesAsync(
+            RoomKey(lobbyId), cancellationToken);
         return raw.IsNull ? null : DecodeStored((byte[])raw!, lobbyId);
     }
+
+    private Task<RedisResult> ReadBoundedSnapshotBytesAsync(
+        RedisKey key, CancellationToken cancellationToken) =>
+        AwaitRedisAsync(() => database.ScriptEvaluateAsync(
+            BoundedSnapshotReadScript, [key], [RedisLobbySnapshotCodec.MaxBytes]),
+            cancellationToken);
 
     /// <summary>
     /// The browser's 15-second pre-match poll is not user activity.
@@ -242,7 +261,8 @@ public sealed class RedisLobbySnapshotStore(
         var response = await AwaitRedisAsync(
             () => database.ScriptEvaluateAsync(
                 ReadFencedWithoutHeartbeatScript,
-                [RoomKey(lobbyId), RevokedGuestKey(trustedGuestId)]),
+                [RoomKey(lobbyId), RevokedGuestKey(trustedGuestId)],
+                [RedisLobbySnapshotCodec.MaxBytes]),
             cancellationToken);
         return response.IsNull ? null : DecodeStored((byte[])response!, lobbyId);
     }
@@ -380,8 +400,8 @@ public sealed class RedisLobbySnapshotStore(
         foreach (var key in keys)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var raw = await AwaitRedisAsync(
-                () => database.StringGetAsync((RedisKey)key), cancellationToken);
+            var raw = await ReadBoundedSnapshotBytesAsync(
+                (RedisKey)key, cancellationToken);
             if (raw.IsNull)
                 continue; // Redis expiry can race this maintenance scan.
 

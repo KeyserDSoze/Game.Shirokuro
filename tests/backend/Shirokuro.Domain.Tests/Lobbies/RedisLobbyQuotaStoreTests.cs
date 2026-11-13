@@ -44,6 +44,67 @@ public sealed class RedisLobbyQuotaStoreTests
         TimeSpan? timeout = null) =>
         new(redis.GetDatabase(), clock, timeout, ns);
 
+
+    [Fact]
+    public async Task OversizedRoomSnapshotNeverLeavesRedisOnDirectPassiveOrIndexedRead()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "snapshot-bytes-" + Guid.NewGuid().ToString("N");
+            var first = Store(a, clock, ns);
+            var second = Store(b, clock, ns);
+            var actor = GuestSessions.NewPlayerId();
+            var node = new RedisGuestLobbyRuntime(first, clock);
+            var room = await node.CreateAsync(actor, ["white", "black"], "white");
+            var db = a.GetDatabase();
+            var key = Assert.Single(await db.SortedSetRangeByRankAsync(
+                "shirokuro:lobby:{" + ns + "}:v2:capacity:all")).ToString();
+            var original = (byte[])(await db.StringGetAsync(key))!;
+            // Whitespace is valid JSON, so an exactly-max-size record is
+            // accepted by the transport AND by the versioned snapshot codec.
+            var boundary = new byte[RedisLobbySnapshotCodec.MaxBytes];
+            original.CopyTo(boundary, 0);
+            Array.Fill(boundary, (byte)' ', original.Length,
+                boundary.Length - original.Length);
+            Assert.True(await db.StringSetAsync(key, boundary, TimeSpan.FromMinutes(30)));
+            Assert.NotNull(await second.ReadAsync(room.LobbyId));
+            Assert.NotNull(await second.ReadForGuestWithoutHeartbeatAsync(
+                room.LobbyId, actor));
+            Assert.Single(await second.GetIndexedRoomsAsync());
+
+            var poisoned = new byte[256 * 1024];
+            Array.Fill(poisoned, (byte)'Z');
+            Assert.True(await db.StringSetAsync(key, poisoned,
+                TimeSpan.FromMinutes(30)));
+            foreach (var action in new Func<Task>[]
+            {
+                async () => { await second.ReadAsync(room.LobbyId); },
+                async () => { await second.ReadForGuestWithoutHeartbeatAsync(
+                    room.LobbyId, actor); },
+                async () => { await second.GetIndexedRoomsAsync(); }
+            })
+            {
+                var failure = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+                    action);
+                Assert.Null(failure.InnerException);
+                Assert.DoesNotContain("ZZZZ", failure.Message);
+                Assert.DoesNotContain(actor, failure.Message);
+            }
+            // Neither read nor cleanup repairs the persisted bytes, TTL or
+            // index. Recovery requires an explicit operator-side restore.
+            Assert.Equal(poisoned, (byte[])(await db.StringGetAsync(key))!);
+            Assert.True(await db.StringSetAsync(key, original,
+                TimeSpan.FromMinutes(30)));
+            Assert.Equal(room.Revision, (await second.ReadAsync(
+                room.LobbyId))!.Snapshot.State.Revision);
+            Assert.Single(await second.GetIndexedRoomsAsync());
+        }
+    }
+
     [Fact]
     public async Task OversizedGlobalIndexMemberFailsClosedWithoutCopyingOrCleaningRooms()
     {

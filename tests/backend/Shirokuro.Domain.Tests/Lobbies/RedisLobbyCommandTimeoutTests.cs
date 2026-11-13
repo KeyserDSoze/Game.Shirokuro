@@ -70,17 +70,22 @@ public sealed class RedisLobbyCommandTimeoutTests
         {
             return method?.Name switch
             {
-                "StringGetAsync" => ReadSnapshot(),
-                "ScriptEvaluateAsync" => CompareExchange(),
+                "ScriptEvaluateAsync" => IsBoundedRead(args)
+                    ? ReadSnapshot() : CompareExchange(),
                 _ => throw new InvalidOperationException(
                     "Unexpected Redis operation in contention fixture.")
             };
         }
 
-        private Task<RedisValue> ReadSnapshot()
+        private static bool IsBoundedRead(object?[]? args)
+            => Assert.IsType<string>(args![0]).Contains(
+                "if #raw > tonumber(ARGV[1])", StringComparison.Ordinal);
+
+        private Task<RedisResult> ReadSnapshot()
         {
             Interlocked.Increment(ref _reads);
-            return Task.FromResult((RedisValue)EncodedSnapshot);
+            return Task.FromResult(RedisResult.Create(
+                (RedisValue)EncodedSnapshot, ResultType.BulkString));
         }
 
         private Task<RedisResult> CompareExchange()
@@ -238,10 +243,18 @@ public sealed class RedisLobbyCommandTimeoutTests
 
         protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
-            if (method?.Name == "StringGetAsync")
+            if (method?.Name == "ScriptEvaluateAsync" &&
+                Assert.IsType<string>(args![0]).Contains(
+                    "if #raw > tonumber(ARGV[1])", StringComparison.Ordinal))
             {
                 Interlocked.Increment(ref _reads);
-                return Task.FromResult((RedisValue)Raw);
+                var values = Assert.IsType<RedisValue[]>(args[2]);
+                Assert.Equal(RedisLobbySnapshotCodec.MaxBytes, (long)Assert.Single(values));
+                // Emulate the server-side byte guard; no oversized reply
+                // ever crosses the simulated Redis/.NET boundary.
+                return Task.FromResult(RedisResult.Create(
+                    (RedisValue)(Raw.Length > RedisLobbySnapshotCodec.MaxBytes
+                        ? [] : Raw), ResultType.BulkString));
             }
             Mutations++;
             throw new InvalidOperationException(
@@ -297,6 +310,24 @@ public sealed class RedisLobbyCommandTimeoutTests
             () => runtime.ForMemberAsync(roomId, playerId));
         Assert.Equal(2, controller.Reads);
         Assert.Equal(0, controller.Mutations);
+    }
+
+
+    [Fact]
+    public async Task BoundedSnapshotReadsDistinguishAbsentFromOversizedDataBeforeTransport()
+    {
+        var database = DispatchProxy.Create<IDatabase, CorruptSnapshotDatabase>();
+        var fixture = (CorruptSnapshotDatabase)(object)database;
+        var roomId = "room-" + Guid.NewGuid().ToString("N");
+        var actor = GuestSessions.NewPlayerId();
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        fixture.Raw = new byte[RedisLobbySnapshotCodec.MaxBytes + 1];
+        await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.ReadAsync(roomId));
+        await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.ReadForGuestWithoutHeartbeatAsync(roomId, actor));
+        Assert.Equal(2, fixture.Reads);
+        Assert.Equal(0, fixture.Mutations);
     }
 
     [Fact]
@@ -368,11 +399,15 @@ public sealed class RedisLobbyCommandTimeoutTests
         {
             return method?.Name switch
             {
-                "ScriptEvaluateAsync" => Scan(args),
-                "StringGetAsync" => Read(args),
+                "ScriptEvaluateAsync" => IsIndexScan(args)
+                    ? Scan(args) : Read(args),
                 _ => RejectWrite()
             };
         }
+
+        private static bool IsIndexScan(object?[]? args)
+            => Assert.IsType<string>(args![0]).Contains(
+                "'ZRANGE', KEYS[1]", StringComparison.Ordinal);
 
         private Task<RedisResult> Scan(object?[]? args)
         {
@@ -396,11 +431,20 @@ public sealed class RedisLobbyCommandTimeoutTests
             return Task.FromResult(RedisResult.Create(bounded));
         }
 
-        private Task<RedisValue> Read(object?[]? args)
+        private Task<RedisResult> Read(object?[]? args)
         {
-            ReadKeys.Add(((RedisKey)args![0]!).ToString());
+            var script = Assert.IsType<string>(args![0]);
+            Assert.Contains("if #raw > tonumber(ARGV[1])", script,
+                StringComparison.Ordinal);
+            var keys = Assert.IsType<RedisKey[]>(args[1]);
+            ReadKeys.Add(Assert.Single(keys).ToString());
+            var limit = Assert.IsType<RedisValue[]>(args[2]);
+            Assert.Equal(RedisLobbySnapshotCodec.MaxBytes, (long)Assert.Single(limit));
             return Task.FromResult(Raw is null
-                ? RedisValue.Null : (RedisValue)Raw);
+                ? RedisResult.Create(RedisValue.Null, ResultType.BulkString)
+                : RedisResult.Create((RedisValue)(Raw.Length >
+                    RedisLobbySnapshotCodec.MaxBytes ? [] : Raw),
+                    ResultType.BulkString));
         }
 
         private object RejectWrite()

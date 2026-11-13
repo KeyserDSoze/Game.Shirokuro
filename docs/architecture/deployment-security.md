@@ -1860,3 +1860,7 @@ avoidable Redis work on rejected cross-origin traffic; it is **not**
 proof of trust for arbitrary non-browser clients that can forge Origin and
 intent, nor a substitute for SameSite cookies, backend authentication,
 rate limits or operational WAF/anti-Sybil defenses (#21).
+
+## Limite dei byte degli snapshot lobby (#105)
+
+Gli snapshot Redis delle lobby v2 hanno un limite applicativo di **32768 byte**. Le tre letture server (GET diretto, GET passivo con fence, scansione dell'indice amministrativo) applicano lo stesso limite già nello script Lua read-only, **prima che Redis invii il risultato**. Un record sopra soglia è sostituito da un marker vuoto impossibile da interpretare come stanza valida: i client autorizzati ricevono il normale risultato opaco di indisponibilità, mentre una chiave realmente assente resta distinta. Il marker non ripara, non elimina e non estende il TTL di nessun record o indice; le attività di cleanup devono essere riprovate dopo indagine/riparazione esplicita dell'operatore. Una lettura passiva sotto revocation fence verifica prima la barriera senza leggere il payload. Non dedurre che uno snapshot alterato sia una stanza vuota.
