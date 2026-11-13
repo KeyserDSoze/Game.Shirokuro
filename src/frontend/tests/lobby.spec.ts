@@ -71,7 +71,16 @@ test('two independent guest browsers create a room, join by invite and select he
     expect(passiveReads).toContain('GET')
     expect(passiveReads.every(method => method === 'GET')).toBe(true)
 
+    // Confirm the write on the authoritative server, not just UI text.
+    // If a later passive GET races the 204, the leave confirmation must
+    // remain visible; a genuine HTTP 404 still fails the test.
+    await second.bringToFront()
+    await expect(second.getByTestId('lobby-revision')).toContainText('4')
+    const leaveReply = second.waitForResponse(reply =>
+      reply.request().method() === 'DELETE' &&
+      reply.url().includes('/api/lobbies/' + invite + '/membership'))
     await second.getByTestId('lobby-leave').click()
+    expect((await leaveReply).status()).toBe(204)
     await expect(second.getByTestId('lobby-message')).toContainText('lasciato la lobby')
     await first.getByTestId('lobby-refresh').click()
     await expect(first.getByTestId('lobby-roster').locator('p')).toHaveCount(1)

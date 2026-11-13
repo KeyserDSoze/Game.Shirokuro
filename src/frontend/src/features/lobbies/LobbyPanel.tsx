@@ -64,6 +64,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   // invalid. Only the server may issue a replacement guest identity.
   const forgetGuest = useCallback(() => {
     passivePollAbortRef.current?.abort()
+    currentRoomRef.current = null
     sessionGenerationRef.current++
     operationRef.current++
     busyRef.current = false
@@ -357,6 +358,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   }
 
   function showRoom(next: LobbyRoster) {
+    // A stale passive response must never see a previous room as current
+    // between a confirmed user action and the next React effect (#109).
+    currentRoomRef.current = next
     setRoom(next)
     setInvite(next.lobbyId)
     const own = next.participants.find(p => p.playerId === session?.playerId)
@@ -582,6 +586,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   onClick={() => void run(async isCurrent => {
                     await guestLobbyApi.leave(room.lobbyId, room.revision)
                     if (!isCurrent()) return
+                    // Clear the passive poll's current-room identity before
+                    // committing the React state change: a late GET/404 after
+                    // successful DELETE must not overwrite "lobby left".
+                    currentRoomRef.current = null
                     setRoom(null)
                     setMessage(t('lobbyLeft'))
                   })}
