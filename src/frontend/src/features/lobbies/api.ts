@@ -76,7 +76,7 @@ export const guestLobbyApi = {
   // 304 is a successful *authorized* no-change result, not a network
   // failure. The validator contains only the last verified room revision,
   // never an invite, player ID, cookie or hidden match information.
-  peek: async (code: string, knownRevision?: number): Promise<LobbyRoster | null> => {
+  peek: async (code: string, knownRevision?: number, signal?: AbortSignal): Promise<LobbyRoster | null> => {
     const room = parseInviteCode(code)
     const tag: Record<string, string> = knownRevision !== undefined &&
       Number.isSafeInteger(knownRevision) && knownRevision >= 0
@@ -86,6 +86,7 @@ export const guestLobbyApi = {
       credentials: 'include',
       cache: 'no-store',
       headers: tag,
+      ...(signal ? { signal } : {}),
     })
     if (response.status === 304) return null
     if (!response.ok) throw new LobbyHttpError(response.status)

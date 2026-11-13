@@ -35,6 +35,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const operationRef = useRef(0)
   const busyRef = useRef(false)
   const currentRoomRef = useRef<LobbyRoster | null>(null)
+  // Only passive roster reads can be cancelled; explicit commands are never aborted.
+  const passivePollAbortRef = useRef<AbortController | null>(null)
   const roomId = room?.lobbyId
   const actorId = session?.playerId
 
@@ -61,6 +63,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   // Drop every locally cached private room reference if the cookie becomes
   // invalid. Only the server may issue a replacement guest identity.
   const forgetGuest = useCallback(() => {
+    passivePollAbortRef.current?.abort()
     sessionGenerationRef.current++
     operationRef.current++
     busyRef.current = false
@@ -177,6 +180,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let active = true
     let timer: number | undefined
     let transientFailures = 0
+    let inFlightAbort: AbortController | null = null
 
     const schedule = (delayMs: number) => {
       if (active) timer = window.setTimeout(() => { void poll() }, delayMs)
@@ -200,9 +204,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         operation === operationRef.current && !busyRef.current &&
         currentRoomRef.current?.lobbyId === roomId
 
+      const controller = new AbortController()
+      inFlightAbort = controller
+      passivePollAbortRef.current = controller
       try {
         const latest = await guestLobbyApi.peek(
-          roomId, currentRoomRef.current?.revision)
+          roomId, currentRoomRef.current?.revision, controller.signal)
         if (!stillCurrent()) return
         // Both an authorized 200 and a no-body 304 mean service recovered.
         transientFailures = 0
@@ -220,7 +227,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           setMessage(t('lobbyMissing'))
         }
       } catch (error) {
-        if (!stillCurrent()) return
+        // An intentional abort is neither a revocation nor a Redis outage.
+        if (controller.signal.aborted || !stillCurrent()) return
         const outcome = classifyRosterPollFailure(
           error instanceof LobbyHttpError ? error.status : undefined)
         if (outcome === 'expired') {
@@ -238,6 +246,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           transientFailures = Math.min(3, transientFailures + 1)
         }
       } finally {
+        if (inFlightAbort === controller) inFlightAbort = null
+        if (passivePollAbortRef.current === controller)
+          passivePollAbortRef.current = null
         // An old request may have finished after a user mutation started.
         // Never apply its failure penalty to a newer user operation.
         if (active && !terminal) {
@@ -251,12 +262,15 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     return () => {
       active = false
       window.clearTimeout(timer)
+      inFlightAbort?.abort()
     }
   }, [roomId, actorId, forgetGuest, t])
 
   async function run(action: (isCurrent: () => boolean) => Promise<void>) {
     if (busyRef.current) return
     busyRef.current = true
+    // User intent supersedes a passive read; never abort the user's mutation.
+    passivePollAbortRef.current?.abort()
     const generation = sessionGenerationRef.current
     const operation = ++operationRef.current
     // Capture the room and identity that initiated this request. After a

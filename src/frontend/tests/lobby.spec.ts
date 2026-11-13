@@ -616,3 +616,76 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
   await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
   expect(mutations).toEqual([])
 })
+
+test('an explicit pre-match action aborts a stalled passive GET without revoking the guest', async ({ page }) => {
+  test.setTimeout(45_000)
+  const code = 'room-' + 'd'.repeat(32)
+  const playerId = 'guest-cancelled-poll'
+  const roster = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId, teamId: 'white', heroId: null }],
+  }
+  const changed = {
+    ...roster, revision: 2,
+    participants: [{ playerId, teamId: 'black', heroId: null }],
+  }
+
+  // Deterministic transport-only guest: no real guest issuance or quota usage.
+  let signedIn = false
+  await page.route('**/api/sessions/me', async route =>
+    route.fulfill(signedIn
+      ? { status: 200, json: { playerId, kind: 'guest' } }
+      : { status: 401 }))
+  await page.route('**/api/sessions/guest', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    await route.fulfill({ status: 200, json: { playerId, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    await route.fulfill({ status: 201, json: roster })
+  })
+  let mutations = 0
+  await page.route('**/api/lobbies/' + code + '/team', async route => {
+    mutations++
+    await route.fulfill({ status: 200, json: changed })
+  })
+
+  // A deliberately unresolved fetch observes actual AbortController behavior,
+  // rather than relying on browser-specific network abort event ordering.
+  await page.addInitScript(() => {
+    const underlyingFetch = window.fetch.bind(window)
+    const probe = { started: 0, aborted: 0 }
+    Object.defineProperty(window, '__shirokuroPeekProbe', { value: probe })
+    window.fetch = (input, init) => {
+      if (typeof input === 'string' && input.endsWith('/roster/peek')) {
+        probe.started++
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            probe.aborted++
+            reject(new DOMException('Aborted', 'AbortError'))
+          }, { once: true })
+        })
+      }
+      return underlyingFetch(input, init)
+    }
+  })
+  const pollStats = () => page.evaluate(() =>
+    (window as Window & { __shirokuroPeekProbe: { started: number; aborted: number } })
+      .__shirokuroPeekProbe)
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect.poll(async () => (await pollStats()).started, { timeout: 25_000 }).toBe(1)
+
+  await page.getByTestId('lobby-new-team').selectOption('black')
+  await page.getByTestId('lobby-change-team').click()
+  await expect.poll(async () => (await pollStats()).aborted).toBe(1)
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  expect(mutations).toBe(1)
+  expect((await pollStats()).started).toBe(1) // no immediate retry
+})

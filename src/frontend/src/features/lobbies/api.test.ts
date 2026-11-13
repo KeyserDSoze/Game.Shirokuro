@@ -164,6 +164,35 @@ describe('guest lobby client boundaries', () => {
     },
   )
 
+  it('forwards AbortSignal only to passive roster polling and never to an explicit refresh', async () => {
+    const controller = new AbortController()
+    const roster = {
+      lobbyId: roomCode, revision: 2, teamIds: ['white', 'black'], participants: [],
+    }
+    const mocked = vi.fn((_path: string, options: RequestInit) => {
+      if (options.signal === controller.signal) {
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener('abort', () =>
+            reject(new DOMException('Aborted', 'AbortError')), { once: true })
+        })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => roster })
+    })
+    vi.stubGlobal('fetch', mocked)
+    const pending = guestLobbyApi.peek(roomCode, 2, controller.signal)
+    expect(mocked).toHaveBeenCalledWith(
+      '/api/lobbies/' + roomCode + '/roster/peek',
+      expect.objectContaining({
+        method: 'GET', signal: controller.signal,
+        headers: { 'If-None-Match': '"rev-2"' },
+      }),
+    )
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(await guestLobbyApi.read(roomCode)).toEqual(roster)
+    expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeUndefined()
+  })
+
   it('sign-in performs no magic persistence or browser-side identity generation', async () => {
     const mocked = vi.fn().mockResolvedValue({
       ok: true, status: 200,
