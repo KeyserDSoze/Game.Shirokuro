@@ -522,7 +522,7 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
 })
 
 test('auto-sync retains private view on 503, clears room on 404 and guest on 401 without writes', async ({ page }) => {
-  test.setTimeout(100_000)
+  test.setTimeout(135_000)
   const code = 'room-' + 'e'.repeat(32)
   const playerId = 'guest-browser-poll'
   const roster = {
@@ -555,9 +555,11 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
   let status = 304
   let reads = 0
   const validators: (string | undefined)[] = []
+  const pollTimes: number[] = []
   await page.route('**/api/lobbies/' + code + '/roster/peek', async route => {
     if (route.request().method() !== 'GET') return route.continue()
     reads++
+    pollTimes.push(Date.now())
     validators.push(route.request().headers()['if-none-match'])
     await route.fulfill({
       status,
@@ -590,7 +592,11 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
   expect(mutations).toEqual([])
 
   status = 404
-  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(3)
+  // After 503 the next background GET must be delayed to at least 30s;
+  // no immediate retry storm during Redis failover.
+  await expect.poll(() => reads, { timeout: 45_000 }).toBeGreaterThanOrEqual(3)
+  expect(pollTimes[2] - pollTimes[1]).toBeGreaterThanOrEqual(30_000)
+  expect(pollTimes[2] - pollTimes[1]).toBeLessThan(45_000)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-create')).toBeVisible()
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)

@@ -113,6 +113,8 @@ A server-confirmed 401 revokes local guest/roster, while 404 or verified
 loss of membership drops the private room; transient 403/429/503/offline
 preserve existing data without immediate retries or clearing user action
 feedback. These are local UI decisions; only the server authorizes access.
+A follow-up (#103) adds bounded backoff under outages; polling is no longer
+a fixed-frequency interval during repeated transient failures.
 
 Vitest covers revision/membership/room validation and safe error
 classification. Existing two-real-browser Playwright now checks that the second guest's
@@ -179,3 +181,32 @@ no content/no-store, outsider/anonymous/error responses despite a matching
 validator and 30-minute idle expiry. Vitest and browser E2E cover request
 headers, null unchanged response, 401/404/503 behavior and absence of
 background writes. Match visibility/privacy rules (#9) remain separate.
+
+## Bounded backoff during Redis outages and rate limiting (#103)
+
+The authorized, no-heartbeat, conditional roster poll normally performs
+a single `GET /roster/peek` **15 seconds after the previous response**
+(200 or bodyless 304). On a transient error (403, 429, 502/503/504 or
+offline), consecutive failures increase the next delay to a nominal
+**30, then 60, then 120 seconds maximum**, with up to 20% positive
+jitter where the 120-second ceiling permits. Success restores the normal
+15-second cadence. All timeouts are local browser UX/load control, not
+gameplay timing; no extra headers, tokens, cookies or identifiers are sent.
+
+A new single self-scheduling timer replaces fixed `setInterval`, so
+responses taking longer than one interval cannot create overlapping
+requests. The timer is cancelled on room/guest switch and unmount and
+never issues requests in a hidden tab or during an explicit guest action.
+An old request completing after a mutation began cannot impose stale
+backoff or update private state. 401 invalidates the guest immediately,
+404 or verified membership loss removes the private room; neither is
+treated as a retryable outage. No auto-login, auto-join, browser storage
+or HTTP writes were introduced; explicit manual Refresh still works and
+remains an authorized heartbeat, while passive polling cannot extend
+the room's 30-minute idle TTL (#101).
+
+Pure Vitest covers the exponential cap, jitter, invalid inputs and
+reset on success; browser Playwright checks unchanged 304, 503, delayed
+next GET, then 404/401 with no background mutation. This reduces
+pressure during Redis failover but does not replace observability,
+monitoring and HA deployment requirements in #21.

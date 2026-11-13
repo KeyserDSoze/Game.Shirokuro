@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { LobbyRoster } from './api'
 import {
-  LOBBY_ROSTER_POLL_INTERVAL_MS,
-  classifyRosterPollFailure, reconcilePolledRoster,
+  LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
+  classifyRosterPollFailure, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -56,6 +56,40 @@ describe('pre-match authenticated lobby polling', () => {
     expect(reconcilePolledRoster(roster(1), payload as LobbyRoster, alice.playerId))
       .toBe('unchanged')
   })
+
+  it('backs off on transient errors, caps retry delay and resets after success', () => {
+    expect(rosterPollDelayMs(0, 0)).toBe(15_000)
+    expect(rosterPollDelayMs(1, 0)).toBe(30_000)
+    expect(rosterPollDelayMs(2, 0)).toBe(60_000)
+    expect(rosterPollDelayMs(3, 0)).toBe(120_000)
+    expect(rosterPollDelayMs(4, 0)).toBe(120_000)
+    expect(rosterPollDelayMs(1000, 0)).toBe(120_000)
+    expect(LOBBY_ROSTER_MAX_BACKOFF_MS).toBe(120_000)
+    // UI resets consecutiveFailures to zero for 200 and 304.
+    expect(rosterPollDelayMs(0, 1)).toBe(15_000)
+  })
+
+  it('adds only bounded jitter without retry storms or overflow', () => {
+    expect(rosterPollDelayMs(1, 0.5)).toBe(33_000)
+    expect(rosterPollDelayMs(1, 1)).toBe(36_000)
+    expect(rosterPollDelayMs(2, 1)).toBe(72_000)
+    expect(rosterPollDelayMs(3, 1)).toBe(120_000)
+    expect(rosterPollDelayMs(5, 0.5)).toBe(120_000)
+  })
+
+  it.each([-1, 0.25, NaN, Infinity, -Infinity])(
+    'treats invalid failure counts (%s) as normal cadence', failures => {
+      expect(rosterPollDelayMs(failures, 1)).toBe(15_000)
+    },
+  )
+
+  it.each([-1, 2, NaN, Infinity, -Infinity])(
+    'clamps invalid random fractions (%s) to a safe jitter window', fraction => {
+      const delay = rosterPollDelayMs(1, fraction)
+      expect(delay).toBeGreaterThanOrEqual(30_000)
+      expect(delay).toBeLessThanOrEqual(36_000)
+    },
+  )
 
   it('invalidates only on 401 or 404, not on Redis/edge outages', () => {
     expect(classifyRosterPollFailure(401)).toBe('expired')

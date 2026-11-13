@@ -8,7 +8,8 @@ import {
   type GuestSession, type LobbyRoster,
 } from './api'
 import {
-  LOBBY_ROSTER_POLL_INTERVAL_MS, classifyRosterPollFailure, reconcilePolledRoster,
+  LOBBY_ROSTER_POLL_INTERVAL_MS, classifyRosterPollFailure,
+  reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 type Props = { previewHeroId: string }
@@ -167,19 +168,33 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
   }, [session, forgetGuest, t])
 
-  // Read-only pre-match roster synchronization. The server continues to
-  // authorize every GET; neither SignalR nor cross-tab data grants access.
-  // Timer callbacks don't overlap, never mint guests and stop on hidden tabs.
+  // Authenticated, read-only, member-scoped pre-match synchronization.
+  // A single self-scheduling timeout avoids overlapping GETs, and exponential
+  // backoff reduces request pressure on API/Redis during failover/outage.
+  // No client-side timer is allowed to renew the server's 30-minute room TTL.
   useEffect(() => {
     if (!roomId || !actorId) return
     let active = true
-    let inFlight = false
+    let timer: number | undefined
+    let transientFailures = 0
+
+    const schedule = (delayMs: number) => {
+      if (active) timer = window.setTimeout(() => { void poll() }, delayMs)
+    }
 
     const poll = async () => {
-      if (!active || inFlight || document.hidden || busyRef.current) return
+      if (!active) return
+      if (document.hidden || busyRef.current) {
+        // Hidden tabs and active user actions never issue background reads.
+        // Do not clear a previously observed outage just because the UI
+        // is temporarily busy or not visible.
+        schedule(LOBBY_ROSTER_POLL_INTERVAL_MS)
+        return
+      }
+
       const generation = sessionGenerationRef.current
       const operation = operationRef.current
-      inFlight = true
+      let terminal = false
       const stillCurrent = () =>
         active && generation === sessionGenerationRef.current &&
         operation === operationRef.current && !busyRef.current &&
@@ -188,16 +203,18 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       try {
         const latest = await guestLobbyApi.peek(
           roomId, currentRoomRef.current?.revision)
-        if (!stillCurrent() || latest === null) return
+        if (!stillCurrent()) return
+        // Both an authorized 200 and a no-body 304 mean service recovered.
+        transientFailures = 0
+        if (latest === null) return
         const current = currentRoomRef.current!
         const result = reconcilePolledRoster(current, latest, actorId)
         if (result === 'updated') {
-          // Another action may have committed a newer revision before
-          // React applies this state update: never overwrite it.
           setRoom(previous =>
             previous?.lobbyId === roomId && previous.revision < latest.revision
               ? latest : previous)
         } else if (result === 'missing') {
+          terminal = true
           setRoom(previous => previous?.lobbyId === roomId ? null : previous)
           setInvite('')
           setMessage(t('lobbyMissing'))
@@ -207,24 +224,33 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         const outcome = classifyRosterPollFailure(
           error instanceof LobbyHttpError ? error.status : undefined)
         if (outcome === 'expired') {
+          terminal = true
           forgetGuest()
           setMessage(t('lobbySessionExpired'))
         } else if (outcome === 'missing') {
+          terminal = true
           setRoom(previous => previous?.lobbyId === roomId ? null : previous)
           setInvite('')
           setMessage(t('lobbyMissing'))
+        } else {
+          // 403, 429, 5xx and offline preserve the authenticated roster.
+          // Cap the counter to prevent number overflow in long outages.
+          transientFailures = Math.min(3, transientFailures + 1)
         }
-        // 403, 429, 503 and offline are not logout evidence.
-        // Do not retry immediately or replace a mutation's status banner.
       } finally {
-        inFlight = false
+        // An old request may have finished after a user mutation started.
+        // Never apply its failure penalty to a newer user operation.
+        if (active && !terminal) {
+          if (!stillCurrent()) transientFailures = 0
+          schedule(rosterPollDelayMs(transientFailures, Math.random()))
+        }
       }
     }
 
-    const timer = window.setInterval(() => { void poll() }, LOBBY_ROSTER_POLL_INTERVAL_MS)
+    schedule(LOBBY_ROSTER_POLL_INTERVAL_MS)
     return () => {
       active = false
-      window.clearInterval(timer)
+      window.clearTimeout(timer)
     }
   }, [roomId, actorId, forgetGuest, t])
 
