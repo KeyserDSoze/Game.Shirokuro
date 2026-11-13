@@ -502,7 +502,7 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   expect(verifiedResponse.status()).toBe(200)
   const verified = await verifiedResponse.json()
   const priorView = await page.getByTestId('lobby-roster').textContent()
-  const priorRevision = await page.getByTestId('lobby-revision').textContent()
+  const verifiedRevision = await page.getByTestId('lobby-revision').textContent()
   let invalidPayload: unknown = null
   await page.route('**/api/lobbies/' + existingRoom + '/roster', async route =>
     route.fulfill({ status: 200, json: invalidPayload }))
@@ -517,7 +517,7 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
     await page.getByTestId('lobby-refresh').click()
     await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
     await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
-    await expect(page.getByTestId('lobby-revision')).toHaveText(priorRevision!)
+    await expect(page.getByTestId('lobby-revision')).toHaveText(verifiedRevision!)
     await expect(page.getByTestId('lobby-roster')).toHaveText(priorView!)
   }
   await page.unroute('**/api/lobbies/' + existingRoom + '/roster')
