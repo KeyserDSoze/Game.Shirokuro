@@ -283,7 +283,7 @@ public sealed class RedisLobbySnapshotStore(
             // Never return a damaged or incompatible private roster.
             throw new LobbySnapshotUnavailableException();
         }
-        return Remaining(snapshot) > TimeSpan.Zero
+        return VerifiedStoredRemaining(snapshot) > TimeSpan.Zero
             ? new Stored(snapshot, bytes)
             : null;
     }
@@ -462,7 +462,7 @@ public sealed class RedisLobbySnapshotStore(
             throw new LobbySnapshotUnavailableException();
         }
 
-        return Remaining(snapshot) > TimeSpan.Zero
+        return VerifiedStoredRemaining(snapshot) > TimeSpan.Zero
             ? new Stored(snapshot, bytes)
             : null;
     }
@@ -476,11 +476,23 @@ public sealed class RedisLobbySnapshotStore(
                    "0123456789abcdef") < 0;
     }
 
+    // V2 JSON can be structurally valid while claiming a future activity
+    // time. Never make its roster available or start administrative cleanup.
+    private TimeSpan VerifiedStoredRemaining(LobbySnapshot snapshot)
+    {
+        var remaining = Remaining(snapshot);
+        if (remaining > _timeout)
+            throw new LobbySnapshotUnavailableException();
+        return remaining;
+    }
+
     private TimeSpan Remaining(LobbySnapshot snapshot)
     {
         if (_timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(inactivityTimeout));
-        return snapshot.LastActivityUtc + _timeout - clock.GetUtcNow();
+        // Subtract instants before adding the timeout. DateTimeOffset.MaxValue
+        // must not overflow the deadline calculation on corrupt Redis input.
+        return snapshot.LastActivityUtc - clock.GetUtcNow() + _timeout;
     }
 
     private long DeadlineMilliseconds(LobbySnapshot snapshot)

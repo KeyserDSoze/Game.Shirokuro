@@ -46,6 +46,78 @@ public sealed class RedisLobbyQuotaStoreTests
 
 
 
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RealRedisFutureActivityIsUnavailableUntilExplicitRepair(
+        bool useMaximumTimestamp)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "future-activity-" + Guid.NewGuid().ToString("N");
+            var nodeA = Store(a, clock, ns);
+            var nodeB = Store(b, clock, ns);
+            var apiA = new RedisGuestLobbyRuntime(nodeA, clock);
+            var apiB = new RedisGuestLobbyRuntime(nodeB, clock);
+            var owner = GuestSessions.NewPlayerId();
+            var guest = GuestSessions.NewPlayerId();
+            var room = await apiA.CreateAsync(owner,
+                ["white", "black"], "white");
+            await apiB.JoinAsync(room.LobbyId, guest,
+                "black", room.Revision);
+
+            var db = a.GetDatabase();
+            var indexKey = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(indexKey)).ToString();
+            var original = (byte[])(await db.StringGetAsync(roomKey))!;
+            var json = JsonNode.Parse(original)!.AsObject();
+            json["LastActivityUtcTicks"] = useMaximumTimestamp
+                ? DateTimeOffset.MaxValue.UtcTicks
+                : clock.GetUtcNow().AddDays(1).UtcTicks;
+            var corrupt = Encoding.UTF8.GetBytes(json.ToJsonString());
+            Assert.NotNull(RedisLobbySnapshotCodec.Decode(
+                corrupt, room.LobbyId));
+            Assert.True(await db.StringSetAsync(
+                roomKey, corrupt, TimeSpan.FromMinutes(30)));
+            var initialTtl = await db.KeyTimeToLiveAsync(roomKey);
+
+            foreach (var call in new Func<Task>[]
+            {
+                async () => { await nodeB.ReadAsync(room.LobbyId); },
+                async () => { await nodeB.ReadForGuestWithoutHeartbeatAsync(
+                    room.LobbyId, guest); },
+                async () => { await nodeB.GetIndexedRoomsAsync(); },
+                async () => { await apiB.RemovePlayerFromAllRoomsAsync(guest); }
+            })
+            {
+                var failure = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+                    call);
+                Assert.Null(failure.InnerException);
+                Assert.DoesNotContain(room.LobbyId, failure.Message);
+                Assert.DoesNotContain(guest, failure.Message);
+            }
+            Assert.Equal(corrupt, (byte[])(await db.StringGetAsync(roomKey))!);
+            Assert.True(await db.KeyTimeToLiveAsync(roomKey) <= initialTtl);
+            Assert.Single(await db.SortedSetRangeByRankAsync(indexKey));
+
+            // The server never repairs unverified data. Recovery is an
+            // explicit operator-side restoration; subsequent cleanup works.
+            Assert.True(await db.StringSetAsync(
+                roomKey, original, TimeSpan.FromMinutes(30)));
+            Assert.Equal(2, (await nodeB.ReadAsync(room.LobbyId))!
+                .Snapshot.State.Participants.Count);
+            Assert.Equal(1, await apiA.RemovePlayerFromAllRoomsAsync(guest));
+            Assert.Equal(owner, Assert.Single((await nodeB.ReadAsync(
+                room.LobbyId))!.Snapshot.State.Participants).PlayerId);
+        }
+    }
+
     [Fact]
     public async Task RealRedisMultiWindowCleanupIsAtomicAgainstLaterDamagedRoom()
     {

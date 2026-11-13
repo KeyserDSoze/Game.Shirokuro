@@ -262,6 +262,49 @@ public sealed class RedisLobbyCommandTimeoutTests
         }
     }
 
+    private static byte[] EncodedGuestRoom(
+        string roomId, string playerId, DateTimeOffset activityUtc)
+    {
+        var state = LobbyState.Create(new LobbyDefinition(
+            roomId, ["white", "black"], ["kira"])).Join(playerId, "white", 0);
+        return RedisLobbySnapshotCodec.Encode(
+            new LobbySnapshot(state, activityUtc, playerId, QuotaTracked: true));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FutureActivityFailsClosedOnDirectAndFencedReads(
+        bool useMaximumTimestamp)
+    {
+        var database = DispatchProxy.Create<IDatabase, CorruptSnapshotDatabase>();
+        var fixture = (CorruptSnapshotDatabase)(object)database;
+        var roomId = "room-" + Guid.NewGuid().ToString("N");
+        var playerId = GuestSessions.NewPlayerId();
+        fixture.Raw = EncodedGuestRoom(roomId, playerId,
+            useMaximumTimestamp ? DateTimeOffset.MaxValue
+                : DateTimeOffset.UtcNow.AddDays(1));
+        // The codec accepts the metadata; the storage-time validation
+        // rejects it as an untrusted, impossible activity timestamp.
+        Assert.NotNull(RedisLobbySnapshotCodec.Decode(fixture.Raw, roomId));
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        foreach (var read in new Func<Task>[]
+        {
+            async () => { await store.ReadAsync(roomId); },
+            async () => { await store.ReadForGuestWithoutHeartbeatAsync(
+                roomId, playerId); }
+        })
+        {
+            var error = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+                read);
+            Assert.Null(error.InnerException);
+            Assert.DoesNotContain(roomId, error.Message);
+            Assert.DoesNotContain(playerId, error.Message);
+        }
+        Assert.Equal(2, fixture.Reads);
+        Assert.Equal(0, fixture.Mutations);
+    }
+
     [Theory]
     [InlineData("truncated")]
     [InlineData("bad-version")]
@@ -330,18 +373,30 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.Equal(0, fixture.Mutations);
     }
 
-    [Fact]
-    public async Task CorruptedRedisRoomReturnsUncached503OnReadAndAllMutations()
+    [Theory]
+    [InlineData("invalid-json")]
+    [InlineData("future-activity")]
+    [InlineData("max-activity")]
+    public async Task CorruptedRedisRoomReturnsUncached503OnReadAndAllMutations(
+        string failure)
     {
+        const string id = "room-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         var database = DispatchProxy.Create<IDatabase, CorruptSnapshotDatabase>();
         var controller = (CorruptSnapshotDatabase)(object)database;
-        controller.Raw = Encoding.UTF8.GetBytes("{not valid json}");
+        controller.Raw = failure switch
+        {
+            "invalid-json" => Encoding.UTF8.GetBytes("{not valid json}"),
+            "future-activity" => EncodedGuestRoom(id, GuestSessions.NewPlayerId(),
+                DateTimeOffset.UtcNow.AddDays(1)),
+            "max-activity" => EncodedGuestRoom(id, GuestSessions.NewPlayerId(),
+                DateTimeOffset.MaxValue),
+            _ => throw new ArgumentOutOfRangeException(nameof(failure))
+        };
         using var host = Production(database);
         using var visitor = Client(host);
         var cookie = await Login(visitor);
         using var guest = Client(host, cookie);
 
-        const string id = "room-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         using (var roster = await guest.GetAsync("/api/lobbies/" + id + "/roster"))
             AssertSanitized503(roster);
 
@@ -751,6 +806,8 @@ public sealed class RedisLobbyCommandTimeoutTests
     [InlineData("bad-version")]
     [InlineData("oversized")]
     [InlineData("untracked")]
+    [InlineData("future-activity")]
+    [InlineData("max-activity")]
     public async Task CorruptIndexedRoomCannotAuthorizeAdministrativeCleanup(
         string caseName)
     {
@@ -768,6 +825,10 @@ public sealed class RedisLobbyCommandTimeoutTests
             "bad-version" => Modified("Version", 999),
             "oversized" => new byte[RedisLobbySnapshotCodec.MaxBytes + 1],
             "untracked" => Modified("QuotaTracked", false),
+            "future-activity" => Modified("LastActivityUtcTicks",
+                DateTimeOffset.UtcNow.AddDays(1).UtcTicks),
+            "max-activity" => Modified("LastActivityUtcTicks",
+                DateTimeOffset.MaxValue.UtcTicks),
             _ => throw new ArgumentOutOfRangeException(nameof(caseName))
         };
 
