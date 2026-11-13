@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   guestLobbyApi, LobbyHttpError, LobbyInputError,
-  parseCurrentSession, parseGuestSession, parseInviteCode, parseTeamIds,
+  isCanonicalGuestPlayerId, parseCurrentSession, parseGuestSession, parseInviteCode, parseTeamIds,
 } from './api'
 
 const roomCode = 'room-' + 'a'.repeat(32)
@@ -193,6 +193,26 @@ describe('guest lobby client boundaries', () => {
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(await guestLobbyApi.read(roomCode)).toEqual(roster)
     expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeUndefined()
+  })
+
+  it.each([
+    ['guest-' + '0'.repeat(32), true],
+    ['guest-' + 'f'.repeat(32), true],
+    ['guest-' + '0123456789abcdef'.repeat(2), true],
+    ['guest-' + '0'.repeat(31), false],
+    ['guest-' + '0'.repeat(33), false],
+    ['guest-' + 'A'.repeat(32), false],
+    ['guest-' + 'G'.repeat(32), false],
+    ['guest-' + '0'.repeat(31) + ' ', false],
+    [' guest-' + '0'.repeat(32), false],
+    ['guest-other', false],
+    ['', false],
+    [null, false],
+    [undefined, false],
+    [42, false],
+    [{ value: 'guest-' + 'a'.repeat(32) }, false],
+  ])('recognizes only canonical generated guest player IDs (%s)', (value, valid) => {
+    expect(isCanonicalGuestPlayerId(value)).toBe(valid)
   })
 
   it('accepts only server-shaped canonical guest identity envelopes', () => {

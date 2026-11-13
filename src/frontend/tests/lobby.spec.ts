@@ -574,8 +574,9 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-message')).toContainText('Squadra aggiornata')
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
 
-  // A 200 misrouted to another room, missing our member or containing private
-  // unknown fields must never replace the currently verified roster (#110).
+  // A 200 misrouted to another room, missing our member, containing
+  // noncanonical player IDs or private fields cannot replace the verified
+  // roster (#110/#114), even if our actor remains among participants.
   const verifiedResponse = await page.request.get('/api/lobbies/' + existingRoom + '/roster')
   expect(verifiedResponse.status()).toBe(200)
   const verified = await verifiedResponse.json()
@@ -588,6 +589,10 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
     { ...verified, lobbyId: 'room-' + 'f'.repeat(32), revision: verified.revision + 20 },
     { ...verified, participants: [{ playerId: 'guest-unrelated', teamId: 'white', heroId: null }] },
     { ...verified, participants: [null] },
+    { ...verified, participants: [...verified.participants,
+      { playerId: 'guest-noncanonical', teamId: 'white', heroId: null }] },
+    { ...verified, participants: [...verified.participants,
+      { playerId: 'guest-' + 'A'.repeat(32), teamId: 'black', heroId: null }] },
     { ...verified, secretRoute: 'should-not-be-imported' },
     { ...verified, revision: 0 },
   ]) {

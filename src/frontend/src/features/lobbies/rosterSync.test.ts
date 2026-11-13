@@ -7,8 +7,8 @@ import {
 
 const lobbyId = 'room-' + 'a'.repeat(32)
 const otherId = 'room-' + 'b'.repeat(32)
-const alice = { playerId: 'guest-alice', teamId: 'white', heroId: null }
-const bob = { playerId: 'guest-bob', teamId: 'black', heroId: 'kira' }
+const alice = { playerId: 'guest-' + '1'.repeat(32), teamId: 'white', heroId: null }
+const bob = { playerId: 'guest-' + '2'.repeat(32), teamId: 'black', heroId: 'kira' }
 
 function roster(revision: number, participants = [alice, bob] as LobbyRoster['participants']): LobbyRoster {
   return { lobbyId, revision, teamIds: ['white', 'black'], participants }
@@ -51,7 +51,7 @@ describe('pre-match authenticated lobby polling', () => {
     [{ ...roster(2), teamIds: null }],
     [{ ...roster(2), participants: null }],
     [{ ...roster(2), participants: [null] }],
-    [{ ...roster(2), participants: [{ playerId: 'guest-alice' }] }],
+    [{ ...roster(2), participants: [{ playerId: alice.playerId }] }],
   ])('classifies malformed responses separately without authorizing room changes', payload => {
     expect(reconcilePolledRoster(roster(1), payload as LobbyRoster, alice.playerId))
       .toBe('invalid')
@@ -63,9 +63,15 @@ describe('pre-match authenticated lobby polling', () => {
     ['duplicate player', roster(3, [alice, alice])],
     ['duplicate team', { ...roster(3), teamIds: ['white', 'white'] }],
     ['unknown player team', roster(3, [{ ...alice, teamId: 'unknown' }, bob])],
+    ['legacy noncanonical guest ID', roster(3, [alice, { ...bob, playerId: 'guest-bob' }])],
+    ['uppercase guest hex', roster(3, [alice, { ...bob, playerId: 'guest-' + 'F'.repeat(32) }])],
+    ['truncated guest ID', roster(3, [alice, { ...bob, playerId: 'guest-' + 'f'.repeat(31) }])],
+    ['oversized guest ID', roster(3, [alice, { ...bob, playerId: 'guest-' + 'f'.repeat(33) }])],
+    ['non-string guest ID', { ...roster(3), participants: [alice, { ...bob, playerId: { id: bob.playerId } }] }],
+    ['invalid actor player ID', roster(3, [{ ...alice, playerId: 'guest-alice' }, bob])],
     ['empty roster', roster(3, [])],
     ['too many members', roster(3, Array.from({ length: 17 }, (_, i) =>
-      ({ playerId: 'guest-' + i, teamId: 'white', heroId: null })))],
+      ({ playerId: 'guest-' + i.toString(16).padStart(32, '0'), teamId: 'white', heroId: null })))],
     ['invalid room ID', { ...roster(3), lobbyId: 'room-INVALID' }],
     ['additional field and missing actor', { ...roster(3, [bob]), secretRoute: 'hidden' }],
   ])('flags passive 200 with %s for backoff without changing the room', (_case, incoming) => {
@@ -150,14 +156,32 @@ describe('explicit authenticated roster adoption (#110)', () => {
     ['missing actor', roster(8, [bob])],
     ['duplicate player', roster(8, [alice, alice])],
     ['unknown team', roster(8, [{ ...alice, teamId: 'other' }])],
+    ['legacy participant ID', roster(8, [alice, { ...bob, playerId: 'guest-bob' }])],
+    ['uppercase participant ID', roster(8, [alice, { ...bob, playerId: 'guest-' + 'A'.repeat(32) }])],
+    ['arbitrary participant ID', roster(8, [alice, { ...bob, playerId: 'other-account' }])],
+    ['huge participant ID', roster(8, [alice, { ...bob, playerId: 'guest-' + 'a'.repeat(100_000) }])],
     ['null participant', { ...roster(8), participants: [null] }],
     ['missing hero', { ...roster(8), participants: [{ playerId: alice.playerId, teamId: 'white' }] }],
     ['extra private field', { ...roster(8), secretRoute: 'hidden' }],
     ['extra player field', { ...roster(8), participants: [{ ...alice, destination: 'hidden' }] }],
     ['too many members', roster(8, Array.from({ length: 17 }, (_, i) =>
-      ({ playerId: 'guest-' + i, teamId: 'white', heroId: null })))],
+      ({ playerId: 'guest-' + i.toString(16).padStart(32, '0'), teamId: 'white', heroId: null })))],
   ])('rejects %s rather than importing an invalid 200', (_kind, payload) => {
     expect(isVerifiedLobbyRoster(payload, alice.playerId, lobbyId, 1)).toBe(false)
+  })
+
+  it('accepts canonical IDs for every participant and rejects even one mismatched member', () => {
+    const current = roster(3)
+    const next = roster(4, [alice, bob, {
+      playerId: 'guest-' + '3'.repeat(32), teamId: 'black', heroId: null,
+    }])
+    expect(isVerifiedLobbyRoster(next, alice.playerId, lobbyId, 3)).toBe(true)
+    expect(reconcilePolledRoster(current, next, alice.playerId)).toBe('updated')
+    const noncanonical = { ...next, participants: [
+      alice, bob, { playerId: 'guest-long-and-fake', teamId: 'black', heroId: null },
+    ] }
+    expect(isVerifiedLobbyRoster(noncanonical, alice.playerId, lobbyId, 3)).toBe(false)
+    expect(reconcilePolledRoster(current, noncanonical, alice.playerId)).toBe('invalid')
   })
 
   it('does not accept wrong requested room, stale revision or other identity', () => {

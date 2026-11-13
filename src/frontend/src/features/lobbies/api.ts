@@ -1,5 +1,10 @@
 /** Pre-match data only; game positions and planned moves are never exposed. */
 export type GuestSession = Readonly<{ playerId: string; kind: 'guest' }>
+/** Match the 128-bit guest ID format from GuestSessions.NewPlayerId() on .NET. */
+export function isCanonicalGuestPlayerId(value: unknown): value is string {
+  return typeof value === 'string' && /^guest-[0-9a-f]{32}$/.test(value)
+}
+
 /** A signed non-guest identity cannot be adopted as a guest session. */
 export type CurrentSession = GuestSession | Readonly<{ playerId: string; kind: 'other' }>
 
@@ -18,7 +23,7 @@ export function parseCurrentSession(payload: unknown): CurrentSession {
       typeof data.playerId !== 'string' || data.playerId.length === 0)
     throw new Error('Invalid session envelope')
 
-  if (data.kind === 'guest' && /^guest-[0-9a-f]{32}$/.test(data.playerId))
+  if (data.kind === 'guest' && isCanonicalGuestPlayerId(data.playerId))
     return { kind: 'guest', playerId: data.playerId }
   // A well-formed non-guest session still clears an obsolete guest in the
   // existing recheck logic, but it must never masquerade as a guest.

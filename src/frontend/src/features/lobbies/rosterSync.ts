@@ -1,4 +1,4 @@
-import type { LobbyRoster } from './api'
+import { isCanonicalGuestPlayerId, type LobbyRoster } from './api'
 
 /** Read-only, member-scoped, pre-match synchronization; not match state. */
 export const LOBBY_ROSTER_POLL_INTERVAL_MS = 15_000
@@ -83,7 +83,7 @@ function isWellFormedLobbyRoster(
     if (Object.keys(player).length !== 3 ||
         !['playerId', 'teamId', 'heroId'].every(key =>
           Object.prototype.hasOwnProperty.call(player, key)) ||
-        typeof player.playerId !== 'string' || player.playerId.length === 0 ||
+        !isCanonicalGuestPlayerId(player.playerId) ||
         seen.has(player.playerId) ||
         typeof player.teamId !== 'string' ||
         !data.teamIds.includes(player.teamId) ||
