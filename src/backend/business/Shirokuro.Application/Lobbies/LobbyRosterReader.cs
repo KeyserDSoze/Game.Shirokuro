@@ -11,9 +11,17 @@ public sealed class LobbyRosterReader(InMemoryLobbyCoordinator coordinator)
         ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
         // Atomic member-scoped read and inactivity refresh.
         // Unknown and non-member rooms stay indistinguishable on the wire.
-        var state = coordinator.GetForMember(lobbyId, trustedPlayerId);
+        return Project(coordinator.GetForMember(lobbyId, trustedPlayerId));
+    }
 
-        return new LobbyRosterView(
+    public LobbyRosterView PeekForMember(string lobbyId, string trustedPlayerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
+        return Project(coordinator.PeekForMember(lobbyId, trustedPlayerId));
+    }
+
+    private static LobbyRosterView Project(Shirokuro.Domain.Lobbies.LobbyState state) =>
+        new(
             state.Definition.LobbyId,
             state.Revision,
             Array.AsReadOnly(state.Definition.TeamIds.ToArray()),

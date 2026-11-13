@@ -133,6 +133,68 @@ public sealed class GuestLobbyHttpTests
     }
 
     [Fact]
+    public async Task PassiveAuthenticatedPollNeverExtendsThirtyMinuteIdleExpiry()
+    {
+        var clock = new ManualClock();
+        using var server = ServerWithClock(clock);
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var owner = Client(server, cookie);
+        var (room, revision) = await Create(owner);
+        var peek = "/api/lobbies/" + room + "/roster/peek";
+
+        // Repeated, valid member polls alone are not an activity heartbeat.
+        clock.Advance(TimeSpan.FromMinutes(20));
+        using (var first = await owner.GetAsync(peek))
+        {
+            Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+            Assert.Equal("no-store", first.Headers.CacheControl?.ToString());
+            using var data = JsonDocument.Parse(await first.Content.ReadAsStringAsync());
+            Assert.Equal(revision, data.RootElement.GetProperty("revision").GetInt64());
+        }
+        clock.Advance(TimeSpan.FromMinutes(9));
+        using (var again = await owner.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.OK, again.StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(1));
+        using (var expired = await owner.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
+        using (var cannotRevive = await owner.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, cannotRevive.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExplicitMemberRefreshExtendsIdleButPassivePollCannotAuthorizeOutsiders()
+    {
+        var clock = new ManualClock();
+        using var server = ServerWithClock(clock);
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var owner = Client(server, cookie);
+        var (room, _) = await Create(owner);
+        var peek = "/api/lobbies/" + room + "/roster/peek";
+
+        using (var anonymous = await visitor.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
+        using var strangerVisitor = Client(server);
+        var (_, strangerCookie) = await SignIn(strangerVisitor);
+        using var stranger = Client(server, strangerCookie);
+        using (var hidden = await stranger.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
+        using (var invalid = await owner.GetAsync("/api/lobbies/room-invalid/roster/peek"))
+            Assert.Equal(HttpStatusCode.NotFound, invalid.StatusCode);
+
+        clock.Advance(TimeSpan.FromMinutes(20));
+        using (var manual = await owner.GetAsync("/api/lobbies/" + room + "/roster"))
+            Assert.Equal(HttpStatusCode.OK, manual.StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(20));
+        using (var stillAlive = await owner.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.OK, stillAlive.StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(10));
+        using (var expired = await owner.GetAsync(peek))
+            Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
+    }
+
+    [Fact]
     public async Task TwoRealGuestSessionsCanCreateJoinChooseHeroesAndLeave()
     {
         using var server = Server();

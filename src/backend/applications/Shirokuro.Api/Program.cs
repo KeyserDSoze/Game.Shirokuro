@@ -595,54 +595,55 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
 }).RequireAuthorization().WithMetadata(new WebMutationGuardRequired());
 
 
-// Read-only authenticated roster. Never accept a playerId from the request.
-// A missing lobby and a non-member both return 404 to avoid room enumeration.
-app.MapGet("/api/lobbies/{lobbyId}/roster",
-    async (string lobbyId, ClaimsPrincipal user, HttpContext context,
-        IAsyncGuestLobby lobby) =>
-    {
-        context.Response.Headers.CacheControl = "no-store";
-        var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(user);
-        if (trustedPlayerId is null)
-        {
-            return Results.Forbid();
-        }
+// All pre-match rosters use identical cookie auth and error policy.
+// Explicit GET is an activity heartbeat; passive GET is authorized but
+// cannot keep abandoned rooms alive merely because a tab is open.
+static async Task<IResult> ServeGuestRosterAsync(
+    string lobbyId, ClaimsPrincipal user, HttpContext context,
+    IAsyncGuestLobby lobby, bool heartbeat)
+{
+    context.Response.Headers.CacheControl = "no-store";
+    var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(user);
+    if (trustedPlayerId is null)
+        return Results.Forbid();
 
-        try
-        {
-            return Results.Ok(await lobby.ForMemberAsync(
-                lobbyId, trustedPlayerId, context.RequestAborted));
-        }
-        catch (Exception error) when (
-            error is KeyNotFoundException or
-            UnauthorizedAccessException or
-            ArgumentException)
-        {
-            return Results.NotFound();
-        }
-        catch (LobbySnapshotUnavailableException)
-        {
-            // Never reveal corrupted/incompatible Redis room bytes or
-            // pretend a member roster was successfully authorized.
-            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-        }
-        catch (LobbyReadContentionException)
-        {
-            // Another node may be advancing this room's activity/snapshot
-            // faster than the bounded read CAS can converge. Do not turn
-            // a transient authoritative-read failure into HTTP 500 or
-            // reveal a roster that has not passed an atomic heartbeat.
-            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-        }
-        catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
-        {
-            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-        }
-        catch (RedisException)
-        {
-            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-        }
-    }).RequireAuthorization()
+    try
+    {
+        var roster = heartbeat
+            ? await lobby.ForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted)
+            : await lobby.PeekForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted);
+        return Results.Ok(roster);
+    }
+    catch (Exception error) when (
+        error is KeyNotFoundException or UnauthorizedAccessException or
+        ArgumentException)
+    {
+        return Results.NotFound(); // Indistinguishable absent/non-member rooms.
+    }
+    catch (Exception error) when (
+        error is LobbySnapshotUnavailableException or LobbyReadContentionException or
+        RedisException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+}
+
+// Keep explicit refresh and SignalR heartbeat semantics unchanged.
+app.MapGet("/api/lobbies/{lobbyId}/roster",
+    (string lobbyId, ClaimsPrincipal user, HttpContext context, IAsyncGuestLobby lobby) =>
+        ServeGuestRosterAsync(lobbyId, user, context, lobby, heartbeat: true))
+    .RequireAuthorization()
+    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"));
+
+// Automatic 15-second polling uses a separate member-only, non-renewing GET.
+app.MapGet("/api/lobbies/{lobbyId}/roster/peek",
+    (string lobbyId, ClaimsPrincipal user, HttpContext context, IAsyncGuestLobby lobby) =>
+        ServeGuestRosterAsync(lobbyId, user, context, lobby, heartbeat: false))
+    .RequireAuthorization()
     .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"));
 
 // Server-owned guest room mutations, with CSRF and revision controls.

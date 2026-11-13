@@ -124,3 +124,30 @@ polling interval. Other real-browser tests already verify server-side
 revocation across copied guest cookies and private lobby endpoints. Hosting, alerting and anti-Sybil controls still belong
 to #21; game rules, hidden movement and match-scoped observations
 remain #3/#5/#9.
+
+## Passive roster polling must not extend idle room lifetime (#101)
+
+The automatic 15-second roster GET introduced in #100 must **not**
+count as authorized activity. Otherwise a browser merely left open
+would keep every pre-match room alive forever, defeating the server's
+30-minute inactivity expiry and exhausting creator/global room quotas.
+The frontend now sends these timer reads to the authenticated,
+member-only `GET /api/lobbies/{roomId}/roster/peek` endpoint. The
+existing explicit `GET /roster` manual Refresh and the SignalR roster
+method intentionally retain their original authorized heartbeat semantics;
+room create/join/hero/team/leave are unchanged. Both paths enforce exact
+canonical room codes, current guest-cookie authority, server-derived actor,
+uniform 404 for nonmembers/absent rooms, no-store response and 503 for
+unavailable Redis. No cross-tab room state, writes or match observations.
+
+Development verifies membership **under the same coordinator lock** while
+reading the immutable snapshot, without modifying last activity. In
+Production/Staging Redis uses an atomic **read-only Lua GET combined with
+the server-owned hashed guest revocation fence**, before decoding the
+authoritative snapshot and checking membership. No CAS, PEXPIRE, index
+score update, TTL extension, or fallback to per-node memory occurs.
+Authenticated polling can still see another player's newer revisions,
+but neither a broken tab nor unattended kiosk sustains room capacity.
+Tests use a fake clock to verify 30-minute expiry despite repeated polls,
+manual GET renewal, anonymous/outsider redaction and Redis two-client
+TTL/bytes and revocation-fence guarantees.

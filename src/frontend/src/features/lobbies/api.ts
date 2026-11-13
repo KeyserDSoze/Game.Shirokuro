@@ -73,6 +73,8 @@ export const guestLobbyApi = {
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/join', 'POST', { teamId }),
   read: (code: string) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/roster'),
+  peek: (code: string) =>
+    request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/roster/peek'),
   chooseHero: (code: string, heroId: string, expectedRevision: number) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/hero',
       'PATCH', { heroId, expectedRevision }),

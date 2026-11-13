@@ -53,12 +53,20 @@ test('two independent guest browsers create a room, join by invite and select he
     await second.getByRole('button', { name: 'Seleziona Shilla' }).click()
     await second.getByTestId('lobby-pick-hero').click()
     await expect(second.getByTestId('lobby-message')).toContainText('Eroe Shilla salvato')
-    // Automatic, authenticated, read-only GET: no user click on Refresh.
-    // The owner sees the other browser's newer hero/roster revision.
+    // Automatic, authenticated, read-only no-heartbeat GET. No user click
+    // on Refresh; only the explicit button is allowed to touch inactivity.
+    const passiveReads: string[] = []
+    first.on('request', request => {
+      if (request.url().includes('/api/lobbies/') &&
+          request.url().endsWith('/roster/peek'))
+        passiveReads.push(request.method())
+    })
     await first.bringToFront()
     await expect(first.getByTestId('lobby-revision')).toContainText('4', { timeout: 25_000 })
     await expect(first.getByTestId('lobby-roster')).toContainText('Shilla')
     await expect(first.getByTestId('lobby-roster')).toContainText('Kira')
+    expect(passiveReads).toContain('GET')
+    expect(passiveReads.every(method => method === 'GET')).toBe(true)
 
     await second.getByTestId('lobby-leave').click()
     await expect(second.getByTestId('lobby-message')).toContainText('lasciato la lobby')
@@ -544,7 +552,7 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
 
   let status = 503
   let reads = 0
-  await page.route('**/api/lobbies/' + code + '/roster', async route => {
+  await page.route('**/api/lobbies/' + code + '/roster/peek', async route => {
     if (route.request().method() !== 'GET') return route.continue()
     reads++
     await route.fulfill({

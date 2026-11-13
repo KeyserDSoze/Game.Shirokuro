@@ -105,6 +105,62 @@ public sealed class RedisLobbyQuotaStoreTests
     }
 
     [Fact]
+    public async Task PassiveCrossNodeRosterReadCannotRenewRedisExpiryOrBypassRevocation()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "passive-" + Guid.NewGuid().ToString("N");
+            var first = Store(a, clock, ns);
+            var second = Store(b, clock, ns);
+            var nodeA = new RedisGuestLobbyRuntime(first, clock);
+            var nodeB = new RedisGuestLobbyRuntime(second, clock);
+            var alice = GuestSessions.NewPlayerId();
+            var bob = GuestSessions.NewPlayerId();
+            var room = await nodeA.CreateAsync(alice, ["white", "black"], "white");
+            await nodeA.JoinAsync(room.LobbyId, bob, "black", room.Revision);
+            var db = a.GetDatabase();
+
+            // Compare the original opaque stored bytes and Redis TTL across
+            // independent clients; passive read cannot run CAS/PSETEX.
+            var indexKey = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var roomKey = Assert.Single(await db.SortedSetRangeByRankAsync(indexKey)).ToString();
+            var oldBytes = (byte[]) (await db.StringGetAsync(roomKey))!;
+            var initialTtl = await db.KeyTimeToLiveAsync(roomKey);
+            Assert.NotNull(initialTtl);
+            clock.Advance(TimeSpan.FromMinutes(20));
+            var passive = await nodeB.PeekForMemberAsync(room.LobbyId, bob);
+            Assert.Equal(2, passive.Revision);
+            Assert.Equal(2, passive.Participants.Count);
+            Assert.Equal(oldBytes, (byte[])(await db.StringGetAsync(roomKey))!);
+            Assert.True(await db.KeyTimeToLiveAsync(roomKey) <= initialTtl);
+            Assert.Equal(clock.GetUtcNow() - TimeSpan.FromMinutes(20),
+                (await first.ReadAsync(room.LobbyId))!.Snapshot.LastActivityUtc);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => nodeB.PeekForMemberAsync(room.LobbyId, GuestSessions.NewPlayerId()));
+
+            clock.Advance(TimeSpan.FromMinutes(10));
+            await Assert.ThrowsAsync<KeyNotFoundException>(
+                () => nodeB.PeekForMemberAsync(room.LobbyId, bob));
+            // A valid explicit GET is still a heartbeat on an active room.
+            // The elapsed fake-clock expiry above must not revive the room.
+            await Assert.ThrowsAsync<KeyNotFoundException>(
+                () => nodeA.ForMemberAsync(room.LobbyId, alice));
+
+            // A new room's fenced revocation is checked inside Lua on peek.
+            var fresh = await nodeA.CreateAsync(alice, ["white", "black"], "white");
+            Assert.Equal(1, (await nodeB.PeekForMemberAsync(fresh.LobbyId, alice)).Revision);
+            await first.FenceGuestAsync(alice);
+            await Assert.ThrowsAsync<KeyNotFoundException>(
+                () => nodeB.PeekForMemberAsync(fresh.LobbyId, alice));
+            Assert.Equal(1, (await first.ReadAsync(fresh.LobbyId))!.Snapshot.State.Revision);
+        }
+    }
+
+    [Fact]
     public async Task RedisGlobalAndOwnerLimitsAreAtomicAcrossTwoIndependentClients()
     {
         if (Address is null) return;

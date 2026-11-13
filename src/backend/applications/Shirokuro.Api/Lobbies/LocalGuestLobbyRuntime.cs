@@ -50,6 +50,13 @@ public sealed class LocalGuestLobbyRuntime(
         return Task.FromResult(reader.ForMember(room, actor));
     }
 
+    public Task<LobbyRosterView> PeekForMemberAsync(string room, string actor,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(reader.PeekForMember(room, actor));
+    }
+
     public Task<int> RemovePlayerFromAllRoomsAsync(string actor,
         CancellationToken cancellationToken = default)
     {

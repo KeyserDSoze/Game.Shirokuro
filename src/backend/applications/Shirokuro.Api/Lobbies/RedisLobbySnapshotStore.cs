@@ -113,6 +113,14 @@ public sealed class RedisLobbySnapshotStore(
         return members
         """;
 
+    // Read-only, atomic fenced GET for the periodic member roster poll.
+    // Unlike a heartbeat CAS this cannot refresh the snapshot or its TTL.
+    // A revoked actor sees the same absent result as a missing lobby.
+    private const string ReadFencedWithoutHeartbeatScript = """
+        if redis.call('EXISTS', KEYS[2]) == 1 then return nil end
+        return redis.call('GET', KEYS[1])
+        """;
+
     public sealed record Stored(LobbySnapshot Snapshot, byte[] RawBytes);
 
     // Guest cookie TTL is 8h. Keep a hashed actor tombstone no longer than
@@ -215,9 +223,32 @@ public sealed class RedisLobbySnapshotStore(
         var raw = await AwaitRedisAsync(
             () => database.StringGetAsync(RoomKey(lobbyId)),
             cancellationToken);
-        if (raw.IsNull)
-            return null;
-        var bytes = (byte[])raw!;
+        return raw.IsNull ? null : DecodeStored((byte[])raw!, lobbyId);
+    }
+
+    /// <summary>
+    /// The browser's 15-second pre-match poll is not user activity.
+    /// Use a single Redis Lua read for the room and guest revocation fence,
+    /// avoiding even an unverified stale room read after known revocation.
+    /// Does not PEXPIRE or touch quota/room indices.
+    /// </summary>
+    public async Task<Stored?> ReadForGuestWithoutHeartbeatAsync(
+        string lobbyId, string trustedGuestId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!ValidServerGuestId(trustedGuestId))
+            throw new ArgumentException("Invalid trusted guest identity.",
+                nameof(trustedGuestId));
+        var response = await AwaitRedisAsync(
+            () => database.ScriptEvaluateAsync(
+                ReadFencedWithoutHeartbeatScript,
+                [RoomKey(lobbyId), RevokedGuestKey(trustedGuestId)]),
+            cancellationToken);
+        return response.IsNull ? null : DecodeStored((byte[])response!, lobbyId);
+    }
+
+    private Stored? DecodeStored(byte[] bytes, string lobbyId)
+    {
         LobbySnapshot snapshot;
         try
         {
@@ -225,9 +256,7 @@ public sealed class RedisLobbySnapshotStore(
         }
         catch (InvalidDataException)
         {
-            // A stored payload may be damaged or written by an incompatible
-            // schema. Never return a partial roster, modify its TTL or
-            // expose the decoder's potentially sensitive inner exception.
+            // Never return a damaged or incompatible private roster.
             throw new LobbySnapshotUnavailableException();
         }
         return Remaining(snapshot) > TimeSpan.Zero

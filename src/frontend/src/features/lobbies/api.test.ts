@@ -97,6 +97,32 @@ describe('guest lobby client boundaries', () => {
     expect((mocked.mock.calls[0][1] as RequestInit).method).toBe('GET')
   })
 
+  it('sends passive roster polls only to the read-only, no-heartbeat route', async () => {
+    const mocked = vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: async () => ({
+        lobbyId: roomCode, revision: 2, teamIds: ['white', 'black'],
+        participants: [],
+      }),
+    })
+    vi.stubGlobal('fetch', mocked)
+    await guestLobbyApi.peek(roomCode)
+    await guestLobbyApi.read(roomCode)
+
+    expect(mocked.mock.calls[0][0])
+      .toBe('/api/lobbies/' + roomCode + '/roster/peek')
+    expect(mocked.mock.calls[1][0])
+      .toBe('/api/lobbies/' + roomCode + '/roster')
+    for (const [, request] of mocked.mock.calls as [string, RequestInit][]) {
+      expect(request.method).toBe('GET')
+      expect(request.credentials).toBe('include')
+      expect(request.cache).toBe('no-store')
+      expect(request.body).toBeUndefined()
+      expect(request.headers).toEqual({})
+    }
+    expect(() => guestLobbyApi.peek('../bad')).toThrow()
+    expect(mocked).toHaveBeenCalledTimes(2)
+  })
+
   it('sign-in performs no magic persistence or browser-side identity generation', async () => {
     const mocked = vi.fn().mockResolvedValue({
       ok: true, status: 200,

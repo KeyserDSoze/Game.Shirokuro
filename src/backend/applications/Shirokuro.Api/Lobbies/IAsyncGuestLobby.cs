@@ -31,6 +31,13 @@ public interface IAsyncGuestLobby
     Task<LobbyRosterView> ForMemberAsync(string roomId, string trustedPlayerId,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Server-authorized pre-match roster read that never renews inactivity.
+    /// The explicit ForMemberAsync remains an authorized heartbeat.
+    /// </summary>
+    Task<LobbyRosterView> PeekForMemberAsync(string roomId,
+        string trustedPlayerId, CancellationToken cancellationToken = default);
+
     Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
         CancellationToken cancellationToken = default);
 }

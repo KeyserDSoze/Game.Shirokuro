@@ -166,6 +166,21 @@ public sealed class InMemoryLobbyCoordinator
         }
     }
 
+    /// <summary>
+    /// Atomic membership check with no activity renewal. Only background
+    /// pre-match synchronization uses this; explicit reads still heartbeat.
+    /// </summary>
+    public LobbyState PeekForMember(string lobbyId, string trustedPlayerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
+        lock (_gate)
+        {
+            var state = Find(lobbyId);
+            EnsureMember(state, trustedPlayerId);
+            return state;
+        }
+    }
+
     public LobbyState Join(string lobbyId, string trustedPlayerId, string teamId, long expectedRevision)
         => Mutate(lobbyId, state => state.Join(trustedPlayerId, teamId, expectedRevision));
 

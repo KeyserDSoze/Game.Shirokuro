@@ -125,6 +125,25 @@ public sealed class RedisGuestLobbyRuntime(
     }
 
     /// <summary>
+    /// Read-only roster synchronization must never keep an idle room alive.
+    /// The Redis Lua read checks the actor fence atomically with GET, then
+    /// the current snapshot is decoded and membership verified here.
+    /// </summary>
+    public async Task<LobbyRosterView> PeekForMemberAsync(
+        string roomId, string trustedPlayerId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedPlayerId);
+        var found = await store.ReadForGuestWithoutHeartbeatAsync(
+            roomId, trustedPlayerId, cancellationToken);
+        if (found is null || !found.Snapshot.QuotaTracked)
+            throw new KeyNotFoundException("Lobby unavailable.");
+        EnsureMember(found.Snapshot.State, trustedPlayerId);
+        return Project(found.Snapshot.State);
+    }
+
+    /// <summary>
     /// Administrative removal after a trusted session revocation/expiry.
     /// Scan the bounded server-only global index, never client supplied IDs.
     /// Deletion and roster revision increments CAS against concurrent writes.
