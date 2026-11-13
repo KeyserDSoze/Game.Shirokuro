@@ -151,3 +151,31 @@ but neither a broken tab nor unattended kiosk sustains room capacity.
 Tests use a fake clock to verify 30-minute expiry despite repeated polls,
 manual GET renewal, anonymous/outsider redaction and Redis two-client
 TTL/bytes and revocation-fence guarantees.
+
+## Conditional passive polling without sharing private roster bodies (#102)
+
+The pre-match `GET /api/lobbies/{roomId}/roster/peek` now supports an
+optional, **exact, quoted** `If-None-Match: "rev-N"` validator based only
+on the last server-verified roster revision. The server first verifies the
+current signed guest ticket, canonical lobby ID, persisted room snapshot
+and membership **for every request**, then emits the non-secret
+`ETag: "rev-N"`. If the revision matches exactly it returns
+**304 Not Modified with no JSON body**; otherwise it returns the
+authorized roster as 200 with the new ETag. Malformed/multi-tag/wildcard
+validators never skip authorization or return false success.
+
+**Every response remains `Cache-Control: no-store`**, including 304.
+The browser never persists or shares ETags, invitations or rosters across
+tabs. A 304 is an in-memory no-op; it does not reset the 30-minute
+inactivity deadline (see #101), and cannot mask 401 guest revocation,
+404 absent/unauthorized lobby or 503 Redis unavailability. Manual
+refresh `GET /roster`, SignalR and user mutations retain their existing
+semantics and do not return 304 in response to conditional tags.
+This reduces unchanged roster response bytes, **not** server-side auth
+checks or Redis workload; matching a version is never access control.
+
+xUnit HTTP/real two-node Redis tests cover 304/200 on revision changes,
+no content/no-store, outsider/anonymous/error responses despite a matching
+validator and 30-minute idle expiry. Vitest and browser E2E cover request
+headers, null unchanged response, 401/404/503 behavior and absence of
+background writes. Match visibility/privacy rules (#9) remain separate.

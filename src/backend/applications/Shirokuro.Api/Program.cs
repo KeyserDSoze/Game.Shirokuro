@@ -612,6 +612,22 @@ static async Task<IResult> ServeGuestRosterAsync(
         var roster = heartbeat
             ? await lobby.ForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted)
             : await lobby.PeekForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted);
+        // A revision is merely a representation validator, never proof
+        // of guest identity or room membership. Both checks above MUST run
+        // before considering any conditional response.
+        if (!heartbeat)
+        {
+            var tag = "\"rev-" + roster.Revision.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) + "\"";
+            context.Response.Headers.ETag = tag;
+            // Only one exact, canonical strong tag is accepted. Invalid,
+            // wildcard or multi-tag values get a normal authorized 200.
+            // Keep Cache-Control: no-store even for an empty 304 response.
+            if (context.Request.Headers.IfNoneMatch.Count == 1 &&
+                string.Equals(context.Request.Headers.IfNoneMatch[0], tag,
+                    StringComparison.Ordinal))
+                return Results.StatusCode(StatusCodes.Status304NotModified);
+        }
         return Results.Ok(roster);
     }
     catch (Exception error) when (

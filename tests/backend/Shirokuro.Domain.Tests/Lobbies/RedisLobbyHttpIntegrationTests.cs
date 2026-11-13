@@ -175,6 +175,27 @@ public sealed class RedisLobbyHttpIntegrationTests
                     Assert.Equal(revision, data.RootElement.GetProperty("revision").GetInt64());
                 }
 
+                // Cross-node 304 still checks shared cookie/session and
+                // membership before suppressing any private roster JSON.
+                var passive = "/api/lobbies/" + sharedRoom + "/roster/peek";
+                using (var request = new HttpRequestMessage(HttpMethod.Get, passive))
+                {
+                    request.Headers.TryAddWithoutValidation(
+                        "If-None-Match", "\"rev-1\"");
+                    using var unchanged = await aliceB.SendAsync(request);
+                    Assert.Equal(HttpStatusCode.NotModified, unchanged.StatusCode);
+                    Assert.Equal("\"rev-1\"", unchanged.Headers.ETag?.Tag);
+                    Assert.Equal("no-store", unchanged.Headers.CacheControl?.ToString());
+                    Assert.Empty(await unchanged.Content.ReadAsByteArrayAsync());
+                }
+                using (var request = new HttpRequestMessage(HttpMethod.Get, passive))
+                {
+                    request.Headers.TryAddWithoutValidation(
+                        "If-None-Match", "\"rev-1\"");
+                    using var hidden = await bobB.SendAsync(request);
+                    Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
+                }
+
                 using (var outsiderRead = await bobB.GetAsync(
                     "/api/lobbies/" + sharedRoom + "/roster"))
                     Assert.Equal(HttpStatusCode.NotFound, outsiderRead.StatusCode);
@@ -193,6 +214,16 @@ public sealed class RedisLobbyHttpIntegrationTests
                     Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
                     using var j = JsonDocument.Parse(await joined.Content.ReadAsStringAsync());
                     Assert.Equal(2, j.RootElement.GetProperty("revision").GetInt64());
+                }
+                using (var request = new HttpRequestMessage(HttpMethod.Get, passive))
+                {
+                    request.Headers.TryAddWithoutValidation(
+                        "If-None-Match", "\"rev-1\"");
+                    using var changed = await aliceB.SendAsync(request);
+                    Assert.Equal(HttpStatusCode.OK, changed.StatusCode);
+                    Assert.Equal("\"rev-2\"", changed.Headers.ETag?.Tag);
+                    using var body = JsonDocument.Parse(await changed.Content.ReadAsStringAsync());
+                    Assert.Equal(2, body.RootElement.GetProperty("revision").GetInt64());
                 }
                 using (var pick = Write(HttpMethod.Patch,
                     "/api/lobbies/" + sharedRoom + "/hero",

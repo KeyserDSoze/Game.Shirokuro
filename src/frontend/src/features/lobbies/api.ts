@@ -73,8 +73,24 @@ export const guestLobbyApi = {
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/join', 'POST', { teamId }),
   read: (code: string) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/roster'),
-  peek: (code: string) =>
-    request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/roster/peek'),
+  // 304 is a successful *authorized* no-change result, not a network
+  // failure. The validator contains only the last verified room revision,
+  // never an invite, player ID, cookie or hidden match information.
+  peek: async (code: string, knownRevision?: number): Promise<LobbyRoster | null> => {
+    const room = parseInviteCode(code)
+    const tag = knownRevision !== undefined &&
+      Number.isSafeInteger(knownRevision) && knownRevision >= 0
+      ? { 'If-None-Match': '"rev-' + knownRevision + '"' } : {}
+    const response = await fetch('/api/lobbies/' + room + '/roster/peek', {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: tag,
+    })
+    if (response.status === 304) return null
+    if (!response.ok) throw new LobbyHttpError(response.status)
+    return response.json() as Promise<LobbyRoster>
+  },
   chooseHero: (code: string, heroId: string, expectedRevision: number) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/hero',
       'PATCH', { heroId, expectedRevision }),

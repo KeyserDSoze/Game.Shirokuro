@@ -105,7 +105,7 @@ describe('guest lobby client boundaries', () => {
       }),
     })
     vi.stubGlobal('fetch', mocked)
-    await guestLobbyApi.peek(roomCode)
+    await guestLobbyApi.peek(roomCode, 2)
     await guestLobbyApi.read(roomCode)
 
     expect(mocked.mock.calls[0][0])
@@ -117,11 +117,52 @@ describe('guest lobby client boundaries', () => {
       expect(request.credentials).toBe('include')
       expect(request.cache).toBe('no-store')
       expect(request.body).toBeUndefined()
-      expect(request.headers).toEqual({})
+      expect(request.headers).toEqual(
+        request === mocked.mock.calls[0][1]
+          ? { 'If-None-Match': '"rev-2"' } : {})
     }
-    expect(() => guestLobbyApi.peek('../bad')).toThrow()
+    await expect(guestLobbyApi.peek('../bad', 2)).rejects.toThrow(LobbyInputError)
     expect(mocked).toHaveBeenCalledTimes(2)
   })
+
+  it('handles 304 with no JSON parsing and preserves an already verified roster', async () => {
+    const json = vi.fn(() => { throw new Error('A 304 must not parse private JSON') })
+    const mocked = vi.fn().mockResolvedValue({ ok: false, status: 304, json })
+    vi.stubGlobal('fetch', mocked)
+    expect(await guestLobbyApi.peek(roomCode, 7)).toBeNull()
+    expect(json).not.toHaveBeenCalled()
+    expect(mocked).toHaveBeenCalledWith(
+      '/api/lobbies/' + roomCode + '/roster/peek',
+      expect.objectContaining({
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'include',
+        headers: { 'If-None-Match': '"rev-7"' },
+      }),
+    )
+  })
+
+  it.each([undefined, -1, 1.25, Number.NaN, Infinity, -Infinity])(
+    'ignores invalid/unavailable revision validators (%s) without losing full 200', async revision => {
+      const roster = { lobbyId: roomCode, revision: 4,
+        teamIds: ['white', 'black'], participants: [] }
+      const mocked = vi.fn().mockResolvedValue({
+        ok: true, status: 200, json: async () => roster,
+      })
+      vi.stubGlobal('fetch', mocked)
+      expect(await guestLobbyApi.peek(roomCode, revision)).toEqual(roster)
+      expect((mocked.mock.calls[0][1] as RequestInit).headers).toEqual({})
+    },
+  )
+
+  it.each([401, 403, 404, 429, 503])(
+    'does not turn a genuine passive poll %i failure into a false 304', async status => {
+      const mocked = vi.fn().mockResolvedValue({ ok: false, status })
+      vi.stubGlobal('fetch', mocked)
+      await expect(guestLobbyApi.peek(roomCode, 5))
+        .rejects.toMatchObject({ name: 'LobbyHttpError', status })
+    },
+  )
 
   it('sign-in performs no magic persistence or browser-side identity generation', async () => {
     const mocked = vi.fn().mockResolvedValue({

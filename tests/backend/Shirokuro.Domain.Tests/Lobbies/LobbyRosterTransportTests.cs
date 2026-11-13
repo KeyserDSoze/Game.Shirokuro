@@ -160,6 +160,24 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task FailedAuthorizedPassiveRosterCannotBecomeNotModifiedOnMatchingEtag()
+    {
+        var unavailable = new ContendedLobby();
+        using var server = CreateServer(unavailable);
+        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"/api/lobbies/{RoomA}/roster/peek");
+        request.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-3\"");
+        using var response = await alice.SendAsync(request);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        Assert.False(response.Headers.Contains("ETag"));
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        Assert.Equal(1, unavailable.Reads);
+    }
+
+    [Fact]
     public async Task ContendedSignalRRosterKeepsExistingOpaqueUnavailableError()
     {
         var contended = new ContendedLobby();

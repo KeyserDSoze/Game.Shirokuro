@@ -186,8 +186,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         currentRoomRef.current?.lobbyId === roomId
 
       try {
-        const latest = await guestLobbyApi.peek(roomId)
-        if (!stillCurrent()) return
+        const latest = await guestLobbyApi.peek(
+          roomId, currentRoomRef.current?.revision)
+        if (!stillCurrent() || latest === null) return
         const current = currentRoomRef.current!
         const result = reconcilePolledRoster(current, latest, actorId)
         if (result === 'updated') {

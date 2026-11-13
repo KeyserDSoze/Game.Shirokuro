@@ -522,7 +522,7 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
 })
 
 test('auto-sync retains private view on 503, clears room on 404 and guest on 401 without writes', async ({ page }) => {
-  test.setTimeout(85_000)
+  test.setTimeout(100_000)
   const code = 'room-' + 'e'.repeat(32)
   const playerId = 'guest-browser-poll'
   const roster = {
@@ -550,15 +550,19 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
     await route.fulfill({ status: 201, json: roster })
   })
 
-  let status = 503
+  // Exercise 304 (unchanged), 503 (temporary outage), 404 (room lost),
+  // and 401 (revoked identity) without minting additional real guests.
+  let status = 304
   let reads = 0
+  const validators: (string | undefined)[] = []
   await page.route('**/api/lobbies/' + code + '/roster/peek', async route => {
     if (route.request().method() !== 'GET') return route.continue()
     reads++
+    validators.push(route.request().headers()['if-none-match'])
     await route.fulfill({
       status,
-      headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' },
-      body: '{}',
+      headers: { 'Cache-Control': 'no-store' },
+      ...(status === 304 ? {} : { body: '{}', contentType: 'application/json' }),
     })
   })
   await page.goto('/')
@@ -573,13 +577,20 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
   })
 
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(1)
+  expect(validators[0]).toBe('"rev-1"')
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)
   await expect(page.getByTestId('lobby-message')).not.toContainText('scaduta')
   expect(mutations).toEqual([])
 
-  status = 404
+  status = 503
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(2)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  expect(validators[1]).toBe('"rev-1"')
+  expect(mutations).toEqual([])
+
+  status = 404
+  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(3)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-create')).toBeVisible()
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)
@@ -592,7 +603,7 @@ test('auto-sync retains private view on 503, clears room on 404 and guest on 401
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   mutations.length = 0
   status = 401
-  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(3)
+  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(4)
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-player')).toHaveCount(0)

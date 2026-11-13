@@ -133,6 +133,139 @@ public sealed class GuestLobbyHttpTests
     }
 
     [Fact]
+    public async Task ConditionalPassiveRosterOnlyReturns304AfterMemberAuthorization()
+    {
+        var clock = new ManualClock();
+        using var server = ServerWithClock(clock);
+        using var ownerVisitor = Client(server);
+        var (_, ownerCookie) = await SignIn(ownerVisitor);
+        using var owner = Client(server, ownerCookie);
+        var (room, revision) = await Create(owner);
+        var path = "/api/lobbies/" + room + "/roster/peek";
+        var tag = "\"rev-" + revision + "\"";
+
+        using (var first = await owner.GetAsync(path))
+        {
+            Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+            Assert.Equal(tag, first.Headers.ETag?.Tag);
+            Assert.Equal("no-store", first.Headers.CacheControl?.ToString());
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", tag);
+            using var unchanged = await owner.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotModified, unchanged.StatusCode);
+            Assert.Equal(tag, unchanged.Headers.ETag?.Tag);
+            Assert.Equal("no-store", unchanged.Headers.CacheControl?.ToString());
+            Assert.Empty(await unchanged.Content.ReadAsByteArrayAsync());
+            Assert.False(unchanged.Headers.Contains("Set-Cookie"));
+        }
+
+        // Matching ETag is NOT an authorization credential.
+        using (var anonymous = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            anonymous.Headers.TryAddWithoutValidation("If-None-Match", tag);
+            using var denied = await ownerVisitor.SendAsync(anonymous);
+            Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+        }
+        using var strangerVisitor = Client(server);
+        var (_, outsiderCookie) = await SignIn(strangerVisitor);
+        using var stranger = Client(server, outsiderCookie);
+        using (var outsider = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            outsider.Headers.TryAddWithoutValidation("If-None-Match", tag);
+            using var hidden = await stranger.SendAsync(outsider);
+            Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
+            Assert.Equal("no-store", hidden.Headers.CacheControl?.ToString());
+        }
+
+        // Even repeated legitimate 304 replies do NOT refresh inactivity.
+        clock.Advance(TimeSpan.FromMinutes(29));
+        using (var request = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", tag);
+            using var stillOpen = await owner.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotModified, stillOpen.StatusCode);
+        }
+        clock.Advance(TimeSpan.FromMinutes(1));
+        using (var request = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", tag);
+            using var expired = await owner.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
+            Assert.NotEqual(HttpStatusCode.NotModified, expired.StatusCode);
+        }
+    }
+
+    [Theory]
+    [InlineData("*")]
+    [InlineData("W/\"rev-1\"")]
+    [InlineData("\"rev-0\"")]
+    [InlineData("\"rev-1\", \"rev-2\"")]
+    [InlineData("\"REV-1\"")]
+    public async Task NonCanonicalConditionalRosterValidatorStillReturns200(
+        string value)
+    {
+        using var server = Server();
+        using var visitor = Client(server);
+        var (_, cookie) = await SignIn(visitor);
+        using var owner = Client(server, cookie);
+        var (room, _) = await Create(owner);
+        var path = "/api/lobbies/" + room + "/roster/peek";
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, path);
+        request.Headers.TryAddWithoutValidation("If-None-Match", value);
+        using var result = await owner.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+        Assert.Equal("\"rev-1\"", result.Headers.ETag?.Tag);
+        using var body = JsonDocument.Parse(await result.Content.ReadAsStringAsync());
+        Assert.Equal(1, body.RootElement.GetProperty("revision").GetInt64());
+    }
+
+    [Fact]
+    public async Task NewServerRosterRevisionInvalidatesOldPassiveValidator()
+    {
+        using var server = Server();
+        using var firstVisitor = Client(server);
+        using var secondVisitor = Client(server);
+        var (_, aliceCookie) = await SignIn(firstVisitor);
+        var (_, bobCookie) = await SignIn(secondVisitor);
+        using var alice = Client(server, aliceCookie);
+        using var bob = Client(server, bobCookie);
+        var (room, _) = await Create(alice);
+        var path = "/api/lobbies/" + room + "/roster/peek";
+
+        using (var join = Write(HttpMethod.Post, "/api/lobbies/" + room + "/join",
+            new { teamId = "black", expectedRevision = 1 }))
+        using (var joined = await bob.SendAsync(join))
+            Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-1\"");
+            using var fresh = await alice.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, fresh.StatusCode);
+            Assert.Equal("\"rev-2\"", fresh.Headers.ETag?.Tag);
+            using var body = JsonDocument.Parse(await fresh.Content.ReadAsStringAsync());
+            Assert.Equal(2, body.RootElement.GetProperty("revision").GetInt64());
+            Assert.Equal(2, body.RootElement.GetProperty("participants").GetArrayLength());
+        }
+        using (var manual = new HttpRequestMessage(HttpMethod.Get,
+            "/api/lobbies/" + room + "/roster"))
+        {
+            manual.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-2\"");
+            using var full = await alice.SendAsync(manual);
+            Assert.Equal(HttpStatusCode.OK, full.StatusCode);
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Get, path))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-2\"");
+            using var unchanged = await alice.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotModified, unchanged.StatusCode);
+        }
+    }
+
+    [Fact]
     public async Task PassiveAuthenticatedPollNeverExtendsThirtyMinuteIdleExpiry()
     {
         var clock = new ManualClock();
