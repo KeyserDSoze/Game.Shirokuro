@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  guestLobbyApi, LobbyHttpError, LobbyInputError, parseInviteCode, parseTeamIds,
+  guestLobbyApi, LobbyHttpError, LobbyInputError,
+  parseCurrentSession, parseGuestSession, parseInviteCode, parseTeamIds,
 } from './api'
 
 const roomCode = 'room-' + 'a'.repeat(32)
+const canonicalGuest = 'guest-' + 'b'.repeat(32)
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -193,14 +195,71 @@ describe('guest lobby client boundaries', () => {
     expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeUndefined()
   })
 
+  it('accepts only server-shaped canonical guest identity envelopes', () => {
+    expect(parseCurrentSession({ playerId: canonicalGuest, kind: 'guest' }))
+      .toEqual({ playerId: canonicalGuest, kind: 'guest' })
+    expect(parseGuestSession({ playerId: canonicalGuest, kind: 'guest' }))
+      .toEqual({ playerId: canonicalGuest, kind: 'guest' })
+    expect(parseCurrentSession({ playerId: 'account-id', kind: 'other' }))
+      .toEqual({ playerId: 'account-id', kind: 'other' })
+    expect(() => parseGuestSession({ playerId: 'account-id', kind: 'other' }))
+      .toThrow('Not a guest session')
+  })
+
+  it.each([
+    ['null body', null],
+    ['array body', []],
+    ['empty body', {}],
+    ['missing playerId', { kind: 'guest' }],
+    ['missing kind', { playerId: canonicalGuest }],
+    ['blank id', { playerId: '', kind: 'guest' }],
+    ['wrong type', { playerId: { id: canonicalGuest }, kind: 'guest' }],
+    ['foreign id', { playerId: 'guest-unrelated', kind: 'guest' }],
+    ['uppercase id', { playerId: 'guest-' + 'A'.repeat(32), kind: 'guest' }],
+    ['extra private field', { playerId: canonicalGuest, kind: 'guest', sessionToken: 'secret' }],
+    ['unknown kind', { playerId: canonicalGuest, kind: 'admin' }],
+    ['array playerId', { playerId: [canonicalGuest], kind: 'guest' }],
+    ['other missing playerId', { kind: 'other' }],
+    ['other whitespace playerId', { playerId: ' ', kind: 'other' }],
+    ['other extra field', { playerId: 'account-id', kind: 'other', secret: 'hidden' }],
+  ])('rejects %s without inventing a guest or revocation', (_reason, payload) => {
+    expect(() => parseCurrentSession(payload)).toThrow('Invalid session envelope')
+    expect(() => parseGuestSession(payload)).toThrow('Invalid session envelope')
+  })
+
+  it('rejects malformed HTTP 200 responses without pretending they are 401', async () => {
+    const mocked = vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: async () => ({ kind: 'guest', playerId: null }),
+    })
+    vi.stubGlobal('fetch', mocked)
+    await expect(guestLobbyApi.session())
+      .rejects.toThrow('Invalid session envelope')
+    await expect(guestLobbyApi.signIn())
+      .rejects.toThrow('Invalid session envelope')
+    expect(mocked).toHaveBeenCalledTimes(2)
+    expect((mocked.mock.calls[0][1] as RequestInit).method).toBe('GET')
+    expect((mocked.mock.calls[1][1] as RequestInit).method).toBe('POST')
+  })
+
+  it('keeps malformed JSON separate from an actual HTTP 401', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: async () => { throw new SyntaxError('bad JSON') },
+    }))
+    await expect(guestLobbyApi.session()).rejects.toBeInstanceOf(SyntaxError)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }))
+    await expect(guestLobbyApi.session()).rejects.toMatchObject({
+      name: 'LobbyHttpError', status: 401,
+    })
+  })
+
   it('sign-in performs no magic persistence or browser-side identity generation', async () => {
     const mocked = vi.fn().mockResolvedValue({
       ok: true, status: 200,
-      json: async () => ({ playerId: 'guest-from-server', kind: 'guest' }),
+      json: async () => ({ playerId: canonicalGuest, kind: 'guest' }),
     })
     vi.stubGlobal('fetch', mocked)
     const session = await guestLobbyApi.signIn()
-    expect(session.playerId).toBe('guest-from-server')
+    expect(session.playerId).toBe(canonicalGuest)
     expect(mocked.mock.calls[0][0]).toBe('/api/sessions/guest')
     expect((mocked.mock.calls[0][1] as RequestInit).body).toBeUndefined()
   })

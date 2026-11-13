@@ -158,6 +158,84 @@ test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ 
   await expect(page.getByTestId('world-stage')).toBeVisible()
 })
 
+test('malformed 200 session envelopes never create a guest or revoke a verified lobby', async ({ page }) => {
+  const code = 'room-' + 'c'.repeat(32)
+  const playerId = 'guest-' + 'c'.repeat(32)
+  const roster = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId, teamId: 'white', heroId: null }],
+  }
+
+  // Mock the boundary without consuming shared Development guest quotas.
+  let signedIn = false
+  let validIssuance = false
+  let meResponse: unknown = { playerId, kind: 'guest' }
+  let sessionReads = 0
+  let guestPosts = 0
+  let roomCreates = 0
+  await page.route('**/api/sessions/me', async route => {
+    sessionReads++
+    await route.fulfill(signedIn
+      ? { status: 200, json: meResponse }
+      : { status: 401 })
+  })
+  await page.route('**/api/sessions/guest', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    guestPosts++
+    signedIn = true
+    await route.fulfill({ status: 200, json: validIssuance
+      ? { playerId, kind: 'guest' }
+      : { playerId: { forged: playerId }, kind: 'guest', sessionToken: 'private' } })
+  })
+  await page.route('**/api/lobbies', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    roomCreates++
+    await route.fulfill({ status: 201, json: roster })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-create')).toHaveCount(0)
+  expect(roomCreates).toBe(0)
+  expect(guestPosts).toBe(1)
+
+  validIssuance = true
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  const existingRoster = await page.getByTestId('lobby-roster').textContent()
+  expect(roomCreates).toBe(1)
+
+  // A bad /me envelope after focus is not a confirmed 401.
+  meResponse = { playerId: 'guest-unrelated', kind: 'guest', privatePath: 'hidden' }
+  const before = sessionReads
+  const refresh = page.waitForResponse(response =>
+    response.url().endsWith('/api/sessions/me') && response.status() === 200)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await refresh
+  await expect.poll(() => sessionReads).toBeGreaterThan(before)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+  await expect(page.getByTestId('lobby-roster')).toHaveText(existingRoster!)
+  expect(guestPosts).toBe(2)
+  expect(roomCreates).toBe(1)
+
+  // An explicit, valid non-guest session remains a genuine identity change.
+  meResponse = { playerId: 'account-id', kind: 'other' }
+  const recheck = page.waitForResponse(response =>
+    response.url().endsWith('/api/sessions/me') && response.status() === 200)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await recheck
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+  expect(guestPosts).toBe(2)
+  expect(roomCreates).toBe(1)
+})
+
 test('malformed invitation is rejected locally and does not trigger a join request', async ({ page }) => {
   const joined: string[] = []
   page.on('request', request => {
@@ -564,7 +642,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   // sequence; subsequent 503 now correctly escalates to 60s rather than 30s.
   test.setTimeout(195_000)
   const code = 'room-' + 'e'.repeat(32)
-  const playerId = 'guest-browser-poll'
+  const playerId = 'guest-' + 'e'.repeat(32)
   const roster = {
     lobbyId: code, revision: 1, teamIds: ['white', 'black'],
     participants: [{ playerId, teamId: 'white', heroId: null }],
@@ -679,7 +757,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
 test('an explicit pre-match action aborts a stalled passive GET without revoking the guest', async ({ page }) => {
   test.setTimeout(45_000)
   const code = 'room-' + 'd'.repeat(32)
-  const playerId = 'guest-cancelled-poll'
+  const playerId = 'guest-' + 'd'.repeat(32)
   const roster = {
     lobbyId: code, revision: 1, teamIds: ['white', 'black'],
     participants: [{ playerId, teamId: 'white', heroId: null }],

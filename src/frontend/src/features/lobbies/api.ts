@@ -1,5 +1,37 @@
 /** Pre-match data only; game positions and planned moves are never exposed. */
 export type GuestSession = Readonly<{ playerId: string; kind: 'guest' }>
+/** A signed non-guest identity cannot be adopted as a guest session. */
+export type CurrentSession = GuestSession | Readonly<{ playerId: string; kind: 'other' }>
+
+/**
+ * HTTP 200 is not proof of a guest identity: the server issues 128-bit,
+ * lowercase-hex guest IDs. Malformed JSON must not become a new actor or
+ * be mistaken for a confirmed HTTP 401 session revocation.
+ */
+export function parseCurrentSession(payload: unknown): CurrentSession {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('Invalid session envelope')
+  const data = payload as Record<string, unknown>
+  if (Object.keys(data).length !== 2 ||
+      !Object.prototype.hasOwnProperty.call(data, 'kind') ||
+      !Object.prototype.hasOwnProperty.call(data, 'playerId') ||
+      typeof data.playerId !== 'string' || data.playerId.length === 0)
+    throw new Error('Invalid session envelope')
+
+  if (data.kind === 'guest' && /^guest-[0-9a-f]{32}$/.test(data.playerId))
+    return { kind: 'guest', playerId: data.playerId }
+  // A well-formed non-guest session still clears an obsolete guest in the
+  // existing recheck logic, but it must never masquerade as a guest.
+  if (data.kind === 'other' && data.playerId.trim() === data.playerId)
+    return { kind: 'other', playerId: data.playerId }
+  throw new Error('Invalid session envelope')
+}
+
+export function parseGuestSession(payload: unknown): GuestSession {
+  const session = parseCurrentSession(payload)
+  if (session.kind !== 'guest') throw new Error('Not a guest session')
+  return session
+}
 export type LobbyParticipant = Readonly<{
   playerId: string
   teamId: string
@@ -64,8 +96,11 @@ async function request<T>(path: string, method = 'GET', body?: object): Promise<
 }
 
 export const guestLobbyApi = {
-  session: () => request<GuestSession>('/sessions/me'),
-  signIn: () => request<GuestSession>('/sessions/guest', 'POST'),
+  // Decode at the boundary; a forged/corrupted 200 never replaces identity.
+  session: async (): Promise<CurrentSession> =>
+    parseCurrentSession(await request<unknown>('/sessions/me')),
+  signIn: async (): Promise<GuestSession> =>
+    parseGuestSession(await request<unknown>('/sessions/guest', 'POST')),
   signOut: () => request<void>('/sessions/guest', 'DELETE'),
   create: (teamIds: readonly string[], teamId: string) =>
     request<LobbyRoster>('/lobbies', 'POST', { teamIds, teamId }),
