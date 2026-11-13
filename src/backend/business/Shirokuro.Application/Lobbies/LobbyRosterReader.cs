@@ -30,7 +30,6 @@ public sealed class LobbyRosterReader(InMemoryLobbyCoordinator coordinator)
                     participant.PlayerId,
                     participant.TeamId,
                     participant.HeroId)).ToArray()));
-    }
 }
 
 
