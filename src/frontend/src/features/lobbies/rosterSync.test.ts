@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { LobbyRoster } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
-  classifyRosterPollFailure, reconcilePolledRoster, rosterPollDelayMs,
+  classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -97,5 +97,40 @@ describe('pre-match authenticated lobby polling', () => {
     for (const code of [undefined, 0, 400, 403, 409, 429, 502, 503, 504]) {
       expect(classifyRosterPollFailure(code)).toBe('retain')
     }
+  })
+})
+
+describe('explicit authenticated roster adoption (#110)', () => {
+  it('accepts a valid member-scoped roster with correct room and revision', () => {
+    expect(isVerifiedLobbyRoster(roster(4), alice.playerId, lobbyId, 4)).toBe(true)
+    expect(isVerifiedLobbyRoster(roster(4), bob.playerId)).toBe(true)
+  })
+
+  it.each([
+    ['null', null],
+    ['array', []],
+    ['wrong room', { ...roster(8), lobbyId: otherId }],
+    ['invalid invite', { ...roster(8), lobbyId: 'room-injected' }],
+    ['fractional revision', { ...roster(8), revision: 1.5 }],
+    ['negative revision', { ...roster(8), revision: -1 }],
+    ['single team', { ...roster(8), teamIds: ['white'] }],
+    ['duplicate team', { ...roster(8), teamIds: ['white', 'white'] }],
+    ['missing actor', roster(8, [bob])],
+    ['duplicate player', roster(8, [alice, alice])],
+    ['unknown team', roster(8, [{ ...alice, teamId: 'other' }])],
+    ['null participant', { ...roster(8), participants: [null] }],
+    ['missing hero', { ...roster(8), participants: [{ playerId: alice.playerId, teamId: 'white' }] }],
+    ['extra private field', { ...roster(8), secretRoute: 'hidden' }],
+    ['extra player field', { ...roster(8), participants: [{ ...alice, destination: 'hidden' }] }],
+    ['too many members', roster(8, Array.from({ length: 17 }, (_, i) =>
+      ({ playerId: 'guest-' + i, teamId: 'white', heroId: null })))],
+  ])('rejects %s rather than importing an invalid 200', (_kind, payload) => {
+    expect(isVerifiedLobbyRoster(payload, alice.playerId, lobbyId, 1)).toBe(false)
+  })
+
+  it('does not accept wrong requested room, stale revision or other identity', () => {
+    expect(isVerifiedLobbyRoster(roster(4), alice.playerId, otherId)).toBe(false)
+    expect(isVerifiedLobbyRoster(roster(4), alice.playerId, lobbyId, 5)).toBe(false)
+    expect(isVerifiedLobbyRoster(roster(4), 'guest-unknown')).toBe(false)
   })
 })

@@ -496,6 +496,32 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-message')).toContainText('Squadra aggiornata')
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
 
+  // A 200 misrouted to another room, missing our member or containing private
+  // unknown fields must never replace the currently verified roster (#110).
+  const verifiedResponse = await page.request.get('/api/lobbies/' + existingRoom + '/roster')
+  expect(verifiedResponse.status()).toBe(200)
+  const verified = await verifiedResponse.json()
+  const priorView = await page.getByTestId('lobby-roster').textContent()
+  const priorRevision = await page.getByTestId('lobby-revision').textContent()
+  let invalidPayload: unknown = null
+  await page.route('**/api/lobbies/' + existingRoom + '/roster', async route =>
+    route.fulfill({ status: 200, json: invalidPayload }))
+  for (const response of [
+    { ...verified, lobbyId: 'room-' + 'f'.repeat(32), revision: verified.revision + 20 },
+    { ...verified, participants: [{ playerId: 'guest-unrelated', teamId: 'white', heroId: null }] },
+    { ...verified, participants: [null] },
+    { ...verified, secretRoute: 'should-not-be-imported' },
+    { ...verified, revision: 0 },
+  ]) {
+    invalidPayload = response
+    await page.getByTestId('lobby-refresh').click()
+    await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(existingRoom)
+    await expect(page.getByTestId('lobby-revision')).toHaveText(priorRevision!)
+    await expect(page.getByTestId('lobby-roster')).toHaveText(priorView!)
+  }
+  await page.unroute('**/api/lobbies/' + existingRoom + '/roster')
+
   // After a 409, an unavailable roster read must not retry the mutation or
   // fabricate a new revision. Avoid extra guest logins in parallel E2E.
   responseStatus = 409

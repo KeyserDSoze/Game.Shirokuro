@@ -9,7 +9,7 @@ import {
 } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyRosterPollFailure,
-  reconcilePolledRoster, rosterPollDelayMs,
+  isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 type Props = { previewHeroId: string }
@@ -309,7 +309,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
               setMessage(t('lobbyMissing'))
               return
             }
-            showRoom(latest)
+            showRoom(latest, conflictRoomId)
             setMessage(t('lobbyConflictRefreshed'))
             return
           } catch (refreshError) {
@@ -357,7 +357,14 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
   }
 
-  function showRoom(next: LobbyRoster) {
+  function showRoom(next: LobbyRoster, expectedRoomId?: string) {
+    // Explicit 200 responses must not adopt foreign or malformed rosters (#110).
+    const previous = currentRoomRef.current
+    const minRevision = previous?.lobbyId === next?.lobbyId
+      ? previous.revision : undefined
+    if (!session || !isVerifiedLobbyRoster(
+      next, session.playerId, expectedRoomId, minRevision,
+    )) throw new Error('Invalid authenticated lobby roster response')
     // A stale passive response must never see a previous room as current
     // between a confirmed user action and the next React effect (#109).
     currentRoomRef.current = next
@@ -482,9 +489,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     data-testid="lobby-join"
                     disabled={busy}
                     onClick={() => void run(async isCurrent => {
-                      const result = await guestLobbyApi.join(parseInviteCode(invite), invitedTeam.trim())
+                      const code = parseInviteCode(invite)
+                      const result = await guestLobbyApi.join(code, invitedTeam.trim())
                       if (!isCurrent()) return
-                      showRoom(result)
+                      showRoom(result, code)
                       setMessage(t('lobbyJoined'))
                     })}
                   >
@@ -531,7 +539,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   onClick={() => void run(async isCurrent => {
                     const result = await guestLobbyApi.read(room.lobbyId)
                     if (!isCurrent()) return
-                    showRoom(result)
+                    showRoom(result, room.lobbyId)
                     setMessage(t('lobbyRefreshed'))
                   })}
                 >
@@ -545,7 +553,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     const result = await guestLobbyApi.chooseHero(
                       room.lobbyId, previewHeroId, room.revision)
                     if (!isCurrent()) return
-                    showRoom(result)
+                    showRoom(result, room.lobbyId)
                     setMessage(t('lobbyHeroSaved', { name: hero?.name ?? previewHeroId }))
                   })}
                 >
@@ -572,7 +580,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     const result = await guestLobbyApi.changeTeam(
                       room.lobbyId, newTeam, room.revision)
                     if (!isCurrent()) return
-                    showRoom(result)
+                    showRoom(result, room.lobbyId)
                     setMessage(t('lobbyTeamSaved'))
                   })}
                 >

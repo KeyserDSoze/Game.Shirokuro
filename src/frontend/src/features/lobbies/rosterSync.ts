@@ -52,6 +52,54 @@ export function reconcilePolledRoster(
   return incoming.revision > current.revision ? 'updated' : 'unchanged'
 }
 
+/**
+ * Validate explicit pre-match responses before putting them into the UI.
+ * Server authentication remains authoritative; a 200 alone is not permission
+ * to import an unrelated, stale or malformed private roster.
+ */
+export function isVerifiedLobbyRoster(
+  payload: unknown, actorId: string, expectedRoomId?: string,
+  minimumRevision?: number,
+): payload is LobbyRoster {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      typeof actorId !== 'string' || actorId.length === 0) return false
+  const data = payload as Record<string, unknown>
+  const keys = ['lobbyId', 'revision', 'teamIds', 'participants']
+  if (Object.keys(data).length !== keys.length ||
+      keys.some(key => !Object.prototype.hasOwnProperty.call(data, key)) ||
+      typeof data.lobbyId !== 'string' ||
+      !/^room-[0-9a-f]{32}$/.test(data.lobbyId) ||
+      (expectedRoomId !== undefined && data.lobbyId !== expectedRoomId) ||
+      typeof data.revision !== 'number' ||
+      !Number.isSafeInteger(data.revision) || data.revision < 0 ||
+      (minimumRevision !== undefined && data.revision < minimumRevision) ||
+      !Array.isArray(data.teamIds) ||
+      data.teamIds.length < 2 || data.teamIds.length > 4 ||
+      !data.teamIds.every((team: unknown) =>
+        typeof team === 'string' && /^[a-z0-9-]{1,24}$/.test(team)) ||
+      new Set(data.teamIds).size !== data.teamIds.length ||
+      !Array.isArray(data.participants) ||
+      data.participants.length < 1 || data.participants.length > 16) return false
+
+  const seen = new Set<string>()
+  for (const entry of data.participants) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+    const player = entry as Record<string, unknown>
+    if (Object.keys(player).length !== 3 ||
+        !['playerId', 'teamId', 'heroId'].every(key =>
+          Object.prototype.hasOwnProperty.call(player, key)) ||
+        typeof player.playerId !== 'string' || player.playerId.length === 0 ||
+        seen.has(player.playerId) ||
+        typeof player.teamId !== 'string' ||
+        !data.teamIds.includes(player.teamId) ||
+        (player.heroId !== null &&
+          (typeof player.heroId !== 'string' || player.heroId.length === 0)))
+      return false
+    seen.add(player.playerId)
+  }
+  return seen.has(actorId)
+}
+
 /** 401 and 404 are authoritative; transient failures keep the last roster. */
 export function classifyRosterPollFailure(
   status: number | undefined,

@@ -137,3 +137,8 @@ GitHub Issues remain the source of detailed truth. This file is a compact index.
 ### Esito CI implementativa e verifiche cross-issue #108 + #109
 
 - [CI implementativa #43457491125](https://github.com/KeyserDSo/Game.Shirokuro/actions/runs/43457491125) **SUCCESS** su [`3e06c52`](https://github.com/KeyserDSoze/Game.Shirokuro/commit/3e06c52f13664977f9f68fb058c9f5d2b6a59f4d): **629/629 xUnit .NET10 standard**, **18/18 test Redis TLS/ACL/rotazione/RDB/replica/Sentinel**, **157/157 Vitest**, **31/31 Playwright senza flaky o retry**, **35/35 Python**, build .NET/frontend, zero errori/skip. Il parser #108 accetta lo `connected_slaves:0` reale della replica e rifiuta gli INFO primari/ruoli invalidi; il test #109 osserva la GET prima della mutazione, verifica `DELETE 204` e invalida subito il riferimento stanza dopo leave. Le CI diagnostiche fallite e i due flaky precedenti sono documentati nelle issue, con correzioni collegate. Resta da verificare CI sull'ultimo commit documentale prima di chiudere #108 e #109; la parent #21 rimane aperta.
+
+
+## Validazione risposte roster #110 — 13/11/2026
+
+- [Issue #110](https://github.com/KeyserDSoze/Game.Shirokuro/issues/110), follow-up #21/#109: il frontend valida forma del DTO roster esplicito, membership dell'ospite, stanza attesa, revisione monotona, coerenza squadre/partecipanti e assenza di proprietà inattese prima di adottare un HTTP 200 da create/join/refresh/hero/team. Un 200 malformato conserva lo stato privato già verificato e segnala indisponibilità senza re-login o replay del comando. Nuovi Vitest e Playwright con risposte 200 simulate su una sessione reale; chiusura soltanto dopo verifica della CI su main HEAD, stato definitivo nell'issue.
