@@ -385,6 +385,16 @@ public sealed class RedisLobbyCommandTimeoutTests
     {
         public RedisValue[] Members { get; set; } = [];
         public byte[]? Raw { get; set; }
+        public Dictionary<string, byte[]?>? RawByKey { get; set; }
+        public bool HoldReads { get; set; }
+        public TaskCompletionSource<bool> InitialWindowFilled { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleaseReads { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _inFlightReads;
+        private int _maxInFlightReads;
+        public int InFlightReads => Volatile.Read(ref _inFlightReads);
+        public int MaxInFlightReads => Volatile.Read(ref _maxInFlightReads);
         public List<string> ReadKeys { get; } = [];
         public int Writes { get; private set; }
         public int ScanCalls { get; private set; }
@@ -431,20 +441,43 @@ public sealed class RedisLobbyCommandTimeoutTests
             return Task.FromResult(RedisResult.Create(bounded));
         }
 
-        private Task<RedisResult> Read(object?[]? args)
+        private async Task<RedisResult> Read(object?[]? args)
         {
             var script = Assert.IsType<string>(args![0]);
             Assert.Contains("if #raw > tonumber(ARGV[1])", script,
                 StringComparison.Ordinal);
             var keys = Assert.IsType<RedisKey[]>(args[1]);
-            ReadKeys.Add(Assert.Single(keys).ToString());
+            var key = Assert.Single(keys).ToString();
+            ReadKeys.Add(key);
             var limit = Assert.IsType<RedisValue[]>(args[2]);
             Assert.Equal(RedisLobbySnapshotCodec.MaxBytes, (long)Assert.Single(limit));
-            return Task.FromResult(Raw is null
-                ? RedisResult.Create(RedisValue.Null, ResultType.BulkString)
-                : RedisResult.Create((RedisValue)(Raw.Length >
-                    RedisLobbySnapshotCodec.MaxBytes ? [] : Raw),
-                    ResultType.BulkString));
+            var inFlight = Interlocked.Increment(ref _inFlightReads);
+            // Concurrent reads race the maximum counter, not the key list.
+            int previous;
+            do
+            {
+                previous = Volatile.Read(ref _maxInFlightReads);
+            } while (inFlight > previous &&
+                     Interlocked.CompareExchange(
+                         ref _maxInFlightReads, inFlight, previous) != previous);
+            if (inFlight == 8)
+                InitialWindowFilled.TrySetResult(true);
+            try
+            {
+                if (HoldReads)
+                    await ReleaseReads.Task;
+                var bytes = RawByKey is null ? Raw :
+                    RawByKey.TryGetValue(key, out var value) ? value : null;
+                return bytes is null
+                    ? RedisResult.Create(RedisValue.Null, ResultType.BulkString)
+                    : RedisResult.Create((RedisValue)(bytes.Length >
+                        RedisLobbySnapshotCodec.MaxBytes ? [] : bytes),
+                        ResultType.BulkString);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlightReads);
+            }
         }
 
         private object RejectWrite()
@@ -506,6 +539,101 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.Equal(0L, fixture.ScanStart);
         Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ScanStop);
         Assert.Equal(GuestLobbyCommands.MaxRooms, fixture.ReadKeys.Count);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+
+    [Fact]
+    public async Task IndexedRoomReadsUseAtMostEightConcurrentRedisCommands()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = Enumerable.Range(0, 19)
+            .Select(i => (RedisValue)IndexedKeyForRoom("room-" + i))
+            .ToArray();
+        fixture.HoldReads = true;
+        fixture.Raw = null; // Expired Redis keys remain harmless omissions.
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var pending = store.GetIndexedRoomsAsync();
+        try
+        {
+            // The first window can be launched without waiting on any GET.
+            await fixture.InitialWindowFilled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(8, fixture.InFlightReads);
+            Assert.Equal(8, fixture.ReadKeys.Count);
+            Assert.False(pending.IsCompleted);
+        }
+        finally
+        {
+            fixture.ReleaseReads.TrySetResult(true);
+        }
+        Assert.Empty(await pending.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(19, fixture.ReadKeys.Count);
+        Assert.Equal(fixture.Members.Select(x => x.ToString()), fixture.ReadKeys);
+        Assert.Equal(8, fixture.MaxInFlightReads);
+        Assert.Equal(0, fixture.InFlightReads);
+        Assert.Equal(1, fixture.ScanCalls);
+        Assert.Equal(0, fixture.Writes);
+    }
+
+    [Fact]
+    public async Task CancelledAdministrativeReadCannotScheduleLaterWindows()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        fixture.Members = Enumerable.Range(0, 20)
+            .Select(i => (RedisValue)IndexedKeyForRoom("room-" + i))
+            .ToArray();
+        fixture.HoldReads = true;
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        using var cancellation = new CancellationTokenSource();
+        var pending = store.GetIndexedRoomsAsync(cancellation.Token);
+        try
+        {
+            await fixture.InitialWindowFilled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+            Assert.Equal(8, fixture.ReadKeys.Count);
+            Assert.Equal(8, fixture.MaxInFlightReads);
+            Assert.Equal(0, fixture.Writes);
+        }
+        finally
+        {
+            fixture.ReleaseReads.TrySetResult(true);
+        }
+    }
+
+    [Fact]
+    public async Task IndexedScanKeepsOrderAndFailsClosedForCorruptLastWindow()
+    {
+        var database = DispatchProxy.Create<IDatabase, IndexedRoomDatabase>();
+        var fixture = (IndexedRoomDatabase)(object)database;
+        var rooms = Enumerable.Range(0, 19).Select(_ => ValidIndexedRoom())
+            .ToArray();
+        fixture.Members = rooms.Select(room =>
+            (RedisValue)IndexedKeyForRoom(room.RoomId)).ToArray();
+        fixture.RawByKey = rooms.ToDictionary(room => IndexedKeyForRoom(room.RoomId),
+            room => (byte[]?)room.Encoded);
+        // The middle room expired after index enumeration; the caller
+        // receives only the surviving rooms, in index order.
+        fixture.RawByKey[IndexedKeyForRoom(rooms[4].RoomId)] = null;
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var verified = await store.GetIndexedRoomsAsync();
+        Assert.Equal(rooms.Where((_, i) => i != 4).Select(x => x.RoomId),
+            verified.Select(x => x.Snapshot.State.Definition.LobbyId));
+        Assert.Equal(19, fixture.ReadKeys.Count);
+        Assert.Equal(8, fixture.MaxInFlightReads);
+
+        // A later corrupted snapshot invalidates the entire scan, not just
+        // the last room. The caller cannot perform partial cleanup.
+        fixture.ReadKeys.Clear();
+        fixture.RawByKey[IndexedKeyForRoom(rooms[18].RoomId)] =
+            new byte[RedisLobbySnapshotCodec.MaxBytes + 1];
+        var error = await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(
+            () => store.GetIndexedRoomsAsync());
+        Assert.Null(error.InnerException);
+        Assert.DoesNotContain(rooms[18].RoomId, error.Message);
+        Assert.Equal(19, fixture.ReadKeys.Count);
         Assert.Equal(0, fixture.Writes);
     }
 

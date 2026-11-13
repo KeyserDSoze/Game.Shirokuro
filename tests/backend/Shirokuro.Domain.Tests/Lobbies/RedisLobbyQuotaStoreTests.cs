@@ -45,6 +45,75 @@ public sealed class RedisLobbyQuotaStoreTests
         new(redis.GetDatabase(), clock, timeout, ns);
 
 
+
+    [Fact]
+    public async Task RealRedisMultiWindowCleanupIsAtomicAgainstLaterDamagedRoom()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "multiwindow-" + Guid.NewGuid().ToString("N");
+            var first = Store(a, clock, ns);
+            var second = Store(b, clock, ns);
+            var apiA = new RedisGuestLobbyRuntime(first, clock);
+            var apiB = new RedisGuestLobbyRuntime(second, clock);
+            var guest = GuestSessions.NewPlayerId();
+            var rooms = new List<string>();
+            for (var i = 0; i < 12; i++)
+            {
+                var owner = GuestSessions.NewPlayerId();
+                var room = await apiA.CreateAsync(
+                    owner, ["white", "black"], "white");
+                await apiB.JoinAsync(room.LobbyId, guest, "black", room.Revision);
+                rooms.Add(room.LobbyId);
+            }
+            Assert.Equal(12, (await first.GetIndexedRoomsAsync()).Count);
+            var db = a.GetDatabase();
+            var members = await db.SortedSetRangeByRankAsync(
+                "shirokuro:lobby:{" + ns + "}:v2:capacity:all");
+            Assert.Equal(12, members.Length);
+            // Poison a key past the first 8 reads, ensuring even the healthy
+            // first window cannot authorize an early membership mutation.
+            var poisonedKey = members[10].ToString();
+            var healthy = (byte[])(await db.StringGetAsync(poisonedKey))!;
+            var damaged = new byte[RedisLobbySnapshotCodec.MaxBytes + 1];
+            Assert.True(await db.StringSetAsync(
+                poisonedKey, damaged, TimeSpan.FromMinutes(30)));
+            await Assert.ThrowsAsync<LobbySnapshotUnavailableException>(() =>
+                apiB.RemovePlayerFromAllRoomsAsync(guest));
+            foreach (var roomId in rooms)
+            {
+                // Corrupt room is checked via raw Redis bytes instead.
+                var roomKey = members.FirstOrDefault(x => x.ToString() ==
+                    "shirokuro:lobby:{" + ns + "}:v2:room:" +
+                    Convert.ToHexStringLower(SHA256.HashData(
+                        Encoding.UTF8.GetBytes(roomId)))).ToString();
+                if (roomKey == poisonedKey)
+                    continue;
+                var snapshot = (await first.ReadAsync(roomId))!.Snapshot;
+                Assert.Equal(2, snapshot.State.Participants.Count);
+                Assert.Contains(snapshot.State.Participants,
+                    p => p.PlayerId == guest);
+            }
+            Assert.Equal(damaged, (byte[])(await db.StringGetAsync(
+                poisonedKey))!);
+            Assert.True(await db.StringSetAsync(
+                poisonedKey, healthy, TimeSpan.FromMinutes(30)));
+            Assert.Equal(12, await apiB.RemovePlayerFromAllRoomsAsync(guest));
+            foreach (var roomId in rooms)
+            {
+                var snapshot = (await first.ReadAsync(roomId))!.Snapshot;
+                Assert.Single(snapshot.State.Participants);
+                Assert.DoesNotContain(snapshot.State.Participants,
+                    p => p.PlayerId == guest);
+            }
+            Assert.Equal(0, await apiA.RemovePlayerFromAllRoomsAsync(guest));
+        }
+    }
+
     [Fact]
     public async Task OversizedRoomSnapshotNeverLeavesRedisOnDirectPassiveOrIndexedRead()
     {

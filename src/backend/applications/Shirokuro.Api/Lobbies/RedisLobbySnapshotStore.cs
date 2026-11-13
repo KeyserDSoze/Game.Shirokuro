@@ -21,6 +21,10 @@ public sealed class RedisLobbySnapshotStore(
     // making their multi-key Lua scripts legal in a cluster.
     private readonly string _prefix = Prefix(namespaceName);
 
+    // Bound concurrent administrative GETs even when the index contains 256
+    // rooms. Each request still carries the Lua byte bound and 2s deadline.
+    private const int IndexedReadWindowSize = 8;
+
     // Compare the complete stored snapshot, including its activity timestamp:
     // unchanged-revision authorized heartbeats must still detect conflicts.
     private const string CompareExchangeScript = """
@@ -397,49 +401,70 @@ public sealed class RedisLobbySnapshotStore(
         }
 
         var result = new List<Stored>(keys.Count);
-        foreach (var key in keys)
+        // Do not issue 256 sequential Redis roundtrips during a guest expiry
+        // sweep. A fixed window bounds both concurrent commands and buffered
+        // snapshot bytes (at most 8 * 32 KiB), while preserving index order.
+        // Crucially this method returns NOTHING until every window succeeds:
+        // later corrupt records cannot authorize a partial guest cleanup.
+        for (var start = 0; start < keys.Count; start += IndexedReadWindowSize)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var raw = await ReadBoundedSnapshotBytesAsync(
-                (RedisKey)key, cancellationToken);
-            if (raw.IsNull)
-                continue; // Redis expiry can race this maintenance scan.
+            var count = Math.Min(IndexedReadWindowSize, keys.Count - start);
+            var pending = new Task<Stored?>[count];
+            for (var i = 0; i < count; i++)
+                pending[i] = ReadIndexedRoomAsync(keys[start + i], cancellationToken);
 
-            var bytes = (byte[])raw!;
-            if (bytes.Length is 0 or > RedisLobbySnapshotCodec.MaxBytes)
-                throw new LobbySnapshotUnavailableException();
-
-            LobbySnapshot snapshot;
-            try
+            foreach (var room in await Task.WhenAll(pending))
             {
-                using var json = JsonDocument.Parse(bytes);
-                if (json.RootElement.ValueKind != JsonValueKind.Object ||
-                    !json.RootElement.TryGetProperty("LobbyId", out var lobbyId) ||
-                    lobbyId.ValueKind != JsonValueKind.String)
-                    throw new LobbySnapshotUnavailableException();
-
-                var id = lobbyId.GetString();
-                if (string.IsNullOrWhiteSpace(id) ||
-                    !string.Equals(key, RoomKey(id).ToString(),
-                        StringComparison.Ordinal))
-                    throw new LobbySnapshotUnavailableException();
-
-                snapshot = RedisLobbySnapshotCodec.Decode(bytes, id);
-                if (!snapshot.QuotaTracked)
-                    throw new LobbySnapshotUnavailableException();
+                if (room is not null)
+                    result.Add(room);
             }
-            catch (Exception error) when (error is JsonException or InvalidDataException)
-            {
-                // Indexed bytes are untrusted just like member roster reads.
-                // Do not expose keys, room IDs, JSON fragments or exceptions.
-                // The caller must retry cleanup; never silently skip/ack.
-                throw new LobbySnapshotUnavailableException();
-            }
-
-            if (Remaining(snapshot) > TimeSpan.Zero)
-                result.Add(new Stored(snapshot, bytes));
         }
         return result;
+    }
+
+    private async Task<Stored?> ReadIndexedRoomAsync(
+        string key, CancellationToken cancellationToken)
+    {
+        var raw = await ReadBoundedSnapshotBytesAsync(
+            (RedisKey)key, cancellationToken);
+        if (raw.IsNull)
+            return null; // Redis expiry can race this maintenance scan.
+
+        var bytes = (byte[])raw!;
+        if (bytes.Length is 0 or > RedisLobbySnapshotCodec.MaxBytes)
+            throw new LobbySnapshotUnavailableException();
+
+        LobbySnapshot snapshot;
+        try
+        {
+            using var json = JsonDocument.Parse(bytes);
+            if (json.RootElement.ValueKind != JsonValueKind.Object ||
+                !json.RootElement.TryGetProperty("LobbyId", out var lobbyId) ||
+                lobbyId.ValueKind != JsonValueKind.String)
+                throw new LobbySnapshotUnavailableException();
+
+            var id = lobbyId.GetString();
+            if (string.IsNullOrWhiteSpace(id) ||
+                !string.Equals(key, RoomKey(id).ToString(),
+                    StringComparison.Ordinal))
+                throw new LobbySnapshotUnavailableException();
+
+            snapshot = RedisLobbySnapshotCodec.Decode(bytes, id);
+            if (!snapshot.QuotaTracked)
+                throw new LobbySnapshotUnavailableException();
+        }
+        catch (Exception error) when (error is JsonException or InvalidDataException)
+        {
+            // Indexed bytes are untrusted just like member roster reads.
+            // Do not expose keys, room IDs, JSON fragments or exceptions.
+            // The caller must retry cleanup; never silently skip/ack.
+            throw new LobbySnapshotUnavailableException();
+        }
+
+        return Remaining(snapshot) > TimeSpan.Zero
+            ? new Stored(snapshot, bytes)
+            : null;
     }
 
     private bool IsIndexedRoomKey(string key)
