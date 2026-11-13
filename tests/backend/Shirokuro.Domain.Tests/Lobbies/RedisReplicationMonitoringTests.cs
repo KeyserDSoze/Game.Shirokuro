@@ -77,38 +77,19 @@ public sealed class RedisReplicationMonitoringTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void SparseRedisReplicaIndicesStillProduceValidAckLag()
-    {
-        // Live TLS Redis can retain non-contiguous slaveN identifiers after
-        // replica reconnect/promotion. Index order and maximum number must
-        // not be inferred from connected_slaves; only unique row count.
-        var single = RedisReplicationInfo.Parse(
-            "role:master\nconnected_slaves:1\n" +
-            "slave7:ip=hidden.internal,state=online,lag=4");
-        Assert.Equal(1, single.ConnectedReplicas);
-        Assert.Equal(4, single.MaxOnlineAckLagSeconds);
-
-        var sparse = RedisReplicationInfo.Parse(
-            "role:master\nconnected_slaves:2\n" +
-            "slave2:ip=hidden.internal,state=online,lag=8\n" +
-            "slave0:ip=hidden.internal,state=send_bulk,lag=999");
-        Assert.Equal(2, sparse.ConnectedReplicas);
-        Assert.Equal(8, sparse.MaxOnlineAckLagSeconds);
-        Assert.DoesNotContain("hidden.internal", sparse.ToString(),
-            StringComparison.Ordinal);
-    }
-
     [Theory]
-    [InlineData("up", RedisReplicaLink.Up)]
-    [InlineData("down", RedisReplicaLink.Down)]
+    [InlineData("up", RedisReplicaLink.Up, false)]
+    [InlineData("down", RedisReplicaLink.Down, false)]
+    [InlineData("up", RedisReplicaLink.Up, true)]
+    [InlineData("down", RedisReplicaLink.Down, true)]
     public void ReplicaHasLinkStateButNeverPretendsToKnowPrimaryReplicaCount(
-        string linkState, RedisReplicaLink expected)
+        string linkState, RedisReplicaLink expected, bool withConnectedZero)
     {
         var sample = RedisReplicationInfo.Parse(
             "role:slave\nmaster_host=secret.example\n" +
             "master_host:private.example\nmaster_port:6382\n" +
             "master_link_status:" + linkState + "\n" +
+            (withConnectedZero ? "connected_slaves:0\n" : "") +
             "slave_repl_offset:450\nmaster_replid:secret\n");
         Assert.Equal(RedisReplicationRole.Replica, sample.Role);
         Assert.Equal(expected, sample.Link);
@@ -136,10 +117,13 @@ public sealed class RedisReplicationMonitoringTests
     [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=1\nslave00:state=online,lag=3")]
     [InlineData("role:master\nconnected_slaves:1\nslave2147483648:state=online,lag=1")]
     [InlineData("role:master\nconnected_slaves:1\nslave0:lag=1")]
+    [InlineData("role:master\nconnected_slaves:1\nslave1:state=online,lag=0")]
+    [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=0\nslave2:state=online,lag=0")]
     [InlineData("role:master\nconnected_slaves:1\nslave00:state=online,lag=0")]
     [InlineData("role:master\nconnected_slaves:1\nslave0:state=unknown,lag=1")]
     [InlineData("role:master\nconnected_slaves:1\nslave0:state=disconnected,lag=1")]
-    [InlineData("role:slave\nmaster_link_status:up\nconnected_slaves:0")]
+    [InlineData("role:slave\nmaster_link_status:up\nconnected_slaves:1")]
+    [InlineData("role:slave\nmaster_link_status:up\nconnected_slaves:0\nslave0:state=online,lag=0")]
     [InlineData("role:slave\nmaster_link_status:down\nslave0:state=online,lag=0")]
     [InlineData("role:slave\nmaster_link_status:broken")]
     public void InvalidReplicationInfoFailsWithConstantNonSensitiveMessage(string raw)

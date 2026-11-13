@@ -1438,13 +1438,17 @@ other potentially identifying strings. The bounded parser consumes only
 `lag` of `slaveN` entries that are online. It rejects oversized
 payloads, malformed counts and invalid role/link without echoing raw
 Redis content. The primary's `slaveN` rows must use **canonical, unique decimal
-indices** (no aliases such as `slave00`) and their **number** must
-match `connected_slaves`. Redis may reuse or retain **sparse indices**
-after topology changes; gaps are **not** by themselves invalid INFO.
-This was verified by a real TLS replica-promotion CI regression (#108).
+indices** (no aliases such as `slave00`) and match the ordered `slave0`
+through `slaveN-1` slots reported by `connected_slaves:N`. Gaps are
+invalid INFO on a primary. Redis 7.4 also reports `connected_slaves:0`
+on a **replica**: that zero value (or an absent field) is valid there and
+must NOT publish a replica-count histogram on a replica. A positive
+`connected_slaves` or any `slaveN` row on a replica is invalid.
+This behavior was confirmed by the TLS promotion test's privacy-safe
+diagnostic after CI caught a false-positive parser rejection (#108).
 Only known `online`, `wait_bgsave` and `send_bulk` states are accepted;
-only `online` contributes to the maximum ACK lag. Replica-role INFO may
-not claim primary-only `connected_slaves` or `slaveN` rows. On inconsistency
+only `online` contributes to the maximum ACK lag. Replica-role INFO
+must not claim a positive dependent-replica count or `slaveN` rows. On inconsistency
 the observer emits a fixed `outcome=invalid` sample and no replica count or
 ACK lag: an invalid sample is **not** a healthy zero-lag observation (#108).
 **Reported ACK lag is time since replica acknowledgment**;

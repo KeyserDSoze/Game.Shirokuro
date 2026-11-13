@@ -119,17 +119,19 @@ public static class RedisReplicationInfo
 
         return role switch
         {
-            // Redis INFO indices are identifiers, not always contiguous
-            // 0..N-1 slots after topology changes. Count must match the
-            // number of unique canonical slaveN rows; do not fabricate
-            // a contiguous-index requirement from connected_slaves.
+            // Redis's primary prints slave0..slaveN-1 and a matching
+            // connected_slaves count; never accept missing/aliased rows.
             RedisReplicationRole.Primary when connected is not null &&
-                connected == replicaIndices.Count && link is null =>
+                connected == replicaIndices.Count && link is null &&
+                replicaIndices.All(index => index >= 0 && index < connected.Value) =>
                 new RedisReplicationSnapshot(
                     RedisReplicationRole.Primary,
                     RedisReplicaLink.NotApplicable, connected, maxLag),
+            // Redis 7.4 reports connected_slaves:0 on REPLICAS too.
+            // A replica must not advertise dependent replica rows, but its
+            // zero count is legitimate and must not become invalid telemetry.
             RedisReplicationRole.Replica when link is not null &&
-                connected is null && replicaIndices.Count == 0 =>
+                (connected is null or 0) && replicaIndices.Count == 0 =>
                 new RedisReplicationSnapshot(
                     RedisReplicationRole.Replica, link.Value, null, null),
             _ => throw new FormatException(InvalidInfo)
