@@ -78,7 +78,7 @@ export const guestLobbyApi = {
   // never an invite, player ID, cookie or hidden match information.
   peek: async (code: string, knownRevision?: number): Promise<LobbyRoster | null> => {
     const room = parseInviteCode(code)
-    const tag = knownRevision !== undefined &&
+    const tag: Record<string, string> = knownRevision !== undefined &&
       Number.isSafeInteger(knownRevision) && knownRevision >= 0
       ? { 'If-None-Match': '"rev-' + knownRevision + '"' } : {}
     const response = await fetch('/api/lobbies/' + room + '/roster/peek', {
