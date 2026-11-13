@@ -111,6 +111,9 @@ public sealed class GuestLogoutRecoveryTests
         public Task<LobbyRosterView> ForMemberAsync(string id, string player,
             CancellationToken token = default) =>
             inner.ForMemberAsync(id, player, token);
+        public Task<LobbyRosterView> PeekForMemberAsync(string id, string player,
+            CancellationToken token = default) =>
+            inner.PeekForMemberAsync(id, player, token);
 
         public Task<int> RemovePlayerFromAllRoomsAsync(string player,
             CancellationToken token = default)

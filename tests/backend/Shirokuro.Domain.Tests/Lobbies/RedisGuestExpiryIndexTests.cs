@@ -59,6 +59,9 @@ public sealed class RedisGuestExpiryIndexTests
         public Task<LobbyRosterView> ForMemberAsync(string room, string id,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+        public Task<LobbyRosterView> PeekForMemberAsync(string room, string id,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class OversizedProtector : IDataProtector

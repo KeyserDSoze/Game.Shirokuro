@@ -165,6 +165,9 @@ public sealed class GuestExpiryBatchIsolationTests
         public Task<LobbyRosterView> ForMemberAsync(string room, string id,
             CancellationToken token = default) =>
             throw new NotSupportedException();
+        public Task<LobbyRosterView> PeekForMemberAsync(string room, string id,
+            CancellationToken token = default) =>
+            throw new NotSupportedException();
     }
 
     private static GuestSessionExpiryWorker Worker(

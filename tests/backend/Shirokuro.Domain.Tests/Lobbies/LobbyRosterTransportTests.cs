@@ -84,6 +84,13 @@ public sealed class LobbyRosterTransportTests
             return Task.FromException<LobbyRosterView>(
                 new LobbyReadContentionException());
         }
+        public Task<LobbyRosterView> PeekForMemberAsync(string roomId,
+            string trustedPlayerId, CancellationToken cancellationToken = default)
+        {
+            Reads++;
+            return Task.FromException<LobbyRosterView>(
+                new LobbySnapshotUnavailableException());
+        }
 
         public Task<LobbyRosterView> CreateAsync(string trustedPlayerId,
             IReadOnlyList<string>? teamIds, string? initialTeam,
