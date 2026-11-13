@@ -50,17 +50,20 @@ test('two independent guest browsers create a room, join by invite and select he
     await expect(second.getByTestId('lobby-roster')).toContainText('Kira')
     await expect(second.getByTestId('lobby-revision')).toContainText('3')
 
+    // Register BEFORE the second player's mutation. Otherwise the first
+    // browser can poll revision 4 before Playwright starts observing requests,
+    // making a successful read appear as a missing request (flaky #109).
+    // The observer sees only transport metadata, never roster contents.
+    const passiveReads: string[] = []
+    first.on('request', request => {
+      if (request.url().includes('/api/lobbies/' + invite + '/roster/peek'))
+        passiveReads.push(request.method())
+    })
     await second.getByRole('button', { name: 'Seleziona Shilla' }).click()
     await second.getByTestId('lobby-pick-hero').click()
     await expect(second.getByTestId('lobby-message')).toContainText('Eroe Shilla salvato')
     // Automatic, authenticated, read-only no-heartbeat GET. No user click
     // on Refresh; only the explicit button is allowed to touch inactivity.
-    const passiveReads: string[] = []
-    first.on('request', request => {
-      if (request.url().includes('/api/lobbies/') &&
-          request.url().endsWith('/roster/peek'))
-        passiveReads.push(request.method())
-    })
     await first.bringToFront()
     await expect(first.getByTestId('lobby-revision')).toContainText('4', { timeout: 25_000 })
     await expect(first.getByTestId('lobby-roster')).toContainText('Shilla')
