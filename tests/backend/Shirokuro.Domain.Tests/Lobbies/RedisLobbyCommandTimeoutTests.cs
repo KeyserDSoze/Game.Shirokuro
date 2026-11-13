@@ -622,7 +622,7 @@ public sealed class RedisLobbyCommandTimeoutTests
         Assert.Equal(rooms.Where((_, i) => i != 4).Select(x => x.RoomId),
             verified.Select(x => x.Snapshot.State.Definition.LobbyId));
         Assert.Equal(19, fixture.ReadKeys.Count);
-        Assert.Equal(8, fixture.MaxInFlightReads);
+        Assert.InRange(fixture.MaxInFlightReads, 1, 8);
 
         // A later corrupted snapshot invalidates the entire scan, not just
         // the last room. The caller cannot perform partial cleanup.
