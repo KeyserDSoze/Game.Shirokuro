@@ -8,8 +8,8 @@ import {
   type GuestSession, type LobbyRoster,
 } from './api'
 import {
-  LOBBY_ROSTER_POLL_INTERVAL_MS, classifyRosterPollFailure,
-  isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
+  LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
+  classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 type Props = { previewHeroId: string }
@@ -314,9 +314,23 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           try {
             const latest = await guestLobbyApi.read(conflictRoomId)
             if (!isCurrent()) return
-            if (latest.lobbyId !== conflictRoomId ||
-                !latest.participants.some(p => p.playerId === conflictPlayerId)) {
+            // The 409 is authoritative for the rejected *mutation*, not
+            // proof that this member has left. A malformed 200 must never
+            // be promoted into a false membership-loss signal (#115).
+            const current = currentRoomRef.current
+            const decision = current?.lobbyId === conflictRoomId
+              ? classifyConflictRosterRefresh(current, latest, conflictPlayerId)
+              : 'invalid'
+            if (decision === 'invalid') {
+              setMessage(t('lobbyConflict'))
+              return
+            }
+            if (decision === 'missing') {
+              // Only a complete, current, same-room roster can revoke the
+              // local room view. Keep the signed guest (not a 401).
+              currentRoomRef.current = null
               setRoom(null)
+              setInvite('')
               setMessage(t('lobbyMissing'))
               return
             }

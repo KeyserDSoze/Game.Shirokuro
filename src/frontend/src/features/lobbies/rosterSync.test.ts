@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { LobbyRoster } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
-  classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
+  classifyConflictRosterRefresh, classifyRosterPollFailure,
+  isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -188,5 +189,47 @@ describe('explicit authenticated roster adoption (#110)', () => {
     expect(isVerifiedLobbyRoster(roster(4), alice.playerId, otherId)).toBe(false)
     expect(isVerifiedLobbyRoster(roster(4), alice.playerId, lobbyId, 5)).toBe(false)
     expect(isVerifiedLobbyRoster(roster(4), 'guest-unknown')).toBe(false)
+  })
+})
+
+
+describe('409 conflict refresh requires validated membership proof (#115)', () => {
+  it('adopts only current, same-room, strictly verified member rosters', () => {
+    const current = roster(4)
+    expect(classifyConflictRosterRefresh(current, roster(4), alice.playerId))
+      .toBe('verified')
+    expect(classifyConflictRosterRefresh(current, roster(5, [alice]), alice.playerId))
+      .toBe('verified')
+    expect(classifyConflictRosterRefresh(current, roster(5, [bob]), alice.playerId))
+      .toBe('missing')
+    // A valid equal revision with confirmed membership loss still proves
+    // absence, but an obsolete revision cannot revoke a newer local view.
+    expect(classifyConflictRosterRefresh(current, roster(4, [bob]), alice.playerId))
+      .toBe('missing')
+    expect(classifyConflictRosterRefresh(current, roster(3, [bob]), alice.playerId))
+      .toBe('invalid')
+  })
+
+  it.each([
+    ['null JSON', null],
+    ['array JSON', []],
+    ['foreign room', { ...roster(5, [bob]), lobbyId: otherId }],
+    ['stale room', roster(3, [bob])],
+    ['empty roster', roster(5, [])],
+    ['missing actor with extra private field', { ...roster(5, [bob]), secretRoute: 'hidden' }],
+    ['malformed participant', { ...roster(5), participants: [null] }],
+    ['noncanonical participant', roster(5, [alice, { ...bob, playerId: 'guest-bob' }])],
+    ['duplicate participant', roster(5, [bob, bob])],
+    ['missing team', { ...roster(5), teamIds: ['white'] }],
+    ['malformed revision', { ...roster(5, [bob]), revision: 1.5 }],
+    ['unexpected participant field', roster(5, [alice, { ...bob, secretRoute: 'hidden' }])],
+  ])('does not infer revocation after 409 from %s', (_kind, incoming) => {
+    expect(classifyConflictRosterRefresh(roster(4), incoming, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('rejects invalid local actor IDs without trusting server-looking JSON', () => {
+    expect(classifyConflictRosterRefresh(roster(4), roster(5, [bob]), 'guest-alice'))
+      .toBe('invalid')
   })
 })

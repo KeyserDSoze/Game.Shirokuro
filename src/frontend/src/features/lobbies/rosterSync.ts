@@ -26,6 +26,22 @@ export function rosterPollDelayMs(
 
 export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing' | 'invalid'
 export type PollFailureDecision = 'expired' | 'missing' | 'retain'
+export type ConflictRosterRefreshDecision = 'verified' | 'missing' | 'invalid'
+
+/**
+ * A 409 may be followed by a 200 that is malformed, foreign, or stale.
+ * Only a fully verified room/revision/participant DTO can establish that
+ * the actor really lost membership. Never examine unvalidated participants.
+ */
+export function classifyConflictRosterRefresh(
+  current: LobbyRoster, incoming: unknown, actorId: string,
+): ConflictRosterRefreshDecision {
+  if (!isCanonicalGuestPlayerId(actorId) ||
+      !isWellFormedLobbyRoster(incoming, current.lobbyId, current.revision))
+    return 'invalid'
+  return incoming.participants.some(participant => participant.playerId === actorId)
+    ? 'verified' : 'missing'
+}
 
 /**
  * A late or malformed response cannot replace a newer local revision.

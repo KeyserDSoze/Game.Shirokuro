@@ -642,6 +642,110 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
 
+test('409 refresh rejects malformed membership loss and only clears on verified loss', async ({ page }) => {
+  const code = 'room-' + 'b'.repeat(32)
+  const actorId = 'guest-' + 'b'.repeat(32)
+  const otherId = 'guest-' + 'a'.repeat(32)
+  const initial = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId: actorId, teamId: 'white', heroId: null }],
+  }
+  // The two authentication responses and room creation are mocked: this
+  // negative test must not consume real shared-IP guest admission quota.
+  let signedIn = false
+  let guestPosts = 0
+  let roomCreates = 0
+  let rejectedChanges = 0
+  let conflictReads = 0
+  let refreshPayload: unknown = null
+  await page.route('**/api/sessions/me', route => route.fulfill(
+    signedIn ? { status: 200, json: { playerId: actorId, kind: 'guest' } }
+      : { status: 401 },
+  ))
+  await page.route('**/api/sessions/guest', route => {
+    guestPosts++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actorId, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    roomCreates++
+    return route.fulfill({ status: 201, json: initial })
+  })
+  await page.route('**/api/lobbies/' + code + '/team', route => {
+    rejectedChanges++
+    return route.fulfill({ status: 409, json: { code: 'revision_conflict' } })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster', route => {
+    conflictReads++
+    return route.fulfill({ status: 200, json: refreshPayload })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actorId)
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  const initialView = await page.getByTestId('lobby-roster').textContent()
+  expect(guestPosts).toBe(1)
+  expect(roomCreates).toBe(1)
+
+  const invalidReplies: unknown[] = [
+    { ...initial, revision: 2, participants: [], secretRoute: 'must-not-be-displayed' },
+    { ...initial, revision: 2, participants: [] },
+    { ...initial, lobbyId: 'room-' + 'f'.repeat(32), revision: 2,
+      participants: [{ playerId: otherId, teamId: 'black', heroId: null }] },
+    { ...initial, revision: 0,
+      participants: [{ playerId: otherId, teamId: 'black', heroId: null }] },
+    { ...initial, revision: 2,
+      participants: [{ playerId: 'guest-other', teamId: 'white', heroId: null }] },
+  ]
+  for (const [index, reply] of invalidReplies.entries()) {
+    refreshPayload = reply
+    await page.getByTestId('lobby-change-team').click()
+    await expect(page.getByTestId('lobby-message')).toContainText('aggiorna il roster')
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-revision')).toContainText('1')
+    await expect(page.getByTestId('lobby-roster')).toHaveText(initialView!)
+    await expect(page.getByTestId('lobby-player')).toContainText(actorId)
+    expect(conflictReads).toBe(index + 1)
+    expect(rejectedChanges).toBe(index + 1)
+    expect(guestPosts).toBe(1)
+  }
+
+  // A complete, current response with our member is safe to adopt.
+  refreshPayload = {
+    ...initial, revision: 2,
+    participants: [
+      { playerId: actorId, teamId: 'white', heroId: null },
+      { playerId: otherId, teamId: 'black', heroId: null },
+    ],
+  }
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('roster aggiornato')
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+  expect(conflictReads).toBe(invalidReplies.length + 1)
+  expect(rejectedChanges).toBe(invalidReplies.length + 1)
+
+  // Only a structurally valid current roster without the actor is evidence
+  // to clear local room and invite. The guest remains signed in.
+  refreshPayload = {
+    ...initial, revision: 3,
+    participants: [{ playerId: otherId, teamId: 'black', heroId: null }],
+  }
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-create')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-player')).toContainText(actorId)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  expect(conflictReads).toBe(invalidReplies.length + 2)
+  expect(rejectedChanges).toBe(invalidReplies.length + 2)
+  expect(guestPosts).toBe(1)
+  expect(roomCreates).toBe(1)
+})
+
 test('auto-sync rejects malformed 200, retains view on 503 and clears only on authorized 404/401', async ({ page }) => {
   // Bounded backoff after an invalid 200 adds 15s to this end-to-end
   // sequence; subsequent 503 now correctly escalates to 60s rather than 30s.
