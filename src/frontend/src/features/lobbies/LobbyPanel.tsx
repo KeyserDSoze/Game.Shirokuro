@@ -393,8 +393,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     const previous = currentRoomRef.current
     const minRevision = previous?.lobbyId === next?.lobbyId
       ? previous.revision : undefined
+    // The .NET LobbyDefinition TeamIds are immutable for this room. A
+    // malformed 200 must not change their IDs or order (#119).
+    const expectedTeams = previous?.lobbyId === next?.lobbyId
+      ? previous.teamIds : undefined
     if (!session || !isVerifiedLobbyRoster(
-      next, session.playerId, expectedRoomId, minRevision,
+      next, session.playerId, expectedRoomId, minRevision, expectedTeams,
     )) throw new Error('Invalid authenticated lobby roster response')
     // A stale passive response must never see a previous room as current
     // between a confirmed user action and the next React effect (#109).

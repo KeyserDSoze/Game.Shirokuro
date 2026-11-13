@@ -227,6 +227,68 @@ describe('canonical hero IDs across roster adoption (#117)', () => {
   })
 })
 
+
+
+describe('immutable team IDs for an existing lobby (#119)', () => {
+  it.each([
+    ['reordered', { ...roster(4), teamIds: ['black', 'white'] }],
+    ['renamed with consistent members', { ...roster(4),
+      teamIds: ['white', 'gold'],
+      participants: [alice, { ...bob, teamId: 'gold' }] }],
+    ['extra valid team', { ...roster(4), teamIds: ['white', 'black', 'gold'] }],
+  ])('rejects %s teams before adopting any valid-looking 200', (_kind, incoming) => {
+    const current = roster(3)
+    // Without an established room, the new definition is a legal custom
+    // configuration; only a change to the SAME room is forbidden.
+    expect(isVerifiedLobbyRoster(incoming, alice.playerId, lobbyId, 3)).toBe(true)
+    expect(isVerifiedLobbyRoster(
+      incoming, alice.playerId, lobbyId, 3, current.teamIds,
+    )).toBe(false)
+    expect(reconcilePolledRoster(current, incoming, alice.playerId)).toBe('invalid')
+    expect(classifyConflictRosterRefresh(current, incoming, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('rejects removal from a three-team room even with a valid two-team DTO', () => {
+    const current = { ...roster(3), teamIds: ['white', 'black', 'gold'] }
+    const incoming = roster(4)
+    expect(isVerifiedLobbyRoster(
+      incoming, alice.playerId, lobbyId, current.revision, current.teamIds,
+    )).toBe(false)
+    expect(reconcilePolledRoster(current, incoming, alice.playerId)).toBe('invalid')
+    expect(classifyConflictRosterRefresh(current, incoming, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('does not treat forged missing membership with changed teams as revocation', () => {
+    const current = roster(3)
+    const missing = { ...roster(4, [bob]),
+      teamIds: ['white', 'gold'],
+      participants: [{ ...bob, teamId: 'gold' }],
+    }
+    expect(classifyConflictRosterRefresh(current, missing, alice.playerId))
+      .toBe('invalid')
+    expect(reconcilePolledRoster(current, missing, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('allows unchanged teams after ordinary revisions and custom first-time joins', () => {
+    const current = { ...roster(4), teamIds: ['white', 'black', 'gold'] }
+    const updated = { ...roster(5, [alice, { ...bob, teamId: 'gold' }]),
+      teamIds: [...current.teamIds] }
+    expect(isVerifiedLobbyRoster(
+      updated, alice.playerId, lobbyId, current.revision, current.teamIds,
+    )).toBe(true)
+    expect(reconcilePolledRoster(current, updated, alice.playerId)).toBe('updated')
+    expect(classifyConflictRosterRefresh(current, updated, alice.playerId))
+      .toBe('verified')
+
+    const firstRoom = { ...updated, lobbyId: otherId, revision: 1 }
+    expect(isVerifiedLobbyRoster(firstRoom, alice.playerId, otherId)).toBe(true)
+    expect(isVerifiedLobbyRoster(firstRoom, alice.playerId, lobbyId)).toBe(false)
+  })
+})
+
 describe('409 conflict refresh requires validated membership proof (#115)', () => {
   it('adopts only current, same-room, strictly verified member rosters', () => {
     const current = roster(4)

@@ -38,7 +38,9 @@ export function classifyConflictRosterRefresh(
   current: LobbyRoster, incoming: unknown, actorId: string,
 ): ConflictRosterRefreshDecision {
   if (!isCanonicalGuestPlayerId(actorId) ||
-      !isWellFormedLobbyRoster(incoming, current.lobbyId, current.revision))
+      !isWellFormedLobbyRoster(
+        incoming, current.lobbyId, current.revision, current.teamIds,
+      ))
     return 'invalid'
   return incoming.participants.some(participant => participant.playerId === actorId)
     ? 'verified' : 'missing'
@@ -54,8 +56,9 @@ export function reconcilePolledRoster(
 ): PolledRosterDecision {
   // Malformed/wrong-room HTTP 200 is not healthy service recovery:
   // report it separately so the caller can apply bounded outage backoff.
-  if (!isWellFormedLobbyRoster(incoming, current.lobbyId))
-    return 'invalid'
+  if (!isWellFormedLobbyRoster(
+    incoming, current.lobbyId, undefined, current.teamIds,
+  )) return 'invalid'
   // Valid but obsolete observations must not revoke even if membership is
   // absent, and do not count as invalid transport data.
   if (incoming.revision < current.revision)
@@ -72,9 +75,12 @@ export function reconcilePolledRoster(
  * Do not import new/unknown fields that might contain private match data.
  * Hero IDs use the same shared heroes.json catalog as the authoritative
  * .NET OriginalHeroRoster. An unknown hero is not equivalent to no hero.
+ * Once the room exists, its definition's team IDs and order are immutable
+ * on .NET; even an otherwise well-formed 200 cannot replace them (#119).
  */
 function isWellFormedLobbyRoster(
   payload: unknown, expectedRoomId?: string, minimumRevision?: number,
+  expectedTeamIds?: readonly string[],
 ): payload is LobbyRoster {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
   const data = payload as Record<string, unknown>
@@ -92,6 +98,10 @@ function isWellFormedLobbyRoster(
       !data.teamIds.every((team: unknown) =>
         typeof team === 'string' && /^[a-z0-9-]{1,24}$/.test(team)) ||
       new Set(data.teamIds).size !== data.teamIds.length ||
+      (expectedTeamIds !== undefined &&
+        (data.teamIds.length !== expectedTeamIds.length ||
+          data.teamIds.some((team: unknown, index: number) =>
+            team !== expectedTeamIds[index]))) ||
       !Array.isArray(data.participants) ||
       data.participants.length < 1 || data.participants.length > 16) return false
 
@@ -119,13 +129,16 @@ function isWellFormedLobbyRoster(
  * An explicit response requires valid shape AND the authenticated actor
  * among the participants. A structurally valid passive roster with no actor
  * is treated separately by reconcilePolledRoster as missing membership.
+ * For an existing room, also compare its immutable ordered team definition.
  */
 export function isVerifiedLobbyRoster(
   payload: unknown, actorId: string, expectedRoomId?: string,
-  minimumRevision?: number,
+  minimumRevision?: number, expectedTeamIds?: readonly string[],
 ): payload is LobbyRoster {
   return typeof actorId === 'string' && actorId.length > 0 &&
-    isWellFormedLobbyRoster(payload, expectedRoomId, minimumRevision) &&
+    isWellFormedLobbyRoster(
+      payload, expectedRoomId, minimumRevision, expectedTeamIds,
+    ) &&
     payload.participants.some(participant => participant.playerId === actorId)
 }
 

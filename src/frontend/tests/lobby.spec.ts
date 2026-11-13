@@ -689,8 +689,9 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
 
   // A 200 misrouted to another room, missing our member, containing
-  // noncanonical IDs, unknown heroes or private fields cannot replace the
-  // verified roster (#110/#114/#117), even if our actor remains present.
+  // noncanonical IDs, unknown heroes, changed room team definition or
+  // private fields cannot replace the verified roster (#110/#114/#117/#119),
+  // even if our actor remains present.
   const verifiedResponse = await page.request.get('/api/lobbies/' + existingRoom + '/roster')
   expect(verifiedResponse.status()).toBe(200)
   const verified = await verifiedResponse.json()
@@ -716,6 +717,15 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
       { playerId: 'guest-' + 'c'.repeat(32), teamId: 'white', heroId: 'Kira' }] },
     { ...verified, participants: [...verified.participants,
       { playerId: 'guest-' + 'd'.repeat(32), teamId: 'black', heroId: 'kira'.repeat(10_000) }] },
+    // Teams are fixed by LobbyDefinition when this room is created. Both
+    // remain structurally valid JSON even though they violate that invariant.
+    { ...verified, revision: verified.revision + 10,
+      teamIds: [...verified.teamIds].reverse() },
+    { ...verified, revision: verified.revision + 10,
+      teamIds: ['white', 'gold'],
+      participants: verified.participants.map(
+        (member: { playerId: string; teamId: string; heroId: string | null }) =>
+          ({ ...member, teamId: member.teamId === 'black' ? 'gold' : member.teamId })) },
     { ...verified, secretRoute: 'should-not-be-imported' },
     { ...verified, revision: 0 },
   ]) {
@@ -930,6 +940,11 @@ test('409 refresh rejects malformed membership loss and only clears on verified 
       participants: [{ playerId: otherId, teamId: 'black', heroId: null }] },
     { ...initial, revision: 2,
       participants: [{ playerId: 'guest-other', teamId: 'white', heroId: null }] },
+    // A forged same-room but changed team definition cannot prove member loss
+    // after 409, even when it has a valid revision and canonical guest IDs.
+    { ...initial, revision: 2, teamIds: ['white', 'gold'],
+      participants: [{ playerId: otherId, teamId: 'gold', heroId: null }] },
+    { ...initial, revision: 2, teamIds: ['black', 'white'] },
   ]
   for (const [index, reply] of invalidReplies.entries()) {
     refreshPayload = reply
