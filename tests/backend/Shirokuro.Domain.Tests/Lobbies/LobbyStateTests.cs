@@ -32,6 +32,43 @@ public sealed class LobbyStateTests
         Assert.Equal(1, state.Revision);
     }
 
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(1, 2)]
+    public void Restore_RejectsFewerRevisionsThanJoinedMembers(
+        long revision, int members)
+    {
+        var definition = Empty().Definition;
+        var participants = new[]
+        {
+            new LobbyParticipant("alice", "white", null),
+            new LobbyParticipant("bob", "black", null)
+        }.Take(members).ToArray();
+
+        Assert.Throws<ArgumentException>(() =>
+            LobbyState.Restore(definition, revision, participants));
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(2, 2)]
+    [InlineData(3, 2)]
+    public void Restore_AcceptsRevisionsAtOrAboveMemberCount(
+        long revision, int members)
+    {
+        var definition = Empty().Definition;
+        var participants = new[]
+        {
+            new LobbyParticipant("alice", "white", null),
+            new LobbyParticipant("bob", "black", "kira")
+        }.Take(members).ToArray();
+
+        var restored = LobbyState.Restore(definition, revision, participants);
+
+        Assert.Equal(revision, restored.Revision);
+        Assert.Equal(members, restored.Participants.Count);
+    }
+
     [Fact]
     public void Join_DoesNotModifyOldSnapshot()
     {

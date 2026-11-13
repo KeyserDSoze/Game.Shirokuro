@@ -77,6 +77,8 @@ export function reconcilePolledRoster(
  * .NET OriginalHeroRoster. An unknown hero is not equivalent to no hero.
  * Once the room exists, its definition's team IDs and order are immutable
  * on .NET; even an otherwise well-formed 200 cannot replace them (#119).
+ * .NET LobbyState.Restore also requires revision >= participant count:
+ * every joined participant consumed at least one revision (#120).
  */
 function isWellFormedLobbyRoster(
   payload: unknown, expectedRoomId?: string, minimumRevision?: number,
@@ -103,7 +105,8 @@ function isWellFormedLobbyRoster(
           data.teamIds.some((team: unknown, index: number) =>
             team !== expectedTeamIds[index]))) ||
       !Array.isArray(data.participants) ||
-      data.participants.length < 1 || data.participants.length > 16) return false
+      data.participants.length < 1 || data.participants.length > 16 ||
+      data.revision < data.participants.length) return false
 
   const seen = new Set<string>()
   for (const entry of data.participants) {

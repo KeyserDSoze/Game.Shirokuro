@@ -883,6 +883,79 @@ test('404 room loss and confirmed 204 leave erase stale invite, not guest identi
   expect(leaves).toBe(1)
 })
 
+test('impossible member counts in 201 and 200 never become an authenticated room', async ({ page }) => {
+  const actor = 'guest-' + 'a'.repeat(32)
+  const other = 'guest-' + 'b'.repeat(32)
+  const lobbyId = 'room-' + 'a'.repeat(32)
+  const first = { lobbyId, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }] }
+  let signedIn = false
+  let guestPosts = 0
+  let creates = 0
+  let rosterReads = 0
+  let createRevision = 0
+  let nextRoster: unknown = null
+
+  // Transport-only guest: never consume the shared Development login quota.
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    signedIn = true
+    guestPosts++
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    creates++
+    return route.fulfill({ status: 201, json: { ...first, revision: createRevision } })
+  })
+  await page.route('**/api/lobbies/' + lobbyId + '/roster', route => {
+    rosterReads++
+    return route.fulfill({ status: 200, json: nextRoster })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // A forged 201 with a member at revision zero must not adopt a room or
+  // destroy a verified guest. Corrected 201 is adopted only by a new click.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  createRevision = 1
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(lobbyId)
+  await expect(page.getByTestId('lobby-revision')).toContainText('1')
+  const rosterView = await page.getByTestId('lobby-roster').textContent()
+
+  // The next 200 has two well-formed guest members but only one
+  // revision. It cannot replace this authenticated roster (#120).
+  nextRoster = { ...first, participants: [
+    { playerId: actor, teamId: 'white', heroId: null },
+    { playerId: other, teamId: 'black', heroId: null },
+  ] }
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(lobbyId)
+  await expect(page.getByTestId('lobby-revision')).toContainText('1')
+  await expect(page.getByTestId('lobby-roster')).toHaveText(rosterView!)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // The same two members at revision 2 are valid, without an automatic
+  // replay. Exactly one explicit read is made per refresh click.
+  nextRoster = { ...(nextRoster as object), revision: 2 }
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Roster aggiornato')
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+  expect(guestPosts).toBe(1)
+  expect(creates).toBe(2)
+  expect(rosterReads).toBe(2)
+})
+
 test('409 refresh rejects malformed membership loss and only clears on verified loss', async ({ page }) => {
   const code = 'room-' + 'b'.repeat(32)
   const actorId = 'guest-' + 'b'.repeat(32)
@@ -945,6 +1018,16 @@ test('409 refresh rejects malformed membership loss and only clears on verified 
     { ...initial, revision: 2, teamIds: ['white', 'gold'],
       participants: [{ playerId: otherId, teamId: 'gold', heroId: null }] },
     { ...initial, revision: 2, teamIds: ['black', 'white'] },
+    // All IDs/teams are valid but revision 1 cannot contain two members
+    // (the authoritative .NET Restore requires revision >= member count).
+    { ...initial, revision: 1, participants: [
+      { playerId: otherId, teamId: 'black', heroId: null },
+      { playerId: 'guest-' + 'c'.repeat(32), teamId: 'white', heroId: null },
+    ] },
+    { ...initial, revision: 1, participants: [
+      { playerId: actorId, teamId: 'white', heroId: null },
+      { playerId: otherId, teamId: 'black', heroId: null },
+    ] },
   ]
   for (const [index, reply] of invalidReplies.entries()) {
     refreshPayload = reply

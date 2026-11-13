@@ -158,6 +158,8 @@ describe('explicit authenticated roster adoption (#110)', () => {
     ['invalid invite', { ...roster(8), lobbyId: 'room-injected' }],
     ['fractional revision', { ...roster(8), revision: 1.5 }],
     ['negative revision', { ...roster(8), revision: -1 }],
+    ['revision zero with a member', roster(0, [alice])],
+    ['revision one with two members', roster(1, [alice, bob])],
     ['single team', { ...roster(8), teamIds: ['white'] }],
     ['duplicate team', { ...roster(8), teamIds: ['white', 'white'] }],
     ['missing actor', roster(8, [bob])],
@@ -283,9 +285,54 @@ describe('immutable team IDs for an existing lobby (#119)', () => {
     expect(classifyConflictRosterRefresh(current, updated, alice.playerId))
       .toBe('verified')
 
-    const firstRoom = { ...updated, lobbyId: otherId, revision: 1 }
+    const firstRoom = { ...updated, lobbyId: otherId, revision: 2 }
     expect(isVerifiedLobbyRoster(firstRoom, alice.playerId, otherId)).toBe(true)
     expect(isVerifiedLobbyRoster(firstRoom, alice.playerId, lobbyId)).toBe(false)
+  })
+})
+
+
+describe('server-compatible minimum revision for a populated roster (#120)', () => {
+  it.each([
+    [0, [alice]],
+    [1, [alice, bob]],
+    [2, [alice, bob, { playerId: 'guest-' + '3'.repeat(32),
+      teamId: 'white', heroId: null }]],
+  ])('rejects an impossible revision %s with more participants', (revision, participants) => {
+    const impossible = roster(revision, participants)
+    expect(isVerifiedLobbyRoster(impossible, alice.playerId, lobbyId)).toBe(false)
+    expect(reconcilePolledRoster(roster(2), impossible, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('never treats a fabricated membership loss as revocation after 409', () => {
+    const current = roster(2, [alice, bob])
+    const fakeAbsent = roster(2, [
+      bob,
+      { playerId: 'guest-' + '3'.repeat(32), teamId: 'white', heroId: null },
+      { playerId: 'guest-' + '4'.repeat(32), teamId: 'black', heroId: null },
+    ])
+    expect(classifyConflictRosterRefresh(current, fakeAbsent, alice.playerId))
+      .toBe('invalid')
+    expect(reconcilePolledRoster(current, fakeAbsent, alice.playerId))
+      .toBe('invalid')
+  })
+
+  it('accepts the actual server lower bound plus later legal revisions', () => {
+    for (const [revision, members] of [
+      [1, [alice]],
+      [2, [alice, bob]],
+      [3, [alice, bob]],
+    ] as const) {
+      const valid = roster(revision, members)
+      expect(isVerifiedLobbyRoster(valid, alice.playerId, lobbyId)).toBe(true)
+    }
+    expect(reconcilePolledRoster(
+      roster(2), roster(3), alice.playerId,
+    )).toBe('updated')
+    expect(classifyConflictRosterRefresh(
+      roster(2), roster(3, [bob]), alice.playerId,
+    )).toBe('missing')
   })
 })
 
@@ -318,6 +365,13 @@ describe('409 conflict refresh requires validated membership proof (#115)', () =
     ['duplicate participant', roster(5, [bob, bob])],
     ['missing team', { ...roster(5), teamIds: ['white'] }],
     ['malformed revision', { ...roster(5, [bob]), revision: 1.5 }],
+    ['revision below member count', roster(4, [alice, bob, {
+      playerId: 'guest-' + '3'.repeat(32), teamId: 'white', heroId: null,
+    }, {
+      playerId: 'guest-' + '4'.repeat(32), teamId: 'black', heroId: null,
+    }, {
+      playerId: 'guest-' + '5'.repeat(32), teamId: 'white', heroId: null,
+    }])],
     ['unexpected participant field', { ...roster(5),
       participants: [alice, { ...bob, secretRoute: 'hidden' }] }],
   ])('does not infer revocation after 409 from %s', (_kind, incoming) => {
