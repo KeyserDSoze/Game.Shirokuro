@@ -35,34 +35,25 @@ export type PollFailureDecision = 'expired' | 'missing' | 'retain'
 export function reconcilePolledRoster(
   current: LobbyRoster, incoming: LobbyRoster, actorId: string,
 ): PolledRosterDecision {
-  if (!incoming || incoming.lobbyId !== current.lobbyId ||
-      !Number.isSafeInteger(incoming.revision) || incoming.revision < current.revision ||
-      !Array.isArray(incoming.teamIds) ||
-      !incoming.teamIds.every(team => typeof team === 'string') ||
-      !Array.isArray(incoming.participants) ||
-      !incoming.participants.every(participant =>
-        participant != null && typeof participant.playerId === 'string' &&
-        typeof participant.teamId === 'string' &&
-        (participant.heroId === null || typeof participant.heroId === 'string'))) {
+  // A malformed 200 is never evidence that the actor left the room.
+  // Use the same strict structural contract as explicit roster actions.
+  if (!isWellFormedLobbyRoster(incoming, current.lobbyId, current.revision))
     return 'unchanged'
-  }
-  if (!incoming.participants.some(participant => participant.playerId === actorId)) {
+  // Only a structurally valid, authorized roster can prove membership loss.
+  if (!incoming.participants.some(participant => participant.playerId === actorId))
     return 'missing'
-  }
   return incoming.revision > current.revision ? 'updated' : 'unchanged'
 }
 
 /**
- * Validate explicit pre-match responses before putting them into the UI.
- * Server authentication remains authoritative; a 200 alone is not permission
- * to import an unrelated, stale or malformed private roster.
+ * Validate the *shared* HTTP DTO contract before any explicit or passive
+ * roster is adopted. This does not replace member authorization on .NET.
+ * Do not import new/unknown fields that might contain private match data.
  */
-export function isVerifiedLobbyRoster(
-  payload: unknown, actorId: string, expectedRoomId?: string,
-  minimumRevision?: number,
+function isWellFormedLobbyRoster(
+  payload: unknown, expectedRoomId?: string, minimumRevision?: number,
 ): payload is LobbyRoster {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
-      typeof actorId !== 'string' || actorId.length === 0) return false
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
   const data = payload as Record<string, unknown>
   const keys = ['lobbyId', 'revision', 'teamIds', 'participants']
   if (Object.keys(data).length !== keys.length ||
@@ -97,7 +88,21 @@ export function isVerifiedLobbyRoster(
       return false
     seen.add(player.playerId)
   }
-  return seen.has(actorId)
+  return true
+}
+
+/**
+ * An explicit response requires valid shape AND the authenticated actor
+ * among the participants. A structurally valid passive roster with no actor
+ * is treated separately by reconcilePolledRoster as missing membership.
+ */
+export function isVerifiedLobbyRoster(
+  payload: unknown, actorId: string, expectedRoomId?: string,
+  minimumRevision?: number,
+): payload is LobbyRoster {
+  return typeof actorId === 'string' && actorId.length > 0 &&
+    isWellFormedLobbyRoster(payload, expectedRoomId, minimumRevision) &&
+    payload.participants.some(participant => participant.playerId === actorId)
 }
 
 /** 401 and 404 are authoritative; transient failures keep the last roster. */

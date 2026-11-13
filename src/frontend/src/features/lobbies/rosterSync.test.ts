@@ -57,6 +57,22 @@ describe('pre-match authenticated lobby polling', () => {
       .toBe('unchanged')
   })
 
+  it.each([
+    ['unknown private field', { ...roster(3), secretRoute: 'hidden-path' }],
+    ['unknown player field', { ...roster(3), participants: [{ ...alice, destination: 'hidden-path' }, bob] }],
+    ['duplicate player', roster(3, [alice, alice])],
+    ['duplicate team', { ...roster(3), teamIds: ['white', 'white'] }],
+    ['unknown player team', roster(3, [{ ...alice, teamId: 'unknown' }, bob])],
+    ['empty roster', roster(3, [])],
+    ['too many members', roster(3, Array.from({ length: 17 }, (_, i) =>
+      ({ playerId: 'guest-' + i, teamId: 'white', heroId: null })))],
+    ['invalid room ID', { ...roster(3), lobbyId: 'room-INVALID' }],
+    ['additional field and missing actor', { ...roster(3, [bob]), secretRoute: 'hidden' }],
+  ])('rejects passive 200 with %s without changing or revoking the room', (_case, incoming) => {
+    expect(reconcilePolledRoster(roster(2), incoming as LobbyRoster, alice.playerId))
+      .toBe('unchanged')
+  })
+
   it('backs off on transient errors, caps retry delay and resets after success', () => {
     expect(rosterPollDelayMs(0, 0)).toBe(15_000)
     expect(rosterPollDelayMs(1, 0)).toBe(30_000)

@@ -142,3 +142,8 @@ GitHub Issues remain the source of detailed truth. This file is a compact index.
 ## Validazione risposte roster #110 — 13/11/2026
 
 - [Issue #110](https://github.com/KeyserDSoze/Game.Shirokuro/issues/110), follow-up #21/#109: il frontend valida forma del DTO roster esplicito, membership dell'ospite, stanza attesa, revisione monotona, coerenza squadre/partecipanti e assenza di proprietà inattese prima di adottare un HTTP 200 da create/join/refresh/hero/team. Un 200 malformato conserva lo stato privato già verificato e segnala indisponibilità senza re-login o replay del comando. Nuovi Vitest e Playwright con risposte 200 simulate su una sessione reale; chiusura soltanto dopo verifica della CI su main HEAD, stato definitivo nell'issue.
+
+
+## Avanzamento #111 — validazione uniforme dei roster passivi (13/11/2026)
+
+- [#111](https://github.com/KeyserDSoze/Game.Shirokuro/issues/111), follow-up a #21/#110: un GET passivo /roster/peek HTTP 200 non deve importare campi privati sconosciuti o roster con participant/team duplicati, team inesistenti, revisione obsoleta o formato invalido. `reconcilePolledRoster` usa ora lo stesso schema rigoroso delle azioni esplicite: solo una risposta **strutturalmente valida** senza l'attore segnala membership mancante; risposte malformate/di altra lobby sono ignorate senza cancellare sessione o dati validi. Aggiunti casi Vitest con DTO avversari e Playwright che osserva la revisione ETag al polling successivo (evita test racy), oltre a 304, 503, 404 e 401. Nessun cambio a server API, gameplay, timeout o frequenza del polling. **Stato iniziale:** in verifica sulla CI main; aggiornare issue dopo esito.
