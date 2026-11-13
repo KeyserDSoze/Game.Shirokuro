@@ -158,6 +158,120 @@ test('guest lobby UI is translated and keyboard-accessible on mobile', async ({ 
   await expect(page.getByTestId('world-stage')).toBeVisible()
 })
 
+test('pending invitation clipboard cannot overwrite confirmed room loss feedback', async ({ page }) => {
+  const actor = 'guest-' + '7'.repeat(32)
+  const roomIds = ['7', '8', '9'].map(char => 'room-' + char.repeat(32))
+  let signedIn = false
+  let guestPosts = 0
+  let creates = 0
+  let leaves = 0
+  let reads = 0
+  let teamWrites = 0
+
+  // Real clipboard permissions are covered elsewhere. Fake only delayed
+  // clipboard outcomes and HTTP so this test consumes no guest IP quota.
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    guestPosts++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    const lobbyId = roomIds[creates++]
+    return route.fulfill({ status: 201, json: {
+      lobbyId, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+    } })
+  })
+  await page.route('**/api/lobbies/*/membership', route => {
+    leaves++
+    return route.fulfill({ status: 204 })
+  })
+  await page.route('**/api/lobbies/*/roster', route => {
+    reads++
+    return route.fulfill({ status: 404 })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[0])
+
+  // A successful clipboard permission result arriving after DELETE 204
+  // cannot replace the authenticated 'left lobby' status (#118).
+  await page.evaluate(() => {
+    const w = window as Window & { finishCopy?: () => void }
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: () => new Promise<void>(resolve => { w.finishCopy = resolve }),
+    } })
+  })
+  await page.getByTestId('lobby-copy-invite').click()
+  await page.waitForFunction(() =>
+    typeof (window as Window & { finishCopy?: () => void }).finishCopy === 'function')
+  await page.getByTestId('lobby-leave').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('lasciato la lobby')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await page.evaluate(async () => {
+    (window as Window & { finishCopy?: () => void }).finishCopy?.()
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+  await expect(page.getByTestId('lobby-message')).toContainText('lasciato la lobby')
+
+  // Also ignore late *rejection* when a member-only roster GET returned 404.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[1])
+  await page.evaluate(() => {
+    const w = window as Window & { finishCopy?: () => void }
+    delete w.finishCopy
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: () => new Promise<void>((_resolve, reject) => {
+        w.finishCopy = () => reject(new Error('Late clipboard denial'))
+      }),
+    } })
+  })
+  await page.getByTestId('lobby-copy-invite').click()
+  await page.waitForFunction(() =>
+    typeof (window as Window & { finishCopy?: () => void }).finishCopy === 'function')
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await page.evaluate(async () => {
+    (window as Window & { finishCopy?: () => void }).finishCopy?.()
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+
+  // An active mutation must temporarily disable copying the room invite;
+  // a 503 does not revoke the verified room or its copy control.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[2])
+  let releaseTeam: (() => void) | undefined
+  await page.route('**/api/lobbies/*/team', async route => {
+    teamWrites++
+    await new Promise<void>(resolve => { releaseTeam = resolve })
+    await route.fulfill({ status: 503 })
+  })
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-copy-invite')).toBeDisabled()
+  await expect.poll(() => teamWrites).toBe(1)
+  releaseTeam?.()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  await expect(page.getByTestId('lobby-copy-invite')).toBeEnabled()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[2])
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  expect(guestPosts).toBe(1)
+  expect(creates).toBe(3)
+  expect(leaves).toBe(1)
+  expect(reads).toBe(1)
+  expect(teamWrites).toBe(1)
+})
+
 test('malformed 200 session envelopes never create a guest or revoke a verified lobby', async ({ page }) => {
   const code = 'room-' + 'c'.repeat(32)
   const playerId = 'guest-' + 'c'.repeat(32)

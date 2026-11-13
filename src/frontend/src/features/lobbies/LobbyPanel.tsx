@@ -412,8 +412,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     if (!code) return
     const generation = sessionGenerationRef.current
     const operation = operationRef.current
+    // The room can be lost while browser clipboard permission is pending.
+    // Guest identity and operation may remain unchanged after forgetRoom().
+    // Never overwrite authoritative leave/missing feedback for an old invite.
     const isCurrent = () => generation === sessionGenerationRef.current &&
-      operation === operationRef.current
+      operation === operationRef.current &&
+      currentRoomRef.current?.lobbyId === code
     try {
       if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable')
       await navigator.clipboard.writeText(code)
@@ -542,6 +546,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   size="sm"
                   data-testid="lobby-copy-invite"
+                  disabled={busy}
                   onClick={() => void copyInvitation()}
                 >
                   {t('lobbyCopyInvite')}
