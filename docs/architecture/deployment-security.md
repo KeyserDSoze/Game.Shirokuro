@@ -1437,9 +1437,11 @@ other potentially identifying strings. The bounded parser consumes only
 `role`, `connected_slaves`, `master_link_status` and the numeric
 `lag` of `slaveN` entries that are online. It rejects oversized
 payloads, malformed counts and invalid role/link without echoing raw
-Redis content. The primary's reported replica rows must be exactly canonical
-`slave0` through `slaveN-1` for `connected_slaves:N`: gaps,
-out-of-range indices and aliases such as `slave00` are **invalid INFO**.
+Redis content. The primary's `slaveN` rows must use **canonical, unique decimal
+indices** (no aliases such as `slave00`) and their **number** must
+match `connected_slaves`. Redis may reuse or retain **sparse indices**
+after topology changes; gaps are **not** by themselves invalid INFO.
+This was verified by a real TLS replica-promotion CI regression (#108).
 Only known `online`, `wait_bgsave` and `send_bulk` states are accepted;
 only `online` contributes to the maximum ACK lag. Replica-role INFO may
 not claim primary-only `connected_slaves` or `slaveN` rows. On inconsistency

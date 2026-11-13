@@ -75,9 +75,8 @@ public static class RedisReplicationInfo
                     if (!int.TryParse(key.AsSpan(5), NumberStyles.None,
                             CultureInfo.InvariantCulture, out var replicaIndex) ||
                         // Redis enumerates connected replicas as slave0..N-1.
-                        // Reject aliases (slave00), missing indices and
-                        // unrelated slaveN rows instead of publishing a
-                        // misleading "ok" replication sample.
+                        // Reject aliases (slave00) and duplicate IDs, but
+                        // preserve sparse canonical indices from real Redis.
                         key != "slave" + replicaIndex.ToString(
                             CultureInfo.InvariantCulture) ||
                         !replicaIndices.Add(replicaIndex))
@@ -120,9 +119,12 @@ public static class RedisReplicationInfo
 
         return role switch
         {
+            // Redis INFO indices are identifiers, not always contiguous
+            // 0..N-1 slots after topology changes. Count must match the
+            // number of unique canonical slaveN rows; do not fabricate
+            // a contiguous-index requirement from connected_slaves.
             RedisReplicationRole.Primary when connected is not null &&
-                connected == replicaIndices.Count && link is null &&
-                replicaIndices.All(index => index >= 0 && index < connected.Value) =>
+                connected == replicaIndices.Count && link is null =>
                 new RedisReplicationSnapshot(
                     RedisReplicationRole.Primary,
                     RedisReplicaLink.NotApplicable, connected, maxLag),
