@@ -35,7 +35,7 @@ describe('pre-match authenticated lobby polling', () => {
   it('rejects rosters for another lobby regardless of revision or participants', () => {
     expect(reconcilePolledRoster(
       roster(1), { ...roster(100), lobbyId: otherId }, alice.playerId,
-    )).toBe('unchanged')
+    )).toBe('invalid')
   })
 
   it('treats an authorized 200 that lost actor membership as missing, not public roster', () => {
@@ -52,9 +52,9 @@ describe('pre-match authenticated lobby polling', () => {
     [{ ...roster(2), participants: null }],
     [{ ...roster(2), participants: [null] }],
     [{ ...roster(2), participants: [{ playerId: 'guest-alice' }] }],
-  ])('ignores malformed responses without changing or revoking local state', payload => {
+  ])('classifies malformed responses separately without authorizing room changes', payload => {
     expect(reconcilePolledRoster(roster(1), payload as LobbyRoster, alice.playerId))
-      .toBe('unchanged')
+      .toBe('invalid')
   })
 
   it.each([
@@ -68,9 +68,25 @@ describe('pre-match authenticated lobby polling', () => {
       ({ playerId: 'guest-' + i, teamId: 'white', heroId: null })))],
     ['invalid room ID', { ...roster(3), lobbyId: 'room-INVALID' }],
     ['additional field and missing actor', { ...roster(3, [bob]), secretRoute: 'hidden' }],
-  ])('rejects passive 200 with %s without changing or revoking the room', (_case, incoming) => {
+  ])('flags passive 200 with %s for backoff without changing the room', (_case, incoming) => {
     expect(reconcilePolledRoster(roster(2), incoming as LobbyRoster, alice.playerId))
-      .toBe('unchanged')
+      .toBe('invalid')
+  })
+
+  it('distinguishes invalid payloads from valid stale/no-change and missing-member responses', () => {
+    const current = roster(7)
+    expect(reconcilePolledRoster(current, { ...roster(8), secretRoute: 'hidden' } as LobbyRoster, alice.playerId))
+      .toBe('invalid')
+    expect(reconcilePolledRoster(current, roster(6), alice.playerId)).toBe('unchanged')
+    expect(reconcilePolledRoster(current, roster(7), alice.playerId)).toBe('unchanged')
+    expect(reconcilePolledRoster(current, roster(7, [bob]), alice.playerId)).toBe('missing')
+    expect(reconcilePolledRoster(current, roster(6, [bob]), alice.playerId)).toBe('unchanged')
+    expect(reconcilePolledRoster(current, roster(8), alice.playerId)).toBe('updated')
+    // Scheduler maps repeated invalid DTOs to the same capped delays
+    // already used for 503/unreachable Redis, rather than the healthy 15s.
+    expect(rosterPollDelayMs(1, 0)).toBe(30_000)
+    expect(rosterPollDelayMs(2, 0)).toBe(60_000)
+    expect(rosterPollDelayMs(3, 0)).toBe(120_000)
   })
 
   it('backs off on transient errors, caps retry delay and resets after success', () => {

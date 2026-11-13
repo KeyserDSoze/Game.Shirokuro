@@ -560,7 +560,9 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
 })
 
 test('auto-sync rejects malformed 200, retains view on 503 and clears only on authorized 404/401', async ({ page }) => {
-  test.setTimeout(135_000)
+  // Bounded backoff after an invalid 200 adds 15s to this end-to-end
+  // sequence; subsequent 503 now correctly escalates to 60s rather than 30s.
+  test.setTimeout(195_000)
   const code = 'room-' + 'e'.repeat(32)
   const playerId = 'guest-browser-poll'
   const roster = {
@@ -588,8 +590,8 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
     await route.fulfill({ status: 201, json: roster })
   })
 
-  // Exercise 304, a malformed 200, 503, 404 and 401 without minting
-  // additional guest identities or adding automatic writes (#111).
+  // Exercise 304, malformed 200 with outage backoff, 503, 404 and 401
+  // without minting identities or issuing automatic writes (#111/#112).
   let status = 304
   let reads = 0
   const validators: (string | undefined)[] = []
@@ -634,7 +636,11 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   expect(validators[1]).toBe('"rev-1"')
 
   status = 503
-  await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(3)
+  // Malformed 200 must NOT reset the outage counter. The next GET is
+  // delayed at least 30s rather than the normal healthy 15s.
+  await expect.poll(() => reads, { timeout: 45_000 }).toBeGreaterThanOrEqual(3)
+  expect(pollTimes[2] - pollTimes[1]).toBeGreaterThanOrEqual(30_000)
+  expect(pollTimes[2] - pollTimes[1]).toBeLessThan(45_000)
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   // The next actual request proves the malformed 200 was not adopted;
   // checking the UI immediately after the prior request would be racy.
@@ -645,11 +651,11 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   expect(mutations).toEqual([])
 
   status = 404
-  // After 503 the next background GET must be delayed to at least 30s;
-  // no immediate retry storm during Redis failover.
-  await expect.poll(() => reads, { timeout: 45_000 }).toBeGreaterThanOrEqual(4)
-  expect(pollTimes[3] - pollTimes[2]).toBeGreaterThanOrEqual(30_000)
-  expect(pollTimes[3] - pollTimes[2]).toBeLessThan(45_000)
+  // A second consecutive bad response (503) escalates the same bounded
+  // schedule to 60s, without repeated requests during Redis failover.
+  await expect.poll(() => reads, { timeout: 85_000 }).toBeGreaterThanOrEqual(4)
+  expect(pollTimes[3] - pollTimes[2]).toBeGreaterThanOrEqual(60_000)
+  expect(pollTimes[3] - pollTimes[2]).toBeLessThan(80_000)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-create')).toBeVisible()
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)

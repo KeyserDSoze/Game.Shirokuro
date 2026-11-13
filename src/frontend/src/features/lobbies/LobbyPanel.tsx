@@ -212,11 +212,22 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         const latest = await guestLobbyApi.peek(
           roomId, currentRoomRef.current?.revision, controller.signal)
         if (!stillCurrent()) return
-        // Both an authorized 200 and a no-body 304 mean service recovered.
-        transientFailures = 0
-        if (latest === null) return
+        // A member-authorized 304 is a successful no-change response.
+        if (latest === null) {
+          transientFailures = 0
+          return
+        }
         const current = currentRoomRef.current!
         const result = reconcilePolledRoster(current, latest, actorId)
+        if (result === 'invalid') {
+          // Even HTTP 200 can carry an unusable DTO during API/proxy
+          // regressions: fail closed and back off, never refresh at 15s.
+          transientFailures = Math.min(3, transientFailures + 1)
+          return
+        }
+        // Valid, including a stale but well-formed revision, means the API
+        // is responsive. Do not penalize an authorized no-change snapshot.
+        transientFailures = 0
         if (result === 'updated') {
           setRoom(previous =>
             previous?.lobbyId === roomId && previous.revision < latest.revision

@@ -24,7 +24,7 @@ export function rosterPollDelayMs(
     Math.round(base * (1 + fraction * 0.2)))
 }
 
-export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing'
+export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing' | 'invalid'
 export type PollFailureDecision = 'expired' | 'missing' | 'retain'
 
 /**
@@ -35,11 +35,15 @@ export type PollFailureDecision = 'expired' | 'missing' | 'retain'
 export function reconcilePolledRoster(
   current: LobbyRoster, incoming: LobbyRoster, actorId: string,
 ): PolledRosterDecision {
-  // A malformed 200 is never evidence that the actor left the room.
-  // Use the same strict structural contract as explicit roster actions.
-  if (!isWellFormedLobbyRoster(incoming, current.lobbyId, current.revision))
+  // Malformed/wrong-room HTTP 200 is not healthy service recovery:
+  // report it separately so the caller can apply bounded outage backoff.
+  if (!isWellFormedLobbyRoster(incoming, current.lobbyId))
+    return 'invalid'
+  // Valid but obsolete observations must not revoke even if membership is
+  // absent, and do not count as invalid transport data.
+  if (incoming.revision < current.revision)
     return 'unchanged'
-  // Only a structurally valid, authorized roster can prove membership loss.
+  // Only a structurally valid, current roster can prove membership loss.
   if (!incoming.participants.some(participant => participant.playerId === actorId))
     return 'missing'
   return incoming.revision > current.revision ? 'updated' : 'unchanged'
