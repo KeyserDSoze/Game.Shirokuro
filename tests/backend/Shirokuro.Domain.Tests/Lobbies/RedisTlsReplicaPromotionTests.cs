@@ -28,6 +28,71 @@ public sealed class RedisTlsReplicaPromotionTests
     private const string MasterContainer = "shirokuro-ci-redis-ha-master";
     private const string ReplicaContainer = "shirokuro-ci-redis-ha-replica";
 
+    /// <summary>
+    /// CI-only diagnostics when a genuine Redis INFO sample is rejected.
+    /// Do not print INFO raw: it includes replica IPs and replication IDs.
+    /// Keep only fixed role/link categories, bounded counts and slaveN
+    /// decimal identifiers + short alphabetic state names.
+    /// </summary>
+    private static RedisReplicationSnapshot ParseRealInfoForTest(string raw)
+    {
+        try
+        {
+            return RedisReplicationInfo.Parse(raw);
+        }
+        catch (FormatException)
+        {
+            var shape = new List<string>();
+            foreach (var sourceLine in raw.Split('\n'))
+            {
+                var line = sourceLine.TrimEnd('\r');
+                if (line.StartsWith("role:", StringComparison.Ordinal))
+                {
+                    shape.Add(line switch
+                    {
+                        "role:master" => "role=master",
+                        "role:slave" => "role=slave",
+                        "role:replica" => "role=replica",
+                        _ => "role=unknown"
+                    });
+                }
+                else if (line.StartsWith("connected_slaves:", StringComparison.Ordinal))
+                {
+                    var number = line["connected_slaves:".Length..];
+                    shape.Add(int.TryParse(number, out var count) &&
+                        count >= 0 && count <= 1024
+                        ? "connected=" + count : "connected=invalid");
+                }
+                else if (line.StartsWith("master_link_status:", StringComparison.Ordinal))
+                {
+                    shape.Add(line switch
+                    {
+                        "master_link_status:up" => "link=up",
+                        "master_link_status:down" => "link=down",
+                        _ => "link=other"
+                    });
+                }
+                else if (line.StartsWith("slave", StringComparison.Ordinal))
+                {
+                    var colon = line.IndexOf(':');
+                    if (colon <= 5 || colon > 12 ||
+                        line.AsSpan(5, colon - 5).IndexOfAnyExcept(
+                            "0123456789") >= 0)
+                        continue;
+                    var rowState = line[(colon + 1)..].Split(',').FirstOrDefault(
+                        part => part.StartsWith("state=", StringComparison.Ordinal));
+                    var state = rowState is null ? "missing" : rowState["state=".Length..];
+                    if (state.Length > 24 || state.Any(c =>
+                        !((c >= 'a' && c <= 'z') || c == '_')))
+                        state = "other";
+                    shape.Add(line[..colon] + ":state=" + state);
+                }
+            }
+            throw new InvalidOperationException(
+                "Sanitized Redis INFO shape: " + string.Join(";", shape));
+        }
+    }
+
     private static string? MasterConnection =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_HA_MASTER");
     private static string? ReplicaConnection =>
@@ -227,9 +292,9 @@ public sealed class RedisTlsReplicaPromotionTests
         // not a fixture string. Extract only role/count/ACK delay. The
         // primary can report connected replicas, while a replica only
         // reports link status, and neither leaks its master_host/IP.
-        var masterSample = RedisReplicationInfo.Parse(
+        var masterSample = ParseRealInfoForTest(
             await RedisCliAsync(MasterContainer, "INFO", "replication"));
-        var replicaSample = RedisReplicationInfo.Parse(
+        var replicaSample = ParseRealInfoForTest(
             await RedisCliAsync(ReplicaContainer, "INFO", "replication"));
         Assert.Equal(RedisReplicationRole.Primary, masterSample.Role);
         Assert.Equal(RedisReplicaLink.NotApplicable, masterSample.Link);
