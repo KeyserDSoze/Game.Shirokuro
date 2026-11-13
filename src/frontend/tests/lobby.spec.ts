@@ -642,6 +642,114 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
 })
 
+test('404 room loss and confirmed 204 leave erase stale invite, not guest identity', async ({ page }) => {
+  const actor = 'guest-' + '6'.repeat(32)
+  const roomIds = ['1', '2', '3', '4'].map(hex => 'room-' + hex.repeat(32))
+  const unknownInvite = 'room-' + '9'.repeat(32)
+  let signedIn = false
+  let guestPosts = 0
+  let created = 0
+  let teamWrites = 0
+  let joinWrites = 0
+  let rosterReads = 0
+  let leaves = 0
+  let teamStatus = 404
+
+  // Fake only this browser scenario; no real guest issuance/IP quota.
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    guestPosts++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    const lobbyId = roomIds[created++]
+    return route.fulfill({ status: 201, json: {
+      lobbyId, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+    } })
+  })
+  await page.route('**/api/lobbies/*/team', route => {
+    teamWrites++
+    return route.fulfill({ status: teamStatus })
+  })
+  await page.route('**/api/lobbies/*/join', route => {
+    joinWrites++
+    return route.fulfill({ status: 404 })
+  })
+  await page.route('**/api/lobbies/*/roster', route => {
+    rosterReads++
+    return route.fulfill({ status: 404 })
+  })
+  await page.route('**/api/lobbies/*/membership', route => {
+    leaves++
+    return route.fulfill({ status: 204 })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // 404 from an authenticated current-room mutation clears room and invite.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[0])
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // A rejected join for a never-verified room is different: keep the
+  // manually entered invitation editable, with no guest revocation.
+  await page.getByTestId('lobby-invite-input').fill(unknownInvite)
+  await page.getByTestId('lobby-join').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue(unknownInvite)
+
+  // 409 followed by GET 404 proves the existing room is gone.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[1])
+  teamStatus = 409
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  expect(rosterReads).toBe(1)
+
+  // Redis/edge outage preserves the verified room, but 204 leave does not.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[2])
+  teamStatus = 503
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('temporaneamente non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[2])
+  await expect(page.getByTestId('lobby-revision')).toContainText('1')
+  await page.getByTestId('lobby-leave').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('lasciato la lobby')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+
+  // The member-scoped explicit GET 404 also invalidates the current room.
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomIds[3])
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Lobby non disponibile')
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // Exactly the clicks above: no background mutations or new guest tickets.
+  expect(guestPosts).toBe(1)
+  expect(created).toBe(4)
+  expect(teamWrites).toBe(3)
+  expect(joinWrites).toBe(1)
+  expect(rosterReads).toBe(2)
+  expect(leaves).toBe(1)
+})
+
 test('409 refresh rejects malformed membership loss and only clears on verified loss', async ({ page }) => {
   const code = 'room-' + 'b'.repeat(32)
   const actorId = 'guest-' + 'b'.repeat(32)

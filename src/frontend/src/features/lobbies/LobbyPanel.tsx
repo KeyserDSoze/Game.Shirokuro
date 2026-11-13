@@ -60,19 +60,24 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     sessionChannelRef.current?.postMessage('recheck')
   }
 
-  // Drop every locally cached private room reference if the cookie becomes
-  // invalid. Only the server may issue a replacement guest identity.
-  const forgetGuest = useCallback(() => {
+  // Invalidate the old room *before* React updates its rendered state.
+  // This drops the passive reader and stale bearer invite, not the guest.
+  const forgetRoom = useCallback(() => {
     passivePollAbortRef.current?.abort()
     currentRoomRef.current = null
+    setRoom(null)
+    setInvite('')
+  }, [])
+
+  // A revoked guest loses its room and all in-flight operation authority.
+  const forgetGuest = useCallback(() => {
+    forgetRoom()
     sessionGenerationRef.current++
     operationRef.current++
     busyRef.current = false
     setBusy(false)
     setSession(null)
-    setRoom(null)
-    setInvite('')
-  }, [])
+  }, [forgetRoom])
 
   useEffect(() => {
     let active = true
@@ -234,8 +239,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
               ? latest : previous)
         } else if (result === 'missing') {
           terminal = true
-          setRoom(previous => previous?.lobbyId === roomId ? null : previous)
-          setInvite('')
+          forgetRoom()
           setMessage(t('lobbyMissing'))
         }
       } catch (error) {
@@ -249,8 +253,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           setMessage(t('lobbySessionExpired'))
         } else if (outcome === 'missing') {
           terminal = true
-          setRoom(previous => previous?.lobbyId === roomId ? null : previous)
-          setInvite('')
+          forgetRoom()
           setMessage(t('lobbyMissing'))
         } else {
           // 403, 429, 5xx and offline preserve the authenticated roster.
@@ -276,7 +279,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       window.clearTimeout(timer)
       inFlightAbort?.abort()
     }
-  }, [roomId, actorId, forgetGuest, t])
+  }, [roomId, actorId, forgetGuest, forgetRoom, t])
 
   async function run(action: (isCurrent: () => boolean) => Promise<void>) {
     if (busyRef.current) return
@@ -328,9 +331,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             if (decision === 'missing') {
               // Only a complete, current, same-room roster can revoke the
               // local room view. Keep the signed guest (not a 401).
-              currentRoomRef.current = null
-              setRoom(null)
-              setInvite('')
+              forgetRoom()
               setMessage(t('lobbyMissing'))
               return
             }
@@ -346,7 +347,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                 return
               }
               if (refreshError.status === 404) {
-                setRoom(null)
+                // The confirmed 404 belongs to this already verified room.
+                if (currentRoomRef.current?.lobbyId === conflictRoomId)
+                  forgetRoom()
                 setMessage(t('lobbyMissing'))
                 return
               }
@@ -357,8 +360,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             return
           }
         }
-        // A missing room is stale, but 403/429/503 do NOT prove logout.
-        if (error.status === 404) setRoom(null)
+        // A 404 for a verified room removes its obsolete invite, too.
+        // A 404 while joining an unknown code is not room loss; leave the
+        // typed invitation available for a deliberate correction (#116).
+        if (error.status === 404 && conflictRoomId &&
+            currentRoomRef.current?.lobbyId === conflictRoomId) forgetRoom()
         const key = error.status === 409 ? 'lobbyConflict' :
           error.status === 404 ? 'lobbyMissing' :
           error.status === 429 ? 'lobbyLimited' :
@@ -622,8 +628,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                     // Clear the passive poll's current-room identity before
                     // committing the React state change: a late GET/404 after
                     // successful DELETE must not overwrite "lobby left".
-                    currentRoomRef.current = null
-                    setRoom(null)
+                    forgetRoom()
                     setMessage(t('lobbyLeft'))
                   })}
                 >
