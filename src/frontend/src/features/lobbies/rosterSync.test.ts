@@ -222,7 +222,8 @@ describe('409 conflict refresh requires validated membership proof (#115)', () =
     ['duplicate participant', roster(5, [bob, bob])],
     ['missing team', { ...roster(5), teamIds: ['white'] }],
     ['malformed revision', { ...roster(5, [bob]), revision: 1.5 }],
-    ['unexpected participant field', roster(5, [alice, { ...bob, secretRoute: 'hidden' }])],
+    ['unexpected participant field', { ...roster(5),
+      participants: [alice, { ...bob, secretRoute: 'hidden' }] }],
   ])('does not infer revocation after 409 from %s', (_kind, incoming) => {
     expect(classifyConflictRosterRefresh(roster(4), incoming, alice.playerId))
       .toBe('invalid')
