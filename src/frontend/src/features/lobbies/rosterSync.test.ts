@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { heroRoster } from '@/features/heroes/catalog'
 import type { LobbyRoster } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
@@ -64,6 +65,11 @@ describe('pre-match authenticated lobby polling', () => {
     ['duplicate player', roster(3, [alice, alice])],
     ['duplicate team', { ...roster(3), teamIds: ['white', 'white'] }],
     ['unknown player team', roster(3, [{ ...alice, teamId: 'unknown' }, bob])],
+    ['unknown hero for other member', roster(3, [alice, { ...bob, heroId: 'wanderer' }])],
+    ['uppercase hero for other member', roster(3, [alice, { ...bob, heroId: 'Kira' }])],
+    ['huge hero for other member', roster(3, [alice, { ...bob, heroId: 'kira'.repeat(100_000) }])],
+    ['non-string hero for other member', { ...roster(3),
+      participants: [alice, { ...bob, heroId: 17 }] }],
     ['legacy noncanonical guest ID', roster(3, [alice, { ...bob, playerId: 'guest-bob' }])],
     ['uppercase guest hex', roster(3, [alice, { ...bob, playerId: 'guest-' + 'F'.repeat(32) }])],
     ['truncated guest ID', roster(3, [alice, { ...bob, playerId: 'guest-' + 'f'.repeat(31) }])],
@@ -157,6 +163,12 @@ describe('explicit authenticated roster adoption (#110)', () => {
     ['missing actor', roster(8, [bob])],
     ['duplicate player', roster(8, [alice, alice])],
     ['unknown team', roster(8, [{ ...alice, teamId: 'other' }])],
+    ['unknown hero ID', roster(8, [alice, { ...bob, heroId: 'wanderer' }])],
+    ['uppercase hero ID', roster(8, [alice, { ...bob, heroId: 'Kira' }])],
+    ['empty hero ID', roster(8, [alice, { ...bob, heroId: '' }])],
+    ['huge hero ID', roster(8, [alice, { ...bob, heroId: 'kira'.repeat(100_000) }])],
+    ['numeric hero ID', { ...roster(8), participants: [alice, { ...bob, heroId: 12 }] }],
+    ['hero ID object', { ...roster(8), participants: [alice, { ...bob, heroId: { id: 'kira' } }] }],
     ['legacy participant ID', roster(8, [alice, { ...bob, playerId: 'guest-bob' }])],
     ['uppercase participant ID', roster(8, [alice, { ...bob, playerId: 'guest-' + 'A'.repeat(32) }])],
     ['arbitrary participant ID', roster(8, [alice, { ...bob, playerId: 'other-account' }])],
@@ -192,6 +204,28 @@ describe('explicit authenticated roster adoption (#110)', () => {
   })
 })
 
+
+describe('canonical hero IDs across roster adoption (#117)', () => {
+  it.each(heroRoster.map(hero => hero.id))('accepts server-known hero %s from shared roster', heroId => {
+    const next = roster(4, [alice, { ...bob, heroId }])
+    expect(isVerifiedLobbyRoster(next, alice.playerId, lobbyId, 3)).toBe(true)
+    expect(reconcilePolledRoster(roster(3), next, alice.playerId)).toBe('updated')
+    expect(classifyConflictRosterRefresh(roster(3), next, alice.playerId))
+      .toBe('verified')
+  })
+
+  it('accepts unselected null hero and does not invent gameplay constraints', () => {
+    const next = roster(4, [alice, { ...bob, heroId: null }])
+    expect(isVerifiedLobbyRoster(next, alice.playerId, lobbyId, 3)).toBe(true)
+    expect(reconcilePolledRoster(roster(3), next, alice.playerId)).toBe('updated')
+  })
+
+  it('rejects a corrupt hero even when the actor is missing; not a revocation', () => {
+    const lost = roster(4, [{ ...bob, heroId: 'not-registered' }])
+    expect(reconcilePolledRoster(roster(3), lost, alice.playerId)).toBe('invalid')
+    expect(classifyConflictRosterRefresh(roster(3), lost, alice.playerId)).toBe('invalid')
+  })
+})
 
 describe('409 conflict refresh requires validated membership proof (#115)', () => {
   it('adopts only current, same-room, strictly verified member rosters', () => {

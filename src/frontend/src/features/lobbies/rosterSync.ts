@@ -1,3 +1,4 @@
+import { getHeroById } from '@/features/heroes/catalog'
 import { isCanonicalGuestPlayerId, type LobbyRoster } from './api'
 
 /** Read-only, member-scoped, pre-match synchronization; not match state. */
@@ -69,6 +70,8 @@ export function reconcilePolledRoster(
  * Validate the *shared* HTTP DTO contract before any explicit or passive
  * roster is adopted. This does not replace member authorization on .NET.
  * Do not import new/unknown fields that might contain private match data.
+ * Hero IDs use the same shared heroes.json catalog as the authoritative
+ * .NET OriginalHeroRoster. An unknown hero is not equivalent to no hero.
  */
 function isWellFormedLobbyRoster(
   payload: unknown, expectedRoomId?: string, minimumRevision?: number,
@@ -104,7 +107,8 @@ function isWellFormedLobbyRoster(
         typeof player.teamId !== 'string' ||
         !data.teamIds.includes(player.teamId) ||
         (player.heroId !== null &&
-          (typeof player.heroId !== 'string' || player.heroId.length === 0)))
+          (typeof player.heroId !== 'string' ||
+            getHeroById(player.heroId) === undefined)))
       return false
     seen.add(player.playerId)
   }

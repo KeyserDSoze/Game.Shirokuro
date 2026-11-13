@@ -575,8 +575,8 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
 
   // A 200 misrouted to another room, missing our member, containing
-  // noncanonical player IDs or private fields cannot replace the verified
-  // roster (#110/#114), even if our actor remains among participants.
+  // noncanonical IDs, unknown heroes or private fields cannot replace the
+  // verified roster (#110/#114/#117), even if our actor remains present.
   const verifiedResponse = await page.request.get('/api/lobbies/' + existingRoom + '/roster')
   expect(verifiedResponse.status()).toBe(200)
   const verified = await verifiedResponse.json()
@@ -593,6 +593,15 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
       { playerId: 'guest-noncanonical', teamId: 'white', heroId: null }] },
     { ...verified, participants: [...verified.participants,
       { playerId: 'guest-' + 'A'.repeat(32), teamId: 'black', heroId: null }] },
+    // These 200s preserve the legitimate actor and canonical participant
+    // identities, but carry hero IDs the server catalog cannot issue (#117).
+    { ...verified, participants: verified.participants.map(
+      (member: { playerId: string; teamId: string; heroId: string | null }) =>
+        ({ ...member, heroId: 'invented-character' })) },
+    { ...verified, participants: [...verified.participants,
+      { playerId: 'guest-' + 'c'.repeat(32), teamId: 'white', heroId: 'Kira' }] },
+    { ...verified, participants: [...verified.participants,
+      { playerId: 'guest-' + 'd'.repeat(32), teamId: 'black', heroId: 'kira'.repeat(10_000) }] },
     { ...verified, secretRoute: 'should-not-be-imported' },
     { ...verified, revision: 0 },
   ]) {
