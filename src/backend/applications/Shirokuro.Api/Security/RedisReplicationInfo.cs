@@ -74,6 +74,12 @@ public static class RedisReplicationInfo
                         break;
                     if (!int.TryParse(key.AsSpan(5), NumberStyles.None,
                             CultureInfo.InvariantCulture, out var replicaIndex) ||
+                        // Redis enumerates connected replicas as slave0..N-1.
+                        // Reject aliases (slave00), missing indices and
+                        // unrelated slaveN rows instead of publishing a
+                        // misleading "ok" replication sample.
+                        key != "slave" + replicaIndex.ToString(
+                            CultureInfo.InvariantCulture) ||
                         !replicaIndices.Add(replicaIndex))
                         throw new FormatException(InvalidInfo);
 
@@ -97,7 +103,10 @@ public static class RedisReplicationInfo
                             lag = seconds;
                         }
                     }
-                    if (string.IsNullOrEmpty(state))
+                    // Known Redis replication transfer phases are not
+                    // equivalent to a fully online, ACKing replica. Reject
+                    // unknown states rather than dropping ACK lag silently.
+                    if (state is not ("online" or "wait_bgsave" or "send_bulk"))
                         throw new FormatException(InvalidInfo);
                     if (state == "online")
                     {
@@ -112,10 +121,13 @@ public static class RedisReplicationInfo
         return role switch
         {
             RedisReplicationRole.Primary when connected is not null &&
-                connected == replicaIndices.Count && link is null => new RedisReplicationSnapshot(
+                connected == replicaIndices.Count && link is null &&
+                replicaIndices.All(index => index >= 0 && index < connected.Value) =>
+                new RedisReplicationSnapshot(
                     RedisReplicationRole.Primary,
                     RedisReplicaLink.NotApplicable, connected, maxLag),
-            RedisReplicationRole.Replica when link is not null =>
+            RedisReplicationRole.Replica when link is not null &&
+                connected is null && replicaIndices.Count == 0 =>
                 new RedisReplicationSnapshot(
                     RedisReplicationRole.Replica, link.Value, null, null),
             _ => throw new FormatException(InvalidInfo)

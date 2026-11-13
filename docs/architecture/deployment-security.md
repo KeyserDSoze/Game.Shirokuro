@@ -1437,7 +1437,15 @@ other potentially identifying strings. The bounded parser consumes only
 `role`, `connected_slaves`, `master_link_status` and the numeric
 `lag` of `slaveN` entries that are online. It rejects oversized
 payloads, malformed counts and invalid role/link without echoing raw
-Redis content. **Reported ACK lag is time since replica acknowledgment**;
+Redis content. The primary's reported replica rows must be exactly canonical
+`slave0` through `slaveN-1` for `connected_slaves:N`: gaps,
+out-of-range indices and aliases such as `slave00` are **invalid INFO**.
+Only known `online`, `wait_bgsave` and `send_bulk` states are accepted;
+only `online` contributes to the maximum ACK lag. Replica-role INFO may
+not claim primary-only `connected_slaves` or `slaveN` rows. On inconsistency
+the observer emits a fixed `outcome=invalid` sample and no replica count or
+ACK lag: an invalid sample is **not** a healthy zero-lag observation (#108).
+**Reported ACK lag is time since replica acknowledgment**;
 it is NOT replica byte-offset lag, not an end-to-end data-consistency
 proof, and cannot establish RPO=0 or failover RTO/SLA. Use independent,
 least-privilege Redis server exporter metrics, Sentinel quorum alerting,

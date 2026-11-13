@@ -64,6 +64,20 @@ public sealed class RedisReplicationMonitoringTests
     }
 
     [Theory]
+    [InlineData("wait_bgsave")]
+    [InlineData("send_bulk")]
+    public void PrimaryTransferStateNeverInventsAnOnlineAckLag(string phase)
+    {
+        var state = RedisReplicationInfo.Parse(
+            "role:master\nconnected_slaves:1\n" +
+            "slave0:ip=hidden.internal,state=" + phase + ",lag=42");
+        Assert.Equal(1, state.ConnectedReplicas);
+        Assert.Null(state.MaxOnlineAckLagSeconds);
+        Assert.DoesNotContain("hidden.internal", state.ToString(),
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
     [InlineData("up", RedisReplicaLink.Up)]
     [InlineData("down", RedisReplicaLink.Down)]
     public void ReplicaHasLinkStateButNeverPretendsToKnowPrimaryReplicaCount(
@@ -100,6 +114,13 @@ public sealed class RedisReplicationMonitoringTests
     [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=1\nslave00:state=online,lag=3")]
     [InlineData("role:master\nconnected_slaves:1\nslave2147483648:state=online,lag=1")]
     [InlineData("role:master\nconnected_slaves:1\nslave0:lag=1")]
+    [InlineData("role:master\nconnected_slaves:1\nslave1:state=online,lag=0")]
+    [InlineData("role:master\nconnected_slaves:2\nslave0:state=online,lag=0\nslave2:state=online,lag=0")]
+    [InlineData("role:master\nconnected_slaves:1\nslave00:state=online,lag=0")]
+    [InlineData("role:master\nconnected_slaves:1\nslave0:state=unknown,lag=1")]
+    [InlineData("role:master\nconnected_slaves:1\nslave0:state=disconnected,lag=1")]
+    [InlineData("role:slave\nmaster_link_status:up\nconnected_slaves:0")]
+    [InlineData("role:slave\nmaster_link_status:down\nslave0:state=online,lag=0")]
     [InlineData("role:slave\nmaster_link_status:broken")]
     public void InvalidReplicationInfoFailsWithConstantNonSensitiveMessage(string raw)
     {
