@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http.Features;
@@ -13,6 +14,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 using Shirokuro.Api.Security;
 using Shirokuro.Api.Readiness;
 using Xunit;
@@ -190,6 +192,80 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.False(response.Headers.Contains("Set-Cookie"));
         Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    [Fact]
+    public async Task UnsupportedSignedCookieFailsClosedBeforeRedisEvenDuringOutage()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var guestCookie = await Issue(anonymous, "https://game.example");
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        var options = server.Services
+            .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+            .Get(CookieAuthenticationDefaults.AuthenticationScheme);
+        var unsupported = new ClaimsPrincipal(new ClaimsIdentity(
+            [new Claim(ClaimTypes.NameIdentifier, "old-verified-account")],
+            CookieAuthenticationDefaults.AuthenticationScheme));
+        var ticket = new AuthenticationTicket(
+            unsupported, CookieAuthenticationDefaults.AuthenticationScheme);
+        var cookie = options.Cookie.Name + "=" +
+                     options.TicketDataFormat.Protect(ticket);
+
+        // A signed but unsupported account ticket must not become a valid
+        // account, nor automatically receive a replacement guest identity.
+        // Redis is unavailable yet no read may be attempted for this shape.
+        cache.Unavailable = true;
+        using var unsupportedClient = Client(server, cookie: cookie);
+        using (var privateRead = await unsupportedClient.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, privateRead.StatusCode);
+            Assert.Equal("no-store", privateRead.Headers.CacheControl?.ToString());
+            Assert.False(privateRead.Headers.Contains("Set-Cookie"));
+        }
+        using (var issuanceRequest = Mutation(
+                   HttpMethod.Post, "/api/sessions/guest", "https://game.example"))
+        using (var rejected = await unsupportedClient.SendAsync(issuanceRequest))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+        }
+        using (var negotiate = await unsupportedClient.PostAsync(
+                   "/hubs/lobbies/negotiate?negotiateVersion=1", null))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, negotiate.StatusCode);
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        // The issuance request uses the server's normal pre-auth technical
+        // admission quota, but it must not reach session registration.
+        Assert.Equal(2, limiter.Calls);
+
+        // Public probes never read guest Redis, even with a rejected ticket.
+        using (var health = await unsupportedClient.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        Assert.Equal(0, cache.Reads);
+
+        // A real, previously issued guest still fails closed at 503 during
+        // the *same* Redis outage, not 401 or an unsupported-account bypass.
+        using var realGuest = Client(server, cookie: guestCookie);
+        using (var outage = await realGuest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, outage.StatusCode);
+            Assert.Equal("no-store", outage.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(1, cache.Reads);
+        cache.Unavailable = false;
+        using var active = await realGuest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, cache.Writes);
     }
 
     [Fact]
