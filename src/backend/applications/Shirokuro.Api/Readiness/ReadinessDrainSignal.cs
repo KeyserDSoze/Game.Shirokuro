@@ -14,6 +14,13 @@ public interface IReadinessDrainSignal
 }
 
 /// <summary>
+/// Trusted routing marker for the two member-only HTTP roster GETs. Using
+/// endpoint metadata (not a URL prefix) prevents a draining node from
+/// changing unknown paths or framework 405 replies into misleading 503s.
+/// </summary>
+public sealed class LobbyRosterReadDrainRequired;
+
+/// <summary>
 /// Once ApplicationStopping is cancelled, this node must not advertise ready.
 /// This does not implement an ingress fence or a load-balancer grace period.
 /// </summary>
