@@ -220,6 +220,7 @@ public sealed class PreAuthenticationMutationGuardTests
         // A signed but unsupported account ticket must not become a valid
         // account, nor automatically receive a replacement guest identity.
         // Redis is unavailable yet no read may be attempted for this shape.
+        using var capture = new MultiplayerMetricCapture();
         cache.Unavailable = true;
         using var unsupportedClient = Client(server, cookie: cookie);
         using (var privateRead = await unsupportedClient.GetAsync("/api/sessions/me"))
@@ -266,6 +267,25 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(HttpStatusCode.OK, active.StatusCode);
         Assert.Equal(2, cache.Reads);
         Assert.Equal(1, cache.Writes);
+
+        // The only exported attribute is a fixed enum value; never include
+        // the signed non-guest NameIdentifier, cookie, IP or raw request path.
+        var decisions = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
+        Assert.Contains(decisions, item => item.Value == 1 &&
+            item.Tags.Count == 1 && item.Tags["outcome"] == "unsupported-ticket");
+        Assert.Contains(decisions, item => item.Value == 1 &&
+            item.Tags["outcome"] == "unavailable");
+        Assert.Contains(decisions, item => item.Value == 1 &&
+            item.Tags["outcome"] == "active");
+        Assert.All(decisions, item =>
+        {
+            Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
+            Assert.Contains(item.Tags["outcome"],
+                new[] { "active", "inactive", "unavailable",
+                         "recovery-cutoff", "unsupported-ticket" });
+            Assert.DoesNotContain("old-verified-account",
+                string.Join(",", item.Tags.Values), StringComparison.Ordinal);
+        });
     }
 
     [Fact]
@@ -942,6 +962,7 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(1, cache.Writes);
         Assert.Equal(1, limiter.Calls);
 
+        using var capture = new MultiplayerMetricCapture();
         cache.Unavailable = true;
         // POST is the registered method for room creation. A request with
         // the wrong method uses the framework's synthetic 405 and Allow
@@ -980,6 +1001,16 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
         Assert.Equal(2, cache.Reads);
         Assert.Equal(1, limiter.Calls);
+
+        // A method mismatch is counted at the early routing fence, not as
+        // an unavailable guest-cookie check. Real session requests above
+        // still report their own Redis authority outcome.
+        var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
+        Assert.Contains(ingress, x => x.Value == 1 &&
+            x.Tags.Count == 1 && x.Tags["reason"] == "method-not-allowed");
+        Assert.All(ingress, x => Assert.Single(x.Tags));
+        Assert.Contains(capture.For(MultiplayerMetrics.GuestCookieAuthorityName),
+            x => x.Tags["outcome"] == "unavailable");
     }
 
     [Fact]
@@ -995,6 +1026,7 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(1, cache.Writes);
         Assert.Equal(1, limiter.Calls);
 
+        using var capture = new MultiplayerMetricCapture();
         cache.Unavailable = true;
         // Routing has no endpoint for any of these namespace-bound paths.
         // The explicit non-JSON body must not turn a missing route into the
@@ -1057,6 +1089,22 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(HttpStatusCode.OK, restored.StatusCode);
         Assert.Equal(2, cache.Reads);
         Assert.Equal(1, cache.Writes);
+
+        // The counter uses closed server-provided labels only, irrespective
+        // of which unknown URL or hostile room suffix was requested.
+        var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
+        Assert.Contains(ingress, x => x.Value == 1 &&
+            x.Tags.Count == 1 && x.Tags["reason"] == "unknown-route");
+        Assert.Contains(ingress, x => x.Value == 1 &&
+            x.Tags.Count == 1 && x.Tags["reason"] == "method-not-allowed");
+        Assert.All(ingress, x =>
+        {
+            Assert.Single(x.Tags);
+            Assert.DoesNotContain("not-a-route",
+                string.Join(",", x.Tags.Values), StringComparison.Ordinal);
+            Assert.DoesNotContain("not-a-room",
+                string.Join(",", x.Tags.Values), StringComparison.Ordinal);
+        });
     }
 
     [Fact]
