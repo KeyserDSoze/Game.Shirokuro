@@ -1116,6 +1116,13 @@ test('409 refresh rejects malformed membership loss and only clears on verified 
     conflictReads++
     return route.fulfill({ status: 200, json: refreshPayload })
   })
+  // This long conflict-matrix test owns a mock room. Its unrelated automatic
+  // passive peek must never hit the real API and spuriously clear that room
+  // with 404 after 15 seconds on a slower CI worker.
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
+    expect(route.request().method()).toBe('GET')
+    return route.fulfill({ status: 304 })
+  })
 
   await page.goto('/')
   await page.getByTestId('lobby-sign-in').click()
