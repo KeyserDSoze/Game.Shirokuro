@@ -781,6 +781,32 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public void Synthetic415FallbackDoesNotClaimMissingContentTypeOrEndpoint()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "POST";
+        context.Request.Path = "/api/lobbies";
+
+        // A missing Content-Type is handled by the normal ASP.NET binder.
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask, new EndpointMetadataCollection(),
+            "415 HTTP Unsupported Media Type"));
+        Assert.False(
+            GuestLobbyMutationMediaTypeGuard.IsFrameworkUnsupportedLobbyRoute(
+                context, out var invalidRoom));
+        Assert.False(invalidRoom);
+
+        // An explicit unsupported type without the framework fallback must
+        // not be mistaken for a DTO-bound lobby route.
+        context.Request.Headers.ContentType = "text/plain";
+        context.SetEndpoint(null);
+        Assert.False(
+            GuestLobbyMutationMediaTypeGuard.IsFrameworkUnsupportedLobbyRoute(
+                context, out invalidRoom));
+        Assert.False(invalidRoom);
+    }
+
+    [Fact]
     public async Task NonJsonLobbyMutationsRejectBeforeGuestRedisAndRoomQuota()
     {
         var cache = new CountingCache();
