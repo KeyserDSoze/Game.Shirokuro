@@ -297,7 +297,8 @@ public sealed class MultiplayerMetricsTests
         var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" })
+                   "lobby-body-size", "lobby-media-type", "session-body", "host",
+                    "transport", "unknown-route", "method-not-allowed" })
             Assert.Contains(ingress, m => m.Tags["reason"] == reason && m.Value == 1);
         Assert.All(ingress, measurement =>
         {
@@ -305,18 +306,19 @@ public sealed class MultiplayerMetricsTests
             Assert.Equal(new[] { "reason" }, measurement.Tags.Keys);
             Assert.Contains(measurement.Tags["reason"],
                 new[] { "room-id", "mutation-origin", "hub-origin",
-                         "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" });
+                         "lobby-body-size", "lobby-media-type", "session-body", "host",
+                    "transport", "unknown-route", "method-not-allowed" });
         });
 
         var validations = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
-        foreach (var result in new[] { "active", "inactive", "unavailable", "recovery-cutoff" })
+        foreach (var result in new[] { "active", "inactive", "unavailable", "recovery-cutoff", "unsupported-ticket" })
             Assert.Contains(validations, m => m.Value == 1 &&
                 m.Tags.Count == 1 && m.Tags["outcome"] == result);
         Assert.All(validations, m =>
         {
             Assert.Equal(new[] { "outcome" }, m.Tags.Keys);
             Assert.Contains(m.Tags["outcome"],
-                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
+                new[] { "active", "inactive", "unavailable", "recovery-cutoff", "unsupported-ticket" });
         });
 
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
@@ -370,11 +372,12 @@ public sealed class MultiplayerMetricsTests
                     "policy" => value is "session" or "lobby",
                     "outcome" => value is "allowed" or "limited" or
                         "unavailable" or "ready" or "success" or "failure" or
-                        "active" or "inactive" or "recovery-cutoff",
+                        "active" or "inactive" or "recovery-cutoff" or "unsupported-ticket",
                     "mode" => value is "local" or "redis",
                     "reason" => value is "room-id" or "mutation-origin" or
                         "hub-origin" or "lobby-body-size" or "lobby-media-type" or
-                        "session-body" or "host" or "transport",
+                        "session-body" or "host" or "transport" or
+                         "unknown-route" or "method-not-allowed",
                     "client" => value is "lobby" or "session",
                     "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
@@ -476,7 +479,8 @@ public sealed class MultiplayerMetricsTests
         var readings = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" })
+                   "lobby-body-size", "lobby-media-type", "session-body", "host",
+                    "transport", "unknown-route", "method-not-allowed" })
             Assert.Contains(readings, o => o.Value == 1 &&
                 o.Tags.Count == 1 && o.Tags["reason"] == reason);
 
