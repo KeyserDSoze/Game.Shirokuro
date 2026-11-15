@@ -172,6 +172,9 @@ public sealed class MultiplayerMetricsExportTests
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.MutationOrigin);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Transport);
+        MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Active);
+        MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Unavailable);
+        MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.RecoveryCutoff);
         MultiplayerMetrics.RecordReadinessDuration(
             true, ReadinessProbeStage.Success, 0.12);
         MultiplayerMetrics.RecordReadinessDuration(
@@ -208,6 +211,8 @@ public sealed class MultiplayerMetricsExportTests
         Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
         Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
         Assert.Contains(MultiplayerMetrics.IngressRejectionsName, payload);
+        Assert.Contains(MultiplayerMetrics.GuestCookieAuthorityName, payload);
+        Assert.Contains("recovery-cutoff", payload);
         Assert.Contains("reason", payload);
         Assert.Contains("transport", payload);
         Assert.Contains("host", payload);

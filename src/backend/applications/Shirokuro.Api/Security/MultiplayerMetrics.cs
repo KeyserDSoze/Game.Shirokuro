@@ -15,6 +15,7 @@ public static class MultiplayerMetrics
     public const string MeterVersion = "0.0.1";
     public const string MutationDecisionsName = "shirokuro.guest_mutation.decisions";
     public const string IngressRejectionsName = "shirokuro.ingress.rejections";
+    public const string GuestCookieAuthorityName = "shirokuro.session.cookie_authority";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
@@ -35,6 +36,9 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> IngressRejections = Meter.CreateCounter<long>(
         IngressRejectionsName, unit: "{rejection}",
         description: "Early server-side ingress guard rejections before guest Redis validation and quota.");
+    private static readonly Counter<long> GuestCookieAuthority = Meter.CreateCounter<long>(
+        GuestCookieAuthorityName, unit: "{validation}",
+        description: "Actual guest-cookie authority validation outcomes; not unique guests.");
     private static readonly Counter<long> ReadinessProbes = Meter.CreateCounter<long>(
         ReadinessProbesName, unit: "{probe}",
         description: "Executed node-readiness probes, excluding cache hits.");
@@ -102,6 +106,26 @@ public static class MultiplayerMetrics
             _ => throw new ArgumentOutOfRangeException(nameof(reason))
         };
         IngressRejections.Add(1, new KeyValuePair<string, object?>("reason", value));
+    }
+
+    /// <summary>
+    /// Exactly one decision for each guest-like signed cookie actually
+    /// validated by ASP.NET cookie authentication. Early ingress rejections,
+    /// anonymous traffic and public probes must not record false validations.
+    /// No session, token, path, IP or exception is an attribute.
+    /// </summary>
+    public static void RecordGuestCookieAuthority(GuestCookieValidationOutcome outcome)
+    {
+        var value = outcome switch
+        {
+            GuestCookieValidationOutcome.Active => "active",
+            GuestCookieValidationOutcome.Inactive => "inactive",
+            GuestCookieValidationOutcome.Unavailable => "unavailable",
+            GuestCookieValidationOutcome.RecoveryCutoff => "recovery-cutoff",
+            _ => throw new ArgumentOutOfRangeException(nameof(outcome))
+        };
+        GuestCookieAuthority.Add(1,
+            new KeyValuePair<string, object?>("outcome", value));
     }
 
     public static void RecordReadinessProbe(bool ready) =>
@@ -247,6 +271,9 @@ public static class MultiplayerMetrics
 }
 
 public enum MutationOutcome { Allowed, Limited, Unavailable }
+
+/// <summary>Finite results of a real signed guest cookie validation.</summary>
+public enum GuestCookieValidationOutcome { Active, Inactive, Unavailable, RecoveryCutoff }
 
 /// <summary>Fixed ingress rejection categories, never raw input data.</summary>
 public enum IngressRejectionReason

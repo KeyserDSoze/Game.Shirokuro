@@ -1925,3 +1925,14 @@ Il contatore misura solo richieste giunte fino ai guard dell'API: un proxy edge 
 ### Ordine del middleware Host applicativo e filtro di framework (#131, prima CI)
 
 ASP.NET Core aggiunge un HostFiltering middleware automatico **prima** dei middleware dichiarati con `app.Use`. Nella prima [CI #43714264864](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43714264864), tre test hanno dimostrato che i 400 Host erano ancora generati dall'host filter del framework e non dall'handler dell'app; perciò non ricevevano no-store né la misura `reason=host`. La correzione registra `EarlyHostIngressStartupFilter` **in testa** alla collection DI `IStartupFilter`: applica lo **stesso** `IngressHostPolicy` stretto e rifiuta con 400/no-store + un evento aggregato **prima** del filtro automatico. Il middleware HostFiltering **resta abilitato** con la allowlist di nomi esatta e lo stesso controllo Host+porta interno resta defense in depth (senza un secondo conteggio). Nessun wildcard Host, bypass della verifica o fiducia in X-Forwarded-Host. Se viene modificato l'ordine dei middleware in future versioni ASP.NET, i test Host avvisano se un 400 torna privo di no-store.
+
+## Validazioni cookie guest: esiti aggregati senza identità (#132)
+
+`shirokuro.session.cookie_authority` misura **ciascuna vera convalida di cookie guest firmato**, non gli account distinti, gli accessi unici o le emissioni di sessione. Una singola misura `outcome`, scelta dal server da quattro soli valori fissi, è emessa da `OnValidatePrincipal` **dopo** ingress Host/HTTPS/Origin/body/quote della richiesta:
+
+- `active`: `GuestSessionRegistry.CheckAuthorityAsync` ha confermato il ticket nel Redis condiviso
+- `inactive`: il registro ha confermato assenza/revoca/scadenza del ticket (autorizzazione 401)
+- `unavailable`: Redis non è verificabile entro il deadline o è indisponibile (fail-closed 503; non significa ticket revocato)
+- `recovery-cutoff`: il cutoff UTC out-of-band configurato dall'operatore ha respinto il ticket con `IssuedUtc` anteriore/non valido, **prima** di leggere Redis
+
+Le richieste senza cookie, i guard ingress precoci e i probe pubblici `/api/health`, `/api/ready` e `/api/preview/board` non generano misure di questa serie; i check ripetuti di un metodo Hub hanno una semantica diversa e non sono conteggiati come validazioni cookie. Non inserire mai cookie, identificativi guest/room, token, IP, path, header, valori di cutoff o messaggi di eccezione nelle metriche: soltanto `outcome` a cardinalità quattro. L'export continua a essere OTLP HTTPS opt-in, senza endpoint `/metrics`. Un picco di `unavailable` indica **richieste** di verifica non riuscite e richiede correlazione operativa con readiness e connettività Redis; un `inactive` non prova né quantifica furti di cookie. Contatori e snapshot non costituiscono un allarme né mitigazione automatica senza collector esterno.

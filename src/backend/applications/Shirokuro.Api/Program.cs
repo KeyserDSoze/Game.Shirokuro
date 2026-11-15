@@ -130,6 +130,8 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
                 if (!GuestSessionRecoveryCutoff.Accepts(
                         context.Properties.IssuedUtc, guestRecoveryCutoffUtc))
                 {
+                    MultiplayerMetrics.RecordGuestCookieAuthority(
+                        GuestCookieValidationOutcome.RecoveryCutoff);
                     context.RejectPrincipal();
                     return;
                 }
@@ -138,6 +140,16 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
                     .GetRequiredService<GuestSessionRegistry>();
                 var authority = await registry.CheckAuthorityAsync(
                     principal, context.HttpContext.RequestAborted);
+                MultiplayerMetrics.RecordGuestCookieAuthority(authority switch
+                {
+                    GuestSessionAuthorityStatus.Active =>
+                        GuestCookieValidationOutcome.Active,
+                    GuestSessionAuthorityStatus.Inactive =>
+                        GuestCookieValidationOutcome.Inactive,
+                    GuestSessionAuthorityStatus.Unavailable =>
+                        GuestCookieValidationOutcome.Unavailable,
+                    _ => throw new ArgumentOutOfRangeException(nameof(authority))
+                });
                 if (authority != GuestSessionAuthorityStatus.Active)
                 {
                     // The ticket was not authenticated in either case.

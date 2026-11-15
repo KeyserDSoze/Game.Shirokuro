@@ -111,18 +111,24 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     private static WebApplicationFactory<Program> Production(
-        CountingCache cache, CountingLimiter limiter, bool stubReadiness = false) =>
+        CountingCache cache, CountingLimiter limiter, bool stubReadiness = false,
+        string? recoveryCutoff = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
             TestDataProtectionConfiguration.Apply(builder);
             TestGuestSessionRedisConfiguration.Apply(builder, cache);
             builder.ConfigureAppConfiguration((_, config) =>
-                config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                var settings = new Dictionary<string, string?>
                 {
                     ["AllowedHosts"] = "game.example",
                     ["Security:AllowedOrigins:0"] = "https://game.example"
-                }));
+                };
+                if (recoveryCutoff is not null)
+                    settings[GuestSessionRecoveryCutoff.ConfigurationKey] = recoveryCutoff;
+                config.AddInMemoryCollection(settings);
+            });
             builder.ConfigureTestServices(services =>
             {
                 services.RemoveAll<IGuestMutationLimiter>();
@@ -177,6 +183,112 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.False(response.Headers.Contains("Set-Cookie"));
         Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    [Fact]
+    public async Task SignedGuestCookieMetricsDistinguishActiveOutageAndConfirmedRevocation()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        using var capture = new MultiplayerMetricCapture();
+
+        using (var health = await anonymous.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        var cookie = await Issue(anonymous, "https://game.example");
+        Assert.Empty(capture.For(MultiplayerMetrics.GuestCookieAuthorityName));
+        Assert.Equal(0, cache.Reads);
+
+        using var guest = Client(server, cookie: cookie);
+        using (var accepted = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.Equal(1, cache.Reads);
+
+        // Public metadata excludes cookie registry validation, even when
+        // the browser sends a perfectly signed guest ticket.
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var preview = await guest.GetAsync("/api/preview/board"))
+            Assert.Equal(HttpStatusCode.OK, preview.StatusCode);
+        // Early malformed lobby routing never triggers cookie authentication.
+        using (var badRoom = await guest.GetAsync("/api/lobbies/bad/roster"))
+            Assert.Equal(HttpStatusCode.NotFound, badRoom.StatusCode);
+        Assert.Equal(1, cache.Reads);
+
+        cache.Unavailable = true;
+        using (var failed = await guest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, failed.StatusCode);
+            Assert.Equal("no-store", failed.Headers.CacheControl?.ToString());
+            Assert.False(failed.Headers.Contains("Set-Cookie"));
+        }
+
+        cache.Unavailable = false;
+        cache.ExpireAll(); // Redis confirms the ticket no longer exists.
+        using (var revoked = await guest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+            Assert.Equal("no-store", revoked.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(3, cache.Reads);
+        Assert.Equal(1, cache.Writes); // No automatic replacement identity.
+        Assert.Equal(1, limiter.Calls);
+
+        var outcomes = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
+        Assert.Equal(3, outcomes.Length);
+        foreach (var state in new[] { "active", "unavailable", "inactive" })
+            Assert.Single(outcomes, item => item.Value == 1 &&
+                item.Tags.Count == 1 && item.Tags["outcome"] == state);
+        Assert.All(outcomes, item =>
+        {
+            Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
+            Assert.DoesNotContain("guest-", item.Tags["outcome"], StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task DisasterRecoveryCutoffRejectsSignedCookieWithoutRedisAuthorityLookup()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var issuing = Production(cache, limiter);
+        using var anonymous = Client(issuing);
+        var cookie = await Issue(anonymous, "https://game.example");
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+
+        // Same persistent Data Protection ring, different node configured
+        // with a future operator cutoff. Redis still holds this original
+        // session, but it MUST NOT be consulted or authenticated.
+        using var recoveryNode = Production(cache, limiter,
+            recoveryCutoff: "2099-01-01T00:00:00Z");
+        using var capture = new MultiplayerMetricCapture();
+        using var guest = Client(recoveryNode, cookie: cookie);
+        using (var rejected = await guest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        var events = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
+        Assert.Single(events);
+        Assert.Equal(1, events[0].Value);
+        Assert.Equal(new[] { "outcome" }, events[0].Tags.Keys);
+        Assert.Equal("recovery-cutoff", events[0].Tags["outcome"]);
+
+        // The old node can still independently validate the same cookie;
+        // the cutoff is a deployment-wide operator setting, not a Redis
+        // delete. Rollout consistency remains an operational requirement.
+        using var original = Client(issuing, cookie: cookie);
+        using (var active = await original.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(2, capture.For(MultiplayerMetrics.GuestCookieAuthorityName).Length);
     }
 
     [Fact]

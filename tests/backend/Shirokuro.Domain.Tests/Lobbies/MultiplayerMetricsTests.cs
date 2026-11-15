@@ -186,6 +186,8 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, MutationOutcome.Unavailable);
         foreach (var reason in Enum.GetValues<IngressRejectionReason>())
             MultiplayerMetrics.RecordIngressRejection(reason);
+        foreach (var outcome in Enum.GetValues<GuestCookieValidationOutcome>())
+            MultiplayerMetrics.RecordGuestCookieAuthority(outcome);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
         MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
@@ -222,6 +224,8 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, (MutationOutcome)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordIngressRejection((IngressRejectionReason)999));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordGuestCookieAuthority((GuestCookieValidationOutcome)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordExpirySweep(false, true, -1));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
@@ -304,6 +308,17 @@ public sealed class MultiplayerMetricsTests
                          "lobby-body-size", "session-body", "host", "transport" });
         });
 
+        var validations = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
+        foreach (var result in new[] { "active", "inactive", "unavailable", "recovery-cutoff" })
+            Assert.Contains(validations, m => m.Value == 1 &&
+                m.Tags.Count == 1 && m.Tags["outcome"] == result);
+        Assert.All(validations, m =>
+        {
+            Assert.Equal(new[] { "outcome" }, m.Tags.Keys);
+            Assert.Contains(m.Tags["outcome"],
+                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
+        });
+
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
             m => m.Tags["policy"] == "session" && m.Tags["outcome"] == "limited");
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
@@ -325,6 +340,7 @@ public sealed class MultiplayerMetricsTests
         {
             MultiplayerMetrics.MutationDecisionsName,
             MultiplayerMetrics.IngressRejectionsName,
+            MultiplayerMetrics.GuestCookieAuthorityName,
             MultiplayerMetrics.ReadinessProbesName,
             MultiplayerMetrics.RedisConnectionEventsName,
             MultiplayerMetrics.ExpirySweepsName,
@@ -338,6 +354,7 @@ public sealed class MultiplayerMetricsTests
             {
                 MultiplayerMetrics.MutationDecisionsName => new[] { "outcome", "policy" },
                 MultiplayerMetrics.IngressRejectionsName => new[] { "reason" },
+                MultiplayerMetrics.GuestCookieAuthorityName => new[] { "outcome" },
                 MultiplayerMetrics.ReadinessProbesName => new[] { "outcome" },
                 MultiplayerMetrics.RedisConnectionEventsName => new[] { "client", "event" },
                 MultiplayerMetrics.ExpirySweepsName => new[] { "mode", "outcome" },
@@ -352,7 +369,8 @@ public sealed class MultiplayerMetricsTests
                 {
                     "policy" => value is "session" or "lobby",
                     "outcome" => value is "allowed" or "limited" or
-                        "unavailable" or "ready" or "success" or "failure",
+                        "unavailable" or "ready" or "success" or "failure" or
+                        "active" or "inactive" or "recovery-cutoff",
                     "mode" => value is "local" or "redis",
                     "reason" => value is "room-id" or "mutation-origin" or
                         "hub-origin" or "lobby-body-size" or "session-body" or
