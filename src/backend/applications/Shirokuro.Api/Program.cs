@@ -126,6 +126,8 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             // Genuine canonical guests still require fresh Redis authority.
             if (!GuestSessions.IsCanonicalGuest(principal))
             {
+                context.HttpContext.Items[
+                    GuestSessions.UnsupportedTicketRequestMarker] = true;
                 context.RejectPrincipal();
                 return;
             }
@@ -577,6 +579,12 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     // is still unverified. Never do so until the registry is available.
     if (context.Items.ContainsKey(GuestSessionRegistry.UnavailableRequestMarker))
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
+    // Only a genuinely anonymous visitor or a confirmed inactive guest may
+    // request a fresh session. A signed non-guest/legacy ticket is not an
+    // account and cannot silently be swapped for a fresh guest identity.
+    if (context.Items.ContainsKey(GuestSessions.UnsupportedTicketRequestMarker))
+        return Results.StatusCode(StatusCodes.Status401Unauthorized);
 
     var existingId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
     if (context.User.Identities.Any(identity => identity.IsAuthenticated))
