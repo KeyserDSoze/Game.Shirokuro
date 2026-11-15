@@ -49,8 +49,9 @@ builder.Services.AddHsts(options =>
     options.Preload = false;
 });
 builder.Services.AddSingleton(TimeProvider.System);
-// Host shutdown is an immediate, monotonic readiness fence in both modes.
-// It must not resolve Redis or use a client-controlled request flag.
+// Host shutdown and optional trusted Linux SIGUSR1 preStop share the same
+// monotonic node-local readiness/admission fence. No request can enable it.
+// Register the singleton before Kestrel starts serving any ingress.
 builder.Services.AddSingleton<IReadinessDrainSignal, HostLifetimeReadinessDrainSignal>();
 if (builder.Environment.IsDevelopment())
     builder.Services.AddHostedService<LobbyExpiryWorker>();
@@ -272,6 +273,10 @@ if (builder.Environment.IsDevelopment())
 }
 
 var app = builder.Build();
+// Install/validate the optional Linux SIGUSR1 handler BEFORE startup starts
+// accepting requests; a first /api/ready probe must not be what arms preStop.
+// Resolving this singleton never contacts Redis or Data Protection.
+_ = app.Services.GetRequiredService<IReadinessDrainSignal>();
 // The only three new guest admissions. Reuse the same trusted endpoint
 // metadata in BOTH ingress fences; never inspect client-controlled paths,
 // headers, query parameters or claims to select the shutdown policy.
