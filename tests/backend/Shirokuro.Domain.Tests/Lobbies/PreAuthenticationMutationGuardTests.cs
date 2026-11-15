@@ -118,6 +118,13 @@ public sealed class PreAuthenticationMutationGuardTests
             builder.UseEnvironment("Production");
             TestDataProtectionConfiguration.Apply(builder);
             TestGuestSessionRedisConfiguration.Apply(builder, cache);
+            // The operator cutoff is sampled from builder.Configuration
+            // during Program startup, before late app-config callbacks.
+            // Supply it as an early WebHost setting as well as a late
+            // provider, like the shared DP key-ring test configuration.
+            if (recoveryCutoff is not null)
+                builder.UseSetting(GuestSessionRecoveryCutoff.ConfigurationKey,
+                    recoveryCutoff);
             builder.ConfigureAppConfiguration((_, config) =>
             {
                 var settings = new Dictionary<string, string?>
