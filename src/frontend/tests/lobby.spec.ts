@@ -971,6 +971,10 @@ test('impossible member counts in 201 and 200 never become an authenticated room
 })
 
 test('409 refresh rejects malformed membership loss and only clears on verified loss', async ({ page }) => {
+  // This isolated test checks a long series of conflict+refresh roundtrips,
+  // every negative variant, and a final verified member loss. Give this
+  // expanded interaction matrix a realistic single-test CI budget (#121).
+  test.setTimeout(90_000)
   const code = 'room-' + 'b'.repeat(32)
   const actorId = 'guest-' + 'b'.repeat(32)
   const otherId = 'guest-' + 'a'.repeat(32)
