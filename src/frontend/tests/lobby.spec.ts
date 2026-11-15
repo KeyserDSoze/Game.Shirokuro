@@ -1439,6 +1439,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
 
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(1)
   expect(validators[0]).toBe('"rev-1"')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)
   await expect(page.getByTestId('lobby-message')).not.toContainText('scaduta')
@@ -1448,6 +1449,8 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   status = 200
   await expect.poll(() => reads, { timeout: 25_000 }).toBeGreaterThanOrEqual(2)
   expect(validators[1]).toBe('"rev-1"')
+  // A malformed 200 is not verification: mark the last snapshot stale.
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
 
   status = 503
   // Malformed 200 must NOT reset the outage counter. The next GET is
@@ -1462,6 +1465,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   await expect(page.getByTestId('lobby-revision')).toContainText('1')
   await expect(page.getByTestId('lobby-roster')).toContainText('white')
   await expect(page.getByTestId('lobby-roster')).not.toContainText('Kira')
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
   expect(mutations).toEqual([])
 
   status = 404
@@ -1471,6 +1475,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   expect(pollTimes[3] - pollTimes[2]).toBeGreaterThanOrEqual(60_000)
   expect(pollTimes[3] - pollTimes[2]).toBeLessThan(80_000)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
   await expect(page.getByTestId('lobby-create')).toBeVisible()
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)
   await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
@@ -1486,6 +1491,7 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
   await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
   expect(mutations).toEqual([])
 })
