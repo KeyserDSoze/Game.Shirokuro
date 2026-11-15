@@ -391,7 +391,8 @@ describe('bounded passive roster reads (#124)', () => {
   it('external abort stops an abort-ignoring fetch immediately without waiting 12s', async () => {
     vi.useFakeTimers()
     const owner = new AbortController()
-    const mocked = vi.fn(() => new Promise<Response>(() => {}))
+    const mocked = vi.fn((_path: string, _options: RequestInit) =>
+      new Promise<Response>(() => {}))
     vi.stubGlobal('fetch', mocked)
     const pending = guestLobbyApi.peek(roomCode, 2, owner.signal)
     const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
