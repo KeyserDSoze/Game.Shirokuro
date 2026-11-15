@@ -27,6 +27,11 @@ public sealed class LobbyRosterTransportTests
     private const string RoomMissing = "room-00000000000000000000000000000000";
     private const string RoomSecret = "room-cccccccccccccccccccccccccccccccc";
     private const string RoomShared = "room-dddddddddddddddddddddddddddddddd";
+    // Real canonical guest identities; a signed legacy account cookie is no
+    // longer an authenticated identity under the sole guest cookie scheme.
+    private const string GuestAlice = "guest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string GuestBob = "guest-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    private const string GuestCara = "guest-cccccccccccccccccccccccccccccccc";
 
     private static WebApplicationFactory<Program> CreateServer(
         IAsyncGuestLobby? overrideLobby = null) =>
@@ -37,11 +42,11 @@ public sealed class LobbyRosterTransportTests
                 {
                     var coordinator = new InMemoryLobbyCoordinator();
                     coordinator.Create(RoomA, ["white", "black"]);
-                    coordinator.Join(RoomA, "alice", "white", 0);
-                    coordinator.Join(RoomA, "bob", "black", 1);
-                    coordinator.ChooseHero(RoomA, "alice", "kira", 2);
+                    coordinator.Join(RoomA, GuestAlice, "white", 0);
+                    coordinator.Join(RoomA, GuestBob, "black", 1);
+                    coordinator.ChooseHero(RoomA, GuestAlice, "kira", 2);
                     coordinator.Create(RoomB, ["white", "black"]);
-                    coordinator.Join(RoomB, "cara", "white", 0);
+                    coordinator.Join(RoomB, GuestCara, "white", 0);
                     return coordinator;
                 });
                 if (overrideLobby is not null)
@@ -68,6 +73,20 @@ public sealed class LobbyRosterTransportTests
         var signed = options.TicketDataFormat.Protect(ticket);
         client.DefaultRequestHeaders.Add("Cookie", options.Cookie.Name + "=" + signed);
         return client;
+    }
+
+    private static HttpClient MemberClientFor(
+        WebApplicationFactory<Program> server, string playerId)
+    {
+        // Use a REAL local guest registry entry rather than the historical
+        // shortcut of signing an arbitrary account-like NameIdentifier.
+        // This keeps the roster/SignalR authorization tests representative
+        // under the new guest-only cookie policy.
+        var registry = server.Services.GetRequiredService<GuestSessionRegistry>();
+        var token = registry.Register(playerId,
+            TimeProvider.System.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(playerId, token);
+        return ClientFor(server, principal.Claims.ToArray());
     }
 
     private sealed class ContendedLobby : IAsyncGuestLobby
@@ -146,7 +165,7 @@ public sealed class LobbyRosterTransportTests
     {
         var contended = new ContendedLobby();
         using var server = CreateServer(contended);
-        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        using var alice = MemberClientFor(server, GuestAlice);
 
         using var response = await alice.GetAsync($"/api/lobbies/{RoomA}/roster");
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
@@ -164,7 +183,7 @@ public sealed class LobbyRosterTransportTests
     {
         var unavailable = new ContendedLobby();
         using var server = CreateServer(unavailable);
-        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        using var alice = MemberClientFor(server, GuestAlice);
 
         using var request = new HttpRequestMessage(HttpMethod.Get,
             $"/api/lobbies/{RoomA}/roster/peek");
@@ -214,7 +233,7 @@ public sealed class LobbyRosterTransportTests
     public async Task SignedInMemberCanReadOnlyExplicitRosterData()
     {
         using var server = CreateServer();
-        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        using var alice = MemberClientFor(server, GuestAlice);
         var response = await alice.GetAsync($"/api/lobbies/{RoomA}/roster");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
@@ -224,7 +243,7 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(RoomA, root.GetProperty("lobbyId").GetString());
         Assert.Equal(3, root.GetProperty("revision").GetInt64());
         Assert.Equal(2, root.GetProperty("participants").GetArrayLength());
-        Assert.Equal("alice",
+        Assert.Equal(GuestAlice,
             root.GetProperty("participants")[0].GetProperty("playerId").GetString());
         Assert.Equal("kira",
             root.GetProperty("participants")[0].GetProperty("heroId").GetString());
@@ -238,7 +257,7 @@ public sealed class LobbyRosterTransportTests
     public async Task OtherMemberIdInQueryCannotOverrideSignedIdentity()
     {
         using var server = CreateServer();
-        using var bob = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "bob"));
+        using var bob = MemberClientFor(server, GuestBob);
         var response = await bob.GetAsync($"/api/lobbies/{RoomB}/roster?playerId=cara");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
@@ -247,7 +266,7 @@ public sealed class LobbyRosterTransportTests
     public async Task UnknownLobbyAndUnauthorizedMembershipHaveSameNotFoundResponse()
     {
         using var server = CreateServer();
-        using var bob = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "bob"));
+        using var bob = MemberClientFor(server, GuestBob);
         var absent = await bob.GetAsync($"/api/lobbies/{RoomMissing}/roster");
         var denied = await bob.GetAsync($"/api/lobbies/{RoomB}/roster");
         Assert.Equal(HttpStatusCode.NotFound, absent.StatusCode);
@@ -257,17 +276,17 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
-    public async Task SignedInButAmbiguousOrMissingIdentityFailsWithForbidden()
+    public async Task SignedInButAmbiguousOrMissingIdentityFailsClosed()
     {
         using var server = CreateServer();
         using var noId = ClientFor(server, new Claim(ClaimTypes.Name, "alice"));
-        Assert.Equal(HttpStatusCode.Forbidden,
+        Assert.Equal(HttpStatusCode.Unauthorized,
             (await noId.GetAsync($"/api/lobbies/{RoomA}/roster")).StatusCode);
 
         using var duplicateId = ClientFor(server,
             new Claim(ClaimTypes.NameIdentifier, "alice"),
             new Claim(ClaimTypes.NameIdentifier, "bob"));
-        Assert.Equal(HttpStatusCode.Forbidden,
+        Assert.Equal(HttpStatusCode.Unauthorized,
             (await duplicateId.GetAsync($"/api/lobbies/{RoomA}/roster")).StatusCode);
     }
 
@@ -288,7 +307,7 @@ public sealed class LobbyRosterTransportTests
     public async Task BrowserSignalRRequiresTrustedOriginButAllowsViteAndNonBrowserClients()
     {
         using var server = CreateServer();
-        using var member = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        using var member = MemberClientFor(server, GuestAlice);
         const string negotiate = "/hubs/lobbies/negotiate?negotiateVersion=1";
 
         // A browser's cross-origin Vite development client is explicitly
@@ -346,7 +365,7 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await anonymous.PostAsync("/hubs/lobbies/negotiate?negotiateVersion=1", null)).StatusCode);
 
-        using var alice = ClientFor(server, new Claim(ClaimTypes.NameIdentifier, "alice"));
+        using var alice = MemberClientFor(server, GuestAlice);
         var negotiate = await alice.PostAsync("/hubs/lobbies/negotiate?negotiateVersion=1", null);
         Assert.Equal(HttpStatusCode.OK, negotiate.StatusCode);
         var json = await negotiate.Content.ReadAsStringAsync();
