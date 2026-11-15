@@ -97,6 +97,42 @@ test('two independent guest browsers create a room, join by invite and select he
     expect(firstId).toContain(unsupportedMedia.identity?.playerId)
     await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
 
+    // An unknown API/Hub path with this existing signed guest must be a
+    // private-cache-safe 404, not an implicit Redis-auth check or new login.
+    // Reuse the existing browser identity rather than consuming guest quota.
+    const unknownRoutes = await first.evaluate(async () => {
+      const results: { status: number; cacheControl: string | null; setCookie: boolean }[] = []
+      for (const path of ['/api/not-a-route', '/hubs/not-a-hub']) {
+        const response = await fetch(path, {
+          method: 'GET', credentials: 'include', cache: 'no-store',
+        })
+        results.push({
+          status: response.status,
+          cacheControl: response.headers.get('Cache-Control'),
+          setCookie: response.headers.has('Set-Cookie'),
+        })
+      }
+      const me = await fetch('/api/sessions/me', {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+      })
+      return {
+        results,
+        identityStatus: me.status,
+        identity: me.ok
+          ? await me.json() as { kind: string; playerId: string }
+          : null,
+      }
+    })
+    for (const result of unknownRoutes.results) {
+      expect(result.status).toBe(404)
+      expect(result.cacheControl).toContain('no-store')
+      expect(result.setCookie).toBe(false)
+    }
+    expect(unknownRoutes.identityStatus).toBe(200)
+    expect(unknownRoutes.identity?.kind).toBe('guest')
+    expect(firstId).toContain(unknownRoutes.identity?.playerId)
+    await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
+
     // A real HTTP 413 must be returned before room creation. Reuse this
     // already signed-in guest instead of spending more shared guest quota.
     const rejectedBody = await first.evaluate(async () => {
