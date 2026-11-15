@@ -17,6 +17,10 @@ using StackExchange.Redis;
 var builder = WebApplication.CreateBuilder(args);
 // Ingress forwarding stays disabled unless exact trusted proxy IPs are configured.
 TrustedProxyForwarding.Configure(builder.Services, builder.Configuration);
+// ASP.NET Core's built-in HostFilteringStartupFilter sits OUTSIDE the
+// app.Use pipeline. Register our strict, no-store, low-cardinality ingress
+// gate first, without weakening or disabling the framework host filter.
+EarlyHostIngressStartupFilter.Register(builder.Services);
 builder.Services.AddIngressHostPolicy();
 PersistentDataProtection.Configure(
     builder.Services, builder.Configuration, builder.Environment);
@@ -251,11 +255,11 @@ app.Use(async (context, next) =>
         .GetRequiredService<IOptions<IngressHostPolicyOptions>>().Value.Policy;
     if (!policy.Allows(context.Request))
     {
-        // The supplied Host is untrusted: never use its value as an OTLP
-        // dimension or let this 400 be cached by a browser/proxy.
+        // Defense in depth after forwarded-header processing. The outer
+        // startup filter already counted this invalid Host precisely once
+        // and set no-store before the framework HostFiltering middleware.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status400BadRequest;
-        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         return;
     }
     await next(context);
