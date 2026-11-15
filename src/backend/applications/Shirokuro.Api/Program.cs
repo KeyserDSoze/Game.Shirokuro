@@ -120,48 +120,50 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
                 return;
 
             var principal = context.Principal;
-            var playerId = AuthenticatedPlayerIdentity.FromPrincipal(principal);
-            var claimsGuestKind = principal?.FindAll(GuestSessions.SessionKindClaim).Any() == true;
-            var looksLikeGuestId = playerId?.StartsWith("guest-", StringComparison.Ordinal) == true;
-            if (claimsGuestKind || looksLikeGuestId)
+            // A Data Protection-signed legacy/non-guest ticket is not a
+            // verified account. No account auth provider exists yet; reject
+            // it BEFORE any guest Redis lookup, never grant implicit access.
+            // Genuine canonical guests still require fresh Redis authority.
+            if (!GuestSessions.IsCanonicalGuest(principal))
             {
-                // IssuedUtc belongs to the signed Data Protection ticket,
-                // never to a client header or restored Redis. An older
-                // ticket cannot authenticate after an operator rotates this
-                // out-of-band cutoff during a stale snapshot recovery.
-                if (!GuestSessionRecoveryCutoff.Accepts(
-                        context.Properties.IssuedUtc, guestRecoveryCutoffUtc))
-                {
-                    MultiplayerMetrics.RecordGuestCookieAuthority(
-                        GuestCookieValidationOutcome.RecoveryCutoff);
-                    context.RejectPrincipal();
-                    return;
-                }
+                context.RejectPrincipal();
+                return;
+            }
 
-                var registry = context.HttpContext.RequestServices
-                    .GetRequiredService<GuestSessionRegistry>();
-                var authority = await registry.CheckAuthorityAsync(
-                    principal, context.HttpContext.RequestAborted);
-                MultiplayerMetrics.RecordGuestCookieAuthority(authority switch
-                {
-                    GuestSessionAuthorityStatus.Active =>
-                        GuestCookieValidationOutcome.Active,
-                    GuestSessionAuthorityStatus.Inactive =>
-                        GuestCookieValidationOutcome.Inactive,
-                    GuestSessionAuthorityStatus.Unavailable =>
-                        GuestCookieValidationOutcome.Unavailable,
-                    _ => throw new ArgumentOutOfRangeException(nameof(authority))
-                });
-                if (authority != GuestSessionAuthorityStatus.Active)
-                {
-                    // The ticket was not authenticated in either case.
-                    // Mark only this server-owned request, never a cookie or
-                    // a client-supplied header, for an accurate 503 challenge.
-                    if (authority == GuestSessionAuthorityStatus.Unavailable)
-                        context.HttpContext.Items[
-                            GuestSessionRegistry.UnavailableRequestMarker] = true;
-                    context.RejectPrincipal();
-                }
+            // IssuedUtc belongs to the signed Data Protection ticket, not
+            // to a request header or restored Redis. Old cookies remain
+            // invalid after an operator-managed recovery cutoff.
+            if (!GuestSessionRecoveryCutoff.Accepts(
+                    context.Properties.IssuedUtc, guestRecoveryCutoffUtc))
+            {
+                MultiplayerMetrics.RecordGuestCookieAuthority(
+                    GuestCookieValidationOutcome.RecoveryCutoff);
+                context.RejectPrincipal();
+                return;
+            }
+
+            var registry = context.HttpContext.RequestServices
+                .GetRequiredService<GuestSessionRegistry>();
+            var authority = await registry.CheckAuthorityAsync(
+                principal, context.HttpContext.RequestAborted);
+            MultiplayerMetrics.RecordGuestCookieAuthority(authority switch
+            {
+                GuestSessionAuthorityStatus.Active =>
+                    GuestCookieValidationOutcome.Active,
+                GuestSessionAuthorityStatus.Inactive =>
+                    GuestCookieValidationOutcome.Inactive,
+                GuestSessionAuthorityStatus.Unavailable =>
+                    GuestCookieValidationOutcome.Unavailable,
+                _ => throw new ArgumentOutOfRangeException(nameof(authority))
+            });
+            if (authority != GuestSessionAuthorityStatus.Active)
+            {
+                // Keep a Redis outage separate from confirmed revocation:
+                // deny both, but report 503 only when authority is unknown.
+                if (authority == GuestSessionAuthorityStatus.Unavailable)
+                    context.HttpContext.Items[
+                        GuestSessionRegistry.UnavailableRequestMarker] = true;
+                context.RejectPrincipal();
             }
         };
         options.Events.OnRedirectToLogin = context =>
