@@ -203,6 +203,9 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     });
 builder.Services.AddAuthorization();
 builder.Services.AddSignalR();
+// Only active SignalR connection contexts are tracked. ApplicationStopping
+// aborts existing transports; the early ingress fence rejects new handshakes.
+builder.Services.AddSingleton<LobbyConnectionDrainRegistry>();
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -358,6 +361,19 @@ app.Use(async (context, next) =>
         context.Response.StatusCode = StatusCodes.Status404NotFound;
         MultiplayerMetrics.RecordIngressRejection(
             IngressRejectionReason.UnknownApiRoute);
+        return;
+    }
+
+    // The selected SignalR endpoint belongs to the real lobby hub. Do not
+    // start negotiate or WebSocket upgrades while the node is stopping:
+    // reject before auth can read the Redis guest registry. The metadata
+    // fence is server-owned, preserving ordinary 404/405 for other paths.
+    if (metadata?.GetMetadata<CookieSocketOriginGuardRequired>() is not null &&
+        context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
+            .IsDraining)
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
         return;
     }
 
