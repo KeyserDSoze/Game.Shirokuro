@@ -316,6 +316,16 @@ app.Use(async (context, next) =>
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
         return;
     }
+    if (metadata?.GetMetadata<GuestLobbyMutationBodyLimitRequired>() is not null &&
+        !GuestLobbyMutationBodyLimit.TryApply(context))
+    {
+        // The declared JSON body cannot be a valid lobby command. Reject it
+        // before validating the Redis guest ticket or spending a room quota.
+        // The Kestrel request body feature also bounds chunked input.
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        return;
+    }
     await next(context);
 });
 

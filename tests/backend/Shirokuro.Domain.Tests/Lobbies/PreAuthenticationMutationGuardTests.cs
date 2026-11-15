@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Http;
@@ -231,6 +233,87 @@ public sealed class PreAuthenticationMutationGuardTests
         using var recovered = await guest.GetAsync("/api/sessions/me");
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
         Assert.Equal(3, cache.Reads);
+    }
+
+    [Fact]
+    public async Task OversizedLobbyBodyRejectsBeforeRedisTicketOrQuotaInProduction()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        // Every DTO-bearing lobby mutation has the server-owned body marker.
+        // A large declared body is rejected without trying guest Redis,
+        // including on the room creation endpoint with its separate quota.
+        foreach (var (method, path) in MutationRoutes.Skip(2))
+        {
+            using var oversized = Mutation(method, path, "https://game.example");
+            oversized.Content = new StringContent(
+                new string('x', (int)GuestLobbyMutationBodyLimit.MaxBytes + 1),
+                Encoding.UTF8, "application/json");
+            Assert.Equal(GuestLobbyMutationBodyLimit.MaxBytes + 1,
+                oversized.Content.Headers.ContentLength);
+            using var denied = await guest.SendAsync(oversized);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+            Assert.False(denied.Headers.Contains("Retry-After"));
+            Assert.Equal(0, cache.Reads);
+            Assert.Equal(1, limiter.Calls);
+        }
+
+        // An exactly-on-boundary body is not rejected by the early guard:
+        // it still needs the authoritative Redis guest validation.
+        using var boundary = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        boundary.Content = new StringContent(
+            new string('x', (int)GuestLobbyMutationBodyLimit.MaxBytes),
+            Encoding.UTF8, "application/json");
+        using var unavailable = await guest.SendAsync(boundary);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+        Assert.Equal("no-store", unavailable.Headers.CacheControl?.ToString());
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, limiter.Calls); // Auth rejected before creation quota.
+    }
+
+    private sealed class FakeBodySizeFeature : IHttpMaxRequestBodySizeFeature
+    {
+        public bool IsReadOnly { get; init; }
+        public long? MaxRequestBodySize { get; set; }
+    }
+
+    [Theory]
+    [InlineData(null, 4096)]
+    [InlineData(30_000, 4096)]
+    [InlineData(2048, 2048)]
+    public void LobbyBodyLimitCapsStreamingRequestsWithoutRelaxingHostLimit(
+        long? configured, long expected)
+    {
+        var context = new DefaultHttpContext();
+        var feature = new FakeBodySizeFeature { MaxRequestBodySize = configured };
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+        Assert.True(GuestLobbyMutationBodyLimit.TryApply(context));
+        Assert.Equal(expected, feature.MaxRequestBodySize);
+    }
+
+    [Fact]
+    public void LobbyBodyLimitDoesNotMutateReadOnlyFeature()
+    {
+        var context = new DefaultHttpContext();
+        var feature = new FakeBodySizeFeature
+        {
+            IsReadOnly = true,
+            MaxRequestBodySize = 8192
+        };
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+        Assert.True(GuestLobbyMutationBodyLimit.TryApply(context));
+        Assert.Equal(8192, feature.MaxRequestBodySize);
     }
 
     [Fact]

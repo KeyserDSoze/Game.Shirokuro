@@ -19,6 +19,25 @@ test('two independent guest browsers create a room, join by invite and select he
     const secondId = await second.getByTestId('lobby-player').textContent()
     expect(firstId).not.toBe(secondId)
 
+    // A real HTTP 413 must be returned before room creation. Reuse this
+    // already signed-in guest instead of spending more shared guest quota.
+    const rejectedBody = await first.evaluate(async () => {
+      const response = await fetch('/api/lobbies', {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', 'X-Shirokuro-Request': '1' },
+        body: JSON.stringify({
+          teamIds: ['white', 'black'], teamId: 'white',
+          ignored: 'x'.repeat(5_000),
+        }),
+      })
+      return { status: response.status, cacheControl: response.headers.get('Cache-Control') }
+    })
+    expect(rejectedBody.status).toBe(413)
+    expect(rejectedBody.cacheControl).toContain('no-store')
+    await expect(first.getByTestId('lobby-player')).toContainText('guest-')
+
     await first.getByTestId('lobby-create').click()
     await expect(first.getByTestId('lobby-message')).toContainText('Lobby creata')
     const invite = (await first.getByTestId('lobby-room-code').textContent())!.trim()

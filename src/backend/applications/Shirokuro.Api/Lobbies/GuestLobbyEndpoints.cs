@@ -28,7 +28,9 @@ public static class GuestLobbyEndpoints
         // before the POST create quota, without URL-based security routing.
         var route = app.MapGroup("/api/lobbies")
             .RequireAuthorization()
-            .WithMetadata(new WebMutationGuardRequired());
+            .WithMetadata(
+                new WebMutationGuardRequired(),
+                new GuestLobbyMutationBodyLimitRequired());
 
         var createRoom = route.MapPost("", async (CreateRoomRequest request, HttpContext context,
             IHostEnvironment environment, IAsyncGuestLobby lobby) =>
