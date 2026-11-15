@@ -85,6 +85,8 @@ export function parseInviteCode(input: string): string {
 
 /** Bounded browser wait; a timed-out mutation may still commit server-side. */
 export const LOBBY_HTTP_REQUEST_TIMEOUT_MS = 15_000
+/** Passive roster reads must finish before the next normal 15s poll window. */
+export const LOBBY_PASSIVE_PEEK_TIMEOUT_MS = 12_000
 
 async function request<T>(path: string, method = 'GET', body?: object): Promise<T> {
   const mutating = method !== 'GET'
@@ -142,16 +144,45 @@ export const guestLobbyApi = {
     const tag: Record<string, string> = knownRevision !== undefined &&
       Number.isSafeInteger(knownRevision) && knownRevision >= 0
       ? { 'If-None-Match': '"rev-' + knownRevision + '"' } : {}
-    const response = await fetch('/api/lobbies/' + room + '/roster/peek', {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: tag,
-      ...(signal ? { signal } : {}),
+    // The effect can cancel a stale poll immediately. A separate internal
+    // controller also cancels a read whose fetch or JSON body never completes.
+    // Neither signal nor timeout is evidence of guest revocation or room loss.
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    const controller = new AbortController()
+    let cancelRead!: () => void
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancelRead = () => {
+        controller.abort()
+        reject(new DOMException('Aborted', 'AbortError'))
+      }
     })
-    if (response.status === 304) return null
-    if (!response.ok) throw new LobbyHttpError(response.status)
-    return response.json() as Promise<LobbyRoster>
+    signal?.addEventListener('abort', cancelRead, { once: true })
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error('Passive lobby roster read timed out'))
+        controller.abort()
+      }, LOBBY_PASSIVE_PEEK_TIMEOUT_MS)
+    })
+    const operation = (async (): Promise<LobbyRoster | null> => {
+      const response = await fetch('/api/lobbies/' + room + '/roster/peek', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: tag,
+        signal: controller.signal,
+      })
+      if (response.status === 304) return null
+      if (!response.ok) throw new LobbyHttpError(response.status)
+      return response.json() as Promise<LobbyRoster>
+    })()
+    try {
+      // An abort-ignoring transport must never stall the poll forever.
+      return await Promise.race([operation, deadline, cancelled])
+    } finally {
+      clearTimeout(timeoutId)
+      signal?.removeEventListener('abort', cancelRead)
+    }
   },
   chooseHero: (code: string, heroId: string, expectedRevision: number) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/hero',

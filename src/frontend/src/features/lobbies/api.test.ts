@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  guestLobbyApi, LOBBY_HTTP_REQUEST_TIMEOUT_MS, LobbyHttpError, LobbyInputError,
+  guestLobbyApi, LOBBY_HTTP_REQUEST_TIMEOUT_MS, LOBBY_PASSIVE_PEEK_TIMEOUT_MS,
+  LobbyHttpError, LobbyInputError,
   isCanonicalGuestPlayerId, parseCurrentSession, parseGuestSession, parseInviteCode, parseTeamIds,
 } from './api'
 
@@ -166,13 +167,13 @@ describe('guest lobby client boundaries', () => {
     },
   )
 
-  it('forwards caller AbortSignal only to passive polling and uses a distinct internal signal for explicit refresh', async () => {
+  it('composes caller cancellation only for passive polling and isolates explicit refresh', async () => {
     const controller = new AbortController()
     const roster = {
       lobbyId: roomCode, revision: 2, teamIds: ['white', 'black'], participants: [],
     }
-    const mocked = vi.fn((_path: string, options: RequestInit) => {
-      if (options.signal === controller.signal) {
+    const mocked = vi.fn((path: string, options: RequestInit) => {
+      if (path.includes('/roster/peek')) {
         return new Promise((_resolve, reject) => {
           options.signal?.addEventListener('abort', () =>
             reject(new DOMException('Aborted', 'AbortError')), { once: true })
@@ -185,11 +186,14 @@ describe('guest lobby client boundaries', () => {
     expect(mocked).toHaveBeenCalledWith(
       '/api/lobbies/' + roomCode + '/roster/peek',
       expect.objectContaining({
-        method: 'GET', signal: controller.signal,
+        method: 'GET', signal: expect.any(AbortSignal),
         headers: { 'If-None-Match': '"rev-2"' },
       }),
     )
+    const passiveSignal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    expect(passiveSignal).not.toBe(controller.signal)
     controller.abort()
+    expect(passiveSignal.aborted).toBe(true)
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(await guestLobbyApi.read(roomCode)).toEqual(roster)
     expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeInstanceOf(AbortSignal)
@@ -344,5 +348,88 @@ describe('bounded authenticated lobby HTTP requests (#123)', () => {
     await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS + 1)
     expect(signal.aborted).toBe(false)
     expect(mocked).toHaveBeenCalledOnce()
+  })
+})
+
+
+describe('bounded passive roster reads (#124)', () => {
+  it('times out a fetch that ignores abort at 12s and permits a later read', async () => {
+    vi.useFakeTimers()
+    expect(LOBBY_PASSIVE_PEEK_TIMEOUT_MS).toBe(12_000)
+    const mocked = vi.fn()
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce({ status: 304, ok: false })
+    vi.stubGlobal('fetch', mocked)
+    const pending = guestLobbyApi.peek(roomCode, 4)
+    const rejected = expect(pending).rejects.toThrow('Passive lobby roster read timed out')
+    const passiveSignal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    await vi.advanceTimersByTimeAsync(11_999)
+    expect(passiveSignal.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    await rejected
+    expect(passiveSignal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(await guestLobbyApi.peek(roomCode, 4)).toBeNull()
+    expect(mocked).toHaveBeenCalledTimes(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('also bounds a stalled JSON body after a valid HTTP 200', async () => {
+    vi.useFakeTimers()
+    const mocked = vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: () => new Promise<never>(() => {}),
+    })
+    vi.stubGlobal('fetch', mocked)
+    const pending = guestLobbyApi.peek(roomCode, 1)
+    const rejected = expect(pending).rejects.toThrow('Passive lobby roster read timed out')
+    await vi.advanceTimersByTimeAsync(12_000)
+    await rejected
+    expect((mocked.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('external abort stops an abort-ignoring fetch immediately without waiting 12s', async () => {
+    vi.useFakeTimers()
+    const owner = new AbortController()
+    const mocked = vi.fn(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', mocked)
+    const pending = guestLobbyApi.peek(roomCode, 2, owner.signal)
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    const passiveSignal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    expect(passiveSignal).not.toBe(owner.signal)
+    owner.abort()
+    await rejected
+    expect(passiveSignal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(mocked).toHaveBeenCalledOnce()
+  })
+
+  it('pre-aborted caller never issues a read or installs a deadline', async () => {
+    vi.useFakeTimers()
+    const owner = new AbortController()
+    owner.abort()
+    const mocked = vi.fn()
+    vi.stubGlobal('fetch', mocked)
+    await expect(guestLobbyApi.peek(roomCode, 2, owner.signal))
+      .rejects.toMatchObject({ name: 'AbortError' })
+    expect(mocked).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([304, 401, 503])('cleans the deadline after a completed HTTP %i', async status => {
+    vi.useFakeTimers()
+    const mocked = vi.fn().mockResolvedValue({ ok: status === 200, status })
+    vi.stubGlobal('fetch', mocked)
+    if (status === 304) {
+      await expect(guestLobbyApi.peek(roomCode, 6)).resolves.toBeNull()
+    } else {
+      await expect(guestLobbyApi.peek(roomCode, 6)).rejects.toMatchObject({
+        name: 'LobbyHttpError', status,
+      })
+    }
+    const passiveSignal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    await vi.advanceTimersByTimeAsync(12_001)
+    expect(passiveSignal.aborted).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

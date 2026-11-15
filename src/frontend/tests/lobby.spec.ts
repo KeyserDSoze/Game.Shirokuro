@@ -1447,3 +1447,73 @@ test('hung lobby creation times out, unlocks controls and never replays a mutati
   expect(stats).toEqual([1, 1])
   expect(issuance).toBe(1)
 })
+
+
+test('hung passive roster GET times out without revoking guest or retrying immediately (#124)', async ({ page }) => {
+  test.setTimeout(55_000)
+  const actor = 'guest-' + 'c'.repeat(32)
+  const code = 'room-' + 'd'.repeat(32)
+  let signedIn = false
+  let sessionPosts = 0
+  let lobbyPosts = 0
+  await page.route('**/api/sessions/me', route =>
+    route.fulfill(signedIn
+      ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+      : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    sessionPosts++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    lobbyPosts++
+    return route.fulfill({ status: 201, json: {
+      lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+    } })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // Simulate a half-open read in-browser so no real guest or room reaches
+  // the server, while observing the real AbortSignal used by the client.
+  await page.evaluate(() => {
+    const realFetch = window.fetch.bind(window)
+    const state = window as Window & { pendingPeek?: number; abortedPeek?: number }
+    state.pendingPeek = 0
+    state.abortedPeek = 0
+    window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (typeof input === 'string' &&
+          input.endsWith('/roster/peek') && init?.method === 'GET') {
+        state.pendingPeek!++
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            state.abortedPeek!++
+            reject(new DOMException('Aborted', 'AbortError'))
+          }, { once: true })
+        })
+      }
+      return realFetch(input, init)
+    }
+  })
+
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+  const peekStats = () => page.evaluate(() => {
+    const state = window as Window & { pendingPeek?: number; abortedPeek?: number }
+    return { started: state.pendingPeek ?? 0, aborted: state.abortedPeek ?? 0 }
+  })
+  await expect.poll(async () => (await peekStats()).started, { timeout: 25_000 }).toBe(1)
+  await expect.poll(async () => (await peekStats()).aborted, { timeout: 20_000 }).toBe(1)
+  expect((await peekStats()).started).toBe(1)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(1)
+  await expect(page.getByTestId('lobby-create')).toHaveCount(0)
+  expect(sessionPosts).toBe(1)
+  expect(lobbyPosts).toBe(1)
+})
