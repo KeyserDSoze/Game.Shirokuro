@@ -854,6 +854,16 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(0, cache.Reads);
         Assert.Equal(1, limiter.Calls);
 
+        // Routing does match this path but not the GET method: its synthetic
+        // 405 endpoint must keep the framework's method semantics. It must
+        // not be treated as an unmatched route or a JSON media-type 415.
+        using (var wrongMethod = await anonymous.GetAsync("/api/lobbies"))
+        {
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, wrongMethod.StatusCode);
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
         // Only a real, authorized API route asks the Redis-backed cookie
         // authority; it must remain fail-closed during the same outage.
         using (var protectedRead = await guest.GetAsync("/api/sessions/me"))
