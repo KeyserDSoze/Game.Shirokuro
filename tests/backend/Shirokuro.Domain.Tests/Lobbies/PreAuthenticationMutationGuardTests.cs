@@ -29,8 +29,11 @@ public sealed class PreAuthenticationMutationGuardTests
     {
         private readonly ConcurrentDictionary<string, byte[]> _data = new();
         private int _reads;
+        private int _writes;
         public int Reads => Volatile.Read(ref _reads);
+        public int Writes => Volatile.Read(ref _writes);
         public bool Unavailable { get; set; }
+        public void ExpireAll() => _data.Clear();
 
         public byte[]? Get(string key) =>
             _data.TryGetValue(key, out var value) ? value : null;
@@ -45,7 +48,10 @@ public sealed class PreAuthenticationMutationGuardTests
         }
 
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
-            => _data[key] = value;
+        {
+            Interlocked.Increment(ref _writes);
+            _data[key] = value;
+        }
 
         public Task SetAsync(string key, byte[] value,
             DistributedCacheEntryOptions options, CancellationToken token = default)
@@ -184,6 +190,7 @@ public sealed class PreAuthenticationMutationGuardTests
         using var guest = Client(server, cookie: cookie);
         Assert.Equal(1, limiter.Calls); // Only the genuine guest admission.
         Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
 
         // The signed guest cookie would require an authoritative Redis
         // read. A denied quota MUST be returned first, even during outage,
@@ -234,6 +241,9 @@ public sealed class PreAuthenticationMutationGuardTests
         }
         Assert.Equal(1, cache.Reads);
         Assert.Equal(4, limiter.Calls);
+        // An outage cannot create a replacement session even when Redis
+        // would accept a SET for a new ticket but not a GET for the old one.
+        Assert.Equal(1, cache.Writes);
 
         // A separate room-creation POST still validates the signed cookie
         // BEFORE attempting its distinct quota, even under registry outage.
@@ -257,6 +267,19 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", recovered.Headers.CacheControl?.ToString());
         Assert.Equal(3, cache.Reads);
         Assert.Equal(5, limiter.Calls);
+        Assert.Equal(1, cache.Writes);
+
+        // A confirmed inactive ticket is different from an unavailable
+        // authority: the explicit user action may issue a fresh guest.
+        cache.ExpireAll();
+        using var reissueRequest = Mutation(HttpMethod.Post,
+            "/api/sessions/guest", "https://game.example");
+        using var reissued = await guest.SendAsync(reissueRequest);
+        Assert.Equal(HttpStatusCode.OK, reissued.StatusCode);
+        Assert.True(reissued.Headers.Contains("Set-Cookie"));
+        Assert.Equal(2, cache.Writes);
+        Assert.Equal(4, cache.Reads);
+        Assert.Equal(6, limiter.Calls);
     }
 
     [Fact]

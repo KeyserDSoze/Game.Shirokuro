@@ -463,6 +463,14 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     if (!GuestSessionBodyGuard.Allows(context))
         return Results.BadRequest(new { code = "session_request_must_be_empty" });
 
+    // The signed guest ticket was rejected because the shared authority
+    // could not be reached, NOT because Redis confirmed it was revoked.
+    // Cookie auth has deliberately removed the principal; treating this
+    // request as anonymous would mint a *new* guest while its predecessor
+    // is still unverified. Never do so until the registry is available.
+    if (context.Items.ContainsKey(GuestSessionRegistry.UnavailableRequestMarker))
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
     var existingId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
     if (context.User.Identities.Any(identity => identity.IsAuthenticated))
     {
