@@ -207,6 +207,167 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task DrainingNodeRejectsOnlyNewAdmissionsBeforeGuestRedisAndQuota()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, stubReadiness: true,
+            drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        using (var active = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+
+        var reads = cache.Reads;
+        Assert.True(reads > 0);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // The real signed guest would need the shared registry. Neither
+        // that validation nor the per-IP Redis limiter may run after drain.
+        drain.Stop();
+        cache.Unavailable = true;
+        limiter.Unavailable = true;
+        foreach (var client in new[] { anonymous, guest })
+        {
+            foreach (var path in new[] { "/api/sessions/guest", "/api/lobbies" })
+            {
+                using var request = Mutation(HttpMethod.Post, path,
+                    "https://game.example");
+                if (path == "/api/lobbies")
+                    request.Content = new StringContent(
+                        """{"teamIds":["white","black"],"teamId":"white"}""",
+                        Encoding.UTF8, "application/json");
+                using var rejected = await client.SendAsync(request);
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+                Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+                Assert.False(rejected.Headers.Contains("Set-Cookie"));
+                Assert.False(rejected.Headers.Contains("Retry-After"));
+                Assert.DoesNotContain("Private Redis",
+                    await rejected.Content.ReadAsStringAsync(),
+                    StringComparison.Ordinal);
+            }
+        }
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // Established routing and pre-auth validation retain their
+        // precedence. The shutdown fence must not hide malformed requests.
+        using (var unknown = await guest.GetAsync("/api/no-such-endpoint"))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+            Assert.Equal("no-store", unknown.Headers.CacheControl?.ToString());
+        }
+        using (var method = await guest.GetAsync("/api/lobbies"))
+        {
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, method.StatusCode);
+            Assert.Equal("no-store", method.Headers.CacheControl?.ToString());
+        }
+        using (var hostile = Mutation(HttpMethod.Post, "/api/sessions/guest",
+                   "https://attacker.example"))
+        using (var rejected = await guest.SendAsync(hostile))
+            Assert.Equal(HttpStatusCode.Forbidden, rejected.StatusCode);
+        using (var body = Mutation(HttpMethod.Post, "/api/sessions/guest",
+                   "https://game.example"))
+        {
+            body.Content = new StringContent("{}", Encoding.UTF8,
+                "application/json");
+            using var rejected = await guest.SendAsync(body);
+            Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+        }
+        using (var media = Mutation(HttpMethod.Post, "/api/lobbies",
+                   "https://game.example"))
+        {
+            media.Content = new StringContent("not-json", Encoding.UTF8,
+                "text/plain");
+            using var rejected = await guest.SendAsync(media);
+            Assert.Equal(HttpStatusCode.UnsupportedMediaType, rejected.StatusCode);
+        }
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var ready = await guest.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+
+        // A non-admission private route still checks its guest authority.
+        using var identity = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, identity.StatusCode);
+        Assert.Equal(reads + 1, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
+    public async Task DevelopmentDrainRejectsNewAdmissionsButAllowsExistingLogout()
+    {
+        var drain = new ManualDrainSignal();
+        using var server = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseEnvironment("Development");
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IReadinessDrainSignal>();
+                    services.AddSingleton<IReadinessDrainSignal>(drain);
+                });
+            });
+        using var anonymous = Client(server, development: true);
+        var cookie = await Issue(anonymous, "http://localhost");
+        using var guest = Client(server, development: true, cookie: cookie);
+
+        // An already-accepted room exists before the drain. Its creator
+        // must retain the ability to log out and remove its memberships.
+        using (var creation = Mutation(HttpMethod.Post, "/api/lobbies",
+                   "http://localhost"))
+        {
+            creation.Content = new StringContent(
+                """{"teamIds":["white","black"],"teamId":"white"}""",
+                Encoding.UTF8, "application/json");
+            using var created = await guest.SendAsync(creation);
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        }
+
+        drain.Stop();
+        foreach (var client in new[] { anonymous, guest })
+        {
+            foreach (var path in new[] { "/api/sessions/guest", "/api/lobbies" })
+            {
+                using var request = Mutation(HttpMethod.Post, path,
+                    "http://localhost");
+                if (path == "/api/lobbies")
+                    request.Content = new StringContent(
+                        """{"teamIds":["white","black"],"teamId":"white"}""",
+                        Encoding.UTF8, "application/json");
+                using var rejected = await client.SendAsync(request);
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+                Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+                Assert.False(rejected.Headers.Contains("Set-Cookie"));
+                Assert.False(rejected.Headers.Contains("Retry-After"));
+            }
+        }
+
+        // Drain is not a blanket authorization bypass or forced logout:
+        // authenticated reads and revocation remain available to the player.
+        using (var existing = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, existing.StatusCode);
+        using (var logout = Mutation(HttpMethod.Delete, "/api/sessions/guest",
+                   "http://localhost"))
+        using (var revoked = await guest.SendAsync(logout))
+            Assert.Equal(HttpStatusCode.NoContent, revoked.StatusCode);
+        using (var oldCookie = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, oldCookie.StatusCode);
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var ready = await guest.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+    }
+
+    [Fact]
     public async Task DrainingLobbyHubRejectsNegotiateAndUpgradeBeforeGuestRedis()
     {
         var cache = new CountingCache();
