@@ -3,8 +3,10 @@ import { heroRoster } from '@/features/heroes/catalog'
 import type { LobbyRoster } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
+  LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS,
   classifyConflictRosterRefresh, classifyRosterPollFailure,
   isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
+  rosterCanHonorResumeHint, rosterResumeDelayMs,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -101,6 +103,47 @@ describe('pre-match authenticated lobby polling', () => {
     expect(rosterPollDelayMs(1, 0)).toBe(30_000)
     expect(rosterPollDelayMs(2, 0)).toBe(60_000)
     expect(rosterPollDelayMs(3, 0)).toBe(120_000)
+  })
+
+  it('enforces a 15-second minimum between passive reads after resume', () => {
+    expect(rosterResumeDelayMs(10_000, 10_000)).toBe(15_000)
+    expect(rosterResumeDelayMs(10_000, 24_999)).toBe(1)
+    expect(rosterResumeDelayMs(10_000, 25_000)).toBe(0)
+    expect(rosterResumeDelayMs(10_000, 90_000)).toBe(0)
+    // A new room anchored at its creation must not cause an immediate GET.
+    expect(rosterResumeDelayMs(0, 1_000)).toBe(14_000)
+    expect(LOBBY_ROSTER_POLL_INTERVAL_MS).toBe(15_000)
+  })
+
+  it('fails safely on bad or backwards monotonic timing', () => {
+    for (const invalid of [NaN, Infinity, -Infinity]) {
+      expect(rosterResumeDelayMs(invalid, 20_000)).toBe(15_000)
+      expect(rosterResumeDelayMs(20_000, invalid)).toBe(15_000)
+    }
+    expect(rosterResumeDelayMs(20_000, 19_999)).toBe(15_000)
+  })
+
+  it('accepts at most one online/focus/visibility hint per 30 seconds', () => {
+    expect(LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS).toBe(30_000)
+    expect(rosterCanHonorResumeHint(null, 0)).toBe(true)
+    expect(rosterCanHonorResumeHint(1_000, 1_000)).toBe(false)
+    expect(rosterCanHonorResumeHint(1_000, 30_999)).toBe(false)
+    expect(rosterCanHonorResumeHint(1_000, 31_000)).toBe(true)
+    expect(rosterCanHonorResumeHint(1_000, 100_000)).toBe(true)
+    expect(rosterCanHonorResumeHint(1_000, 999)).toBe(false)
+    expect(rosterCanHonorResumeHint(NaN, 100_000)).toBe(false)
+    expect(rosterCanHonorResumeHint(null, Number.POSITIVE_INFINITY)).toBe(false)
+    expect(rosterCanHonorResumeHint(null, Number.NaN)).toBe(false)
+  })
+
+  it('never mistakes wake hints for server-authoritative guest revocation', () => {
+    const verified = roster(3)
+    expect(reconcilePolledRoster(verified, verified, alice.playerId)).toBe('unchanged')
+    expect(classifyRosterPollFailure(503)).toBe('retain')
+    expect(classifyRosterPollFailure(504)).toBe('retain')
+    expect(rosterResumeDelayMs(0, 120_000)).toBe(0)
+    // Waking can advance the next check, but does not grant a session,
+    // mutate a room or classify an outage as confirmation of membership.
   })
 
   it('backs off on transient errors, caps retry delay and resets after success', () => {
