@@ -4,6 +4,29 @@ import { isCanonicalGuestPlayerId, type LobbyRoster } from './api'
 /** Read-only, member-scoped, pre-match synchronization; not match state. */
 export const LOBBY_ROSTER_POLL_INTERVAL_MS = 15_000
 export const LOBBY_ROSTER_MAX_BACKOFF_MS = 120_000
+// A network/visibility hint may bring forward one passive read, but may
+// never turn a failing 120-second backoff into a request storm.
+export const LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS = 30_000
+
+/**
+ * Minimum interval from the last read attempt (or initial room display) to
+ * a wake-triggered read. Monotonic performance.now() is supplied by the UI:
+ * a backwards/invalid clock must fail to the safe 15-second floor.
+ */
+export function rosterResumeDelayMs(lastReadStartedAt: number, now: number): number {
+  if (!Number.isFinite(lastReadStartedAt) || !Number.isFinite(now) ||
+      now < lastReadStartedAt) return LOBBY_ROSTER_POLL_INTERVAL_MS
+  return Math.max(0, LOBBY_ROSTER_POLL_INTERVAL_MS - (now - lastReadStartedAt))
+}
+
+/** One accepted hint per 30 seconds; duplicate focus/online events coalesce. */
+export function rosterCanHonorResumeHint(
+  lastHintAt: number | null, now: number,
+): boolean {
+  return Number.isFinite(now) && (lastHintAt === null ||
+    (Number.isFinite(lastHintAt) &&
+     now - lastHintAt >= LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS))
+}
 
 /**
  * Bounded exponential retry with positive 0..20% jitter (where headroom
