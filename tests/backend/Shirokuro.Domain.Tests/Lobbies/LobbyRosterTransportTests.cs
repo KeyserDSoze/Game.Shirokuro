@@ -12,6 +12,8 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Hosting;
+using Shirokuro.Api.Readiness;
 using Shirokuro.Api.Hubs;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
@@ -92,6 +94,7 @@ public sealed class LobbyRosterTransportTests
     private sealed class ContendedLobby : IAsyncGuestLobby
     {
         public int Reads { get; private set; }
+        public TaskCompletionSource<LobbyRosterView>? Pending { get; set; }
 
         public Task<LobbyRosterView> ForMemberAsync(string roomId, string trustedPlayerId,
             CancellationToken cancellationToken = default)
@@ -100,7 +103,7 @@ public sealed class LobbyRosterTransportTests
             // Simulate the Redis runtime's bounded heartbeat CAS retry
             // exhaustion AFTER auth/member routing, without real contention
             // races or an arbitrary InvalidOperationException catch-all.
-            return Task.FromException<LobbyRosterView>(
+            return Pending?.Task ?? Task.FromException<LobbyRosterView>(
                 new LobbyReadContentionException());
         }
         public Task<LobbyRosterView> PeekForMemberAsync(string roomId,
@@ -388,8 +391,12 @@ public sealed class LobbyRosterTransportTests
             System.Reflection.BindingFlags.Instance |
             System.Reflection.BindingFlags.Public |
             System.Reflection.BindingFlags.DeclaredOnly);
-        var method = Assert.Single(methods);
-        Assert.Equal("GetRoster", method.Name);
+        // SignalR lifecycle overrides are not caller-invokable hub methods.
+        // No new player-controlled room subscription or mutation was added.
+        Assert.Equal(new[] { "GetRoster", "OnConnectedAsync", "OnDisconnectedAsync" },
+            methods.Select(method => method.Name).OrderBy(name => name,
+                StringComparer.Ordinal));
+        var method = Assert.Single(methods.Where(m => m.Name == "GetRoster"));
         var parameter = Assert.Single(method.GetParameters());
         Assert.Equal("lobbyId", parameter.Name);
         Assert.Equal(typeof(string), parameter.ParameterType);
@@ -539,6 +546,97 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(TimeSpan.FromHours(8), cookie.ExpireTimeSpan);
     }
 
+    private sealed class StoppingHostLifetime : IHostApplicationLifetime, IDisposable
+    {
+        private readonly CancellationTokenSource _stopping = new();
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => _stopping.Token;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() => _stopping.Cancel();
+        public void Dispose() => _stopping.Dispose();
+    }
+
+    [Fact]
+    public async Task ShutdownAbortsTrackedLobbySocketsAndRejectsNewConnections()
+    {
+        using var host = new StoppingHostLifetime();
+        var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var reader = new LobbyRosterReader(new InMemoryLobbyCoordinator());
+
+        var first = new FakeHubContext(Principal("alice"),
+            connectionId: "socket-1");
+        var gone = new FakeHubContext(Principal("bob"),
+            connectionId: "socket-2");
+        var firstHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = first };
+        var goneHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = gone };
+
+        await firstHub.OnConnectedAsync();
+        await goneHub.OnConnectedAsync();
+        Assert.Equal(0, first.AbortCount);
+        Assert.Equal(0, gone.AbortCount);
+        await goneHub.OnDisconnectedAsync(null);
+
+        host.StopApplication();
+        Assert.True(drain.IsDraining);
+        Assert.Equal(1, first.AbortCount);
+        Assert.Equal(0, gone.AbortCount); // Disconnected contexts are removed.
+
+        // CancellationToken callback executes once; repeated host shutdown
+        // and repeated checks cannot create further abort side effects.
+        host.StopApplication();
+        Assert.Equal(1, first.AbortCount);
+
+        var late = new FakeHubContext(Principal("alice"),
+            connectionId: "socket-late");
+        Assert.False(tracker.TryTrack(late));
+        Assert.Equal(1, late.AbortCount);
+        var rejectedHubContext = new FakeHubContext(Principal("alice"),
+            connectionId: "socket-post-stop");
+        var rejectedHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker)
+        {
+            Context = rejectedHubContext
+        };
+        await rejectedHub.OnConnectedAsync();
+        Assert.Equal(1, rejectedHubContext.AbortCount);
+        await firstHub.OnDisconnectedAsync(null);
+    }
+
+    [Fact]
+    public async Task ExistingHubRefusesRosterBeforeAndAfterShutdownDuringInFlightRead()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create(RoomA, ["white", "black"]);
+        coordinator.Join(RoomA, "alice", "white", 0);
+        var reader = new LobbyRosterReader(coordinator);
+        using var host = new StoppingHostLifetime();
+        var drain = new HostLifetimeReadinessDrainSignal(host);
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby { Pending = pending };
+        var hub = new LobbyRosterHub(reader, lobby: lobby, drain: drain)
+        {
+            Context = new FakeHubContext(Principal("alice"))
+        };
+
+        var read = hub.GetRoster(RoomA);
+        Assert.Equal(1, lobby.Reads);
+        host.StopApplication();
+        pending.SetResult(reader.ForMember(RoomA, "alice"));
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(() => read)).Message);
+
+        // Once stopping was observed, no subsequent roster request may
+        // touch session or lobby persistence, even with a valid room ID.
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(RoomA))).Message);
+        Assert.Equal(1, lobby.Reads);
+    }
+
     private static ClaimsPrincipal Principal(string playerId) =>
         new(new ClaimsIdentity([
             new Claim(ClaimTypes.NameIdentifier, playerId)
@@ -546,15 +644,18 @@ public sealed class LobbyRosterTransportTests
 
     private sealed class FakeHubContext(
         ClaimsPrincipal user,
-        string? spoofedUserIdentifier = null) : HubCallerContext
+        string? spoofedUserIdentifier = null,
+        string connectionId = "test-connection") : HubCallerContext
     {
-        public override string ConnectionId => "test-connection";
+        private int _abortCount;
+        public int AbortCount => Volatile.Read(ref _abortCount);
+        public override string ConnectionId => connectionId;
         public override string? UserIdentifier => spoofedUserIdentifier;
         public override ClaimsPrincipal User => user;
         public override IDictionary<object, object?> Items { get; } =
             new Dictionary<object, object?>();
         public override IFeatureCollection Features { get; } = new FeatureCollection();
         public override CancellationToken ConnectionAborted => CancellationToken.None;
-        public override void Abort() { }
+        public override void Abort() => Interlocked.Increment(ref _abortCount);
     }
 }
