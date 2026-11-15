@@ -10,6 +10,7 @@ import {
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
   classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
+  rosterCanHonorResumeHint, rosterResumeDelayMs,
 } from './rosterSync'
 import { sessionRecheckDelayMs } from './sessionRecheck'
 
@@ -210,20 +211,56 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let timer: number | undefined
     let transientFailures = 0
     let inFlightAbort: AbortController | null = null
+    let nextDeadline = Infinity
+    // Treat the initial verified room display like a successful read:
+    // returning online immediately after joining must not issue another GET.
+    let lastReadStartedAt = performance.now()
+    let lastResumeHintAt: number | null = null
+    let resumePending = false
 
+    // A wake event can only move a previously scheduled read earlier.
+    // Repeated focus/online/visibility hints cannot postpone its deadline
+    // or create multiple timers.
     const schedule = (delayMs: number) => {
-      if (active) timer = window.setTimeout(() => { void poll() }, delayMs)
+      if (!active) return
+      const due = performance.now() + delayMs
+      if (timer !== undefined && nextDeadline <= due) return
+      if (timer !== undefined) window.clearTimeout(timer)
+      nextDeadline = due
+      timer = window.setTimeout(() => {
+        timer = undefined
+        nextDeadline = Infinity
+        void poll()
+      }, delayMs)
+    }
+
+    const resume = () => {
+      if (!active || document.hidden || !navigator.onLine ||
+          busyRef.current) return
+      const now = performance.now()
+      if (!rosterCanHonorResumeHint(lastResumeHintAt, now)) return
+      lastResumeHintAt = now
+      if (inFlightAbort !== null) {
+        // Never overlap a read. Its completion schedules at most one
+        // trailing check, still subject to the 15-second GET floor.
+        resumePending = true
+        return
+      }
+      schedule(rosterResumeDelayMs(lastReadStartedAt, now))
+    }
+    const onVisible = () => {
+      if (!document.hidden) resume()
     }
 
     const poll = async () => {
       if (!active) return
-      if (document.hidden || busyRef.current) {
-        // Hidden tabs and active user actions never issue background reads.
-        // Do not clear a previously observed outage just because the UI
-        // is temporarily busy or not visible.
+      if (document.hidden || !navigator.onLine || busyRef.current) {
+        // Offline/hidden tabs and user mutations issue no background GET.
+        // Retain outage state; only a verified 200/304 resets backoff.
         schedule(LOBBY_ROSTER_POLL_INTERVAL_MS)
         return
       }
+      lastReadStartedAt = performance.now()
 
       const generation = sessionGenerationRef.current
       const operation = operationRef.current
@@ -291,15 +328,27 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // Never apply its failure penalty to a newer user operation.
         if (active && !terminal) {
           if (!stillCurrent()) transientFailures = 0
-          schedule(rosterPollDelayMs(transientFailures, Math.random()))
+          // A wake received during an in-flight read may produce one
+          // trailing probe, never a concurrent request or immediate retry.
+          const delay = resumePending
+            ? rosterResumeDelayMs(lastReadStartedAt, performance.now())
+            : rosterPollDelayMs(transientFailures, Math.random())
+          resumePending = false
+          schedule(delay)
         }
       }
     }
 
+    window.addEventListener('online', resume)
+    window.addEventListener('focus', resume)
+    document.addEventListener('visibilitychange', onVisible)
     schedule(LOBBY_ROSTER_POLL_INTERVAL_MS)
     return () => {
       active = false
       window.clearTimeout(timer)
+      window.removeEventListener('online', resume)
+      window.removeEventListener('focus', resume)
+      document.removeEventListener('visibilitychange', onVisible)
       inFlightAbort?.abort()
     }
   }, [roomId, actorId, forgetGuest, forgetRoom, t])
