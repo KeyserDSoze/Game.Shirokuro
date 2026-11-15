@@ -114,7 +114,9 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             // membership, a private roster or match state.
             var metadata = context.HttpContext.GetEndpoint()?.Metadata;
             if (metadata?.GetMetadata<PublicProbeEndpoint>() is not null ||
-                metadata?.GetMetadata<PublicBoardPreviewEndpoint>() is not null)
+                metadata?.GetMetadata<PublicBoardPreviewEndpoint>() is not null ||
+                ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(
+                    context.HttpContext))
                 return;
 
             var principal = context.Principal;
@@ -314,6 +316,13 @@ if (app.Environment.IsDevelopment())
 app.Use(async (context, next) =>
 {
     var metadata = context.GetEndpoint()?.Metadata;
+
+    // Leave the framework's synthetic 405 endpoint in charge of the status
+    // and its accurate Allow header. It never invokes application handlers;
+    // cookie validation skips ONLY this verified fallback, so Redis guest
+    // authority is not queried for a method mismatch.
+    if (ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context))
+        context.Response.Headers.CacheControl = "no-store";
 
     // No API or Hub route matched. An unknown address has no authenticated
     // resource to authorize: return the ordinary 404 BEFORE cookie validation
