@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Shirokuro.Api.Security;
+using Shirokuro.Api.Readiness;
 using Shirokuro.Application.Lobbies;
 using Shirokuro.Domain.Lobbies;
 
@@ -33,10 +34,15 @@ public static class GuestLobbyEndpoints
                 new GuestLobbyMutationBodyLimitRequired());
 
         var createRoom = route.MapPost("", async (CreateRoomRequest request, HttpContext context,
-            IHostEnvironment environment, IAsyncGuestLobby lobby) =>
+            IHostEnvironment environment, IAsyncGuestLobby lobby, IReadinessDrainSignal drain) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
+            // DTO binding runs AFTER middleware; a slow request body can
+            // cross ApplicationStopping while both earlier fences were green.
+            // Do not begin a new room CAS after that boundary.
+            if (drain.IsDraining)
+                return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
             return await Respond(async () =>
             {
                 var roster = await lobby.CreateAsync(actor!, request.TeamIds,
@@ -50,10 +56,16 @@ public static class GuestLobbyEndpoints
             createRoom.RequireRateLimiting("guest-room-creation");
 
         route.MapPost("/{roomId}/join", async (string roomId, JoinRoomRequest request,
-            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
+            HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby,
+            IReadinessDrainSignal drain) =>
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
+            // A late JSON body must not admit a participant after host stop.
+            // Already-started Redis CAS calls remain governed by their own
+            // authoritative result; do not claim that they can be cancelled.
+            if (drain.IsDraining)
+                return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
             return await Respond(async () => Results.Ok(await lobby.JoinAsync(
                 roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
