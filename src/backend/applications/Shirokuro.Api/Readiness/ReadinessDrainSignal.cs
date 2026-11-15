@@ -21,6 +21,13 @@ public interface IReadinessDrainSignal
 public sealed class LobbyRosterReadDrainRequired { }
 
 /// <summary>
+/// Trusted marker only for a new lobby membership admission via HTTP POST
+/// /api/lobbies/{roomId}/join. Existing members' actions are not denied by
+/// this join-specific host drain marker.
+/// </summary>
+public sealed class LobbyJoinDrainRequired { }
+
+/// <summary>
 /// Once ApplicationStopping is cancelled, this node must not advertise ready.
 /// This does not implement an ingress fence or a load-balancer grace period.
 /// </summary>
