@@ -720,14 +720,41 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
     var principal = GuestSessions.CreatePrincipal(playerId, sessionId);
+    var drain = context.RequestServices.GetRequiredService<IReadinessDrainSignal>();
+
+    // A Redis SET can finish after ApplicationStopping, even though the
+    // pre- and post-auth admission fences were both passed while ready.
+    // Never return its random ticket to the caller on this node. Attempt
+    // authoritative revocation; if Redis is down, the unpublished token
+    // remains unguessable and its Redis entry still has an absolute TTL.
+    // This also handles a failure to schedule the encrypted expiry work.
+    async Task<IResult> DenyNewGuestAsync()
+    {
+        try
+        {
+            await registry.RevokeAsync(principal, context.RequestAborted);
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            // No ticket is disclosed if the rollback is unconfirmed.
+        }
+        context.Response.Headers.Remove("Set-Cookie");
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+
+    if (drain.IsDraining)
+        return await DenyNewGuestAsync();
     try
     {
         // Persist encrypted maintenance work BEFORE returning any guest cookie.
-        // If Redis rejects this write, revoke the newly registered ticket.
+        // A host stop during that async write must also revoke/deny issuance.
         if (!environment.IsDevelopment())
             await context.RequestServices.GetRequiredService<IGuestExpiryIndex>()
                 .ScheduleAsync(playerId, expires, context.RequestAborted,
                     trustedSessionToken: sessionId);
+        if (drain.IsDraining)
+            return await DenyNewGuestAsync();
+
         await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
             principal,
             new AuthenticationProperties
@@ -739,17 +766,12 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
     }
     catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
     {
-        try
-        {
-            await registry.RevokeAsync(principal, context.RequestAborted);
-        }
-        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
-        {
-            // Even if rollback cannot contact Redis, no ticket is returned.
-        }
-        context.Response.Headers.Remove("Set-Cookie");
-        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        return await DenyNewGuestAsync();
     }
+    // Clear even a cookie already staged by SignInAsync if shutdown started
+    // before the response was handed back. Not a distributed Redis CAS fence.
+    if (drain.IsDraining)
+        return await DenyNewGuestAsync();
     return Results.Ok(new { playerId, kind = "guest" });
 });
 // Metadata has only trusted enum values for both deployment modes.
