@@ -315,6 +315,23 @@ app.Use(async (context, next) =>
 {
     var metadata = context.GetEndpoint()?.Metadata;
 
+    // No API or Hub route matched. An unknown address has no authenticated
+    // resource to authorize: return the ordinary 404 BEFORE cookie validation
+    // can read the shared Redis guest registry. Exact path segments avoid
+    // accidentally capturing unrelated /apix or /hubs-extra endpoints.
+    // Routing has already selected genuine 405/415 fallback endpoints, so
+    // those continue through their existing guards and HTTP semantics.
+    if (context.GetEndpoint() is null &&
+        (context.Request.Path.StartsWithSegments(
+             "/api", StringComparison.OrdinalIgnoreCase) ||
+         context.Request.Path.StartsWithSegments(
+             "/hubs", StringComparison.OrdinalIgnoreCase)))
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+
     // The framework's AcceptsMatcherPolicy creates a synthetic 415 during
     // routing when a JSON DTO route receives an explicit non-JSON media type.
     // Its replacement endpoint has NONE of the original route metadata:
