@@ -35,18 +35,25 @@ public sealed class PreAuthenticationMutationGuardTests
         public int Reads => Volatile.Read(ref _reads);
         public int Writes => Volatile.Read(ref _writes);
         public bool Unavailable { get; set; }
+        // Optional async gate for an AUTHENTICATED cookie lookup already in
+        // flight before ApplicationStopping; never delay normal fixtures.
+        public TaskCompletionSource<bool>? ReadStarted { get; set; }
+        public TaskCompletionSource<bool>? ResumeRead { get; set; }
         public void ExpireAll() => _data.Clear();
 
         public byte[]? Get(string key) =>
             _data.TryGetValue(key, out var value) ? value : null;
 
-        public Task<byte[]?> GetAsync(string key,
+        public async Task<byte[]?> GetAsync(string key,
             CancellationToken token = default)
         {
             Interlocked.Increment(ref _reads);
+            ReadStarted?.TrySetResult(true);
+            if (ResumeRead is { } gate)
+                await gate.Task.WaitAsync(token);
             if (Unavailable)
                 throw new IOException("Private Redis endpoint and password");
-            return Task.FromResult(Get(key));
+            return Get(key);
         }
 
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
@@ -80,12 +87,19 @@ public sealed class PreAuthenticationMutationGuardTests
         public int Calls => Volatile.Read(ref _calls);
         public bool Allowed { get; set; } = true;
         public bool Unavailable { get; set; }
+        // Control a quota already acquired by the ingress middleware but
+        // not yet completed. A permit may be spent; no room may be created.
+        public TaskCompletionSource<bool>? PermitStarted { get; set; }
+        public TaskCompletionSource<GuestMutationDecision>? PendingPermit { get; set; }
 
         public Task<GuestMutationDecision> AcquireAsync(
             GuestMutationRateLimit rule, IPAddress? clientIp,
             CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref _calls);
+            PermitStarted?.TrySetResult(true);
+            if (PendingPermit is { } gate)
+                return gate.Task.WaitAsync(cancellationToken);
             if (Unavailable)
                 throw new IOException("Sensitive Redis connection details");
             return Task.FromResult(new GuestMutationDecision(Allowed, 60_000));
@@ -204,6 +218,135 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.False(response.Headers.Contains("Set-Cookie"));
         Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    private static async Task AssertPostAuthDrainResponseAsync(
+        HttpResponseMessage response)
+    {
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        Assert.False(response.Headers.Contains("Retry-After"));
+        Assert.False(response.Headers.Contains("ETag"));
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("guest-", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("room-", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("redis", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GuestIssuanceWaitingForQuotaCannotMintCookieAfterDrainStarts()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var visitor = Client(server);
+
+        limiter.PermitStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        limiter.PendingPermit = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            "https://game.example");
+        var inFlight = visitor.SendAsync(request);
+        await limiter.PermitStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The pre-auth fence already passed before the limiter completed.
+        drain.Stop();
+        limiter.PendingPermit.SetResult(new GuestMutationDecision(true, 60_000));
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(10));
+        await AssertPostAuthDrainResponseAsync(result);
+        Assert.Equal(1, limiter.Calls);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(0, cache.Writes); // No signed ticket persisted.
+    }
+
+    [Fact]
+    public async Task RoomCreationWaitingForQuotaCannotMutateLobbyAfterDrainStarts()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        var rooms = server.Services.GetRequiredService<
+            Shirokuro.Application.Lobbies.InMemoryLobbyCoordinator>();
+        Assert.Equal(0, rooms.StoredRoomCount);
+
+        limiter.PermitStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        limiter.PendingPermit = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var request = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        request.Content = new StringContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""",
+            Encoding.UTF8, "application/json");
+        var inFlight = guest.SendAsync(request);
+        await limiter.PermitStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The cookie was authorized BEFORE the quota gate; a late permit
+        // does not authorize a newly created room on a draining node.
+        Assert.Equal(1, cache.Reads);
+        drain.Stop();
+        limiter.PendingPermit.SetResult(new GuestMutationDecision(true, 60_000));
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(10));
+        await AssertPostAuthDrainResponseAsync(result);
+        Assert.Equal(0, rooms.StoredRoomCount);
+        Assert.Equal(2, limiter.Calls); // One issuance + one room permit.
+        Assert.Equal(1, cache.Writes); // Only the pre-drain guest ticket.
+    }
+
+    [Fact]
+    public async Task JoinWaitingForCookieAuthorityCannotChangeRosterAfterDrainStarts()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var anonymous = Client(server);
+        var ownerCookie = await Issue(anonymous, "https://game.example");
+        var joinerCookie = await Issue(anonymous, "https://game.example");
+        using var owner = Client(server, cookie: ownerCookie);
+        using var joiner = Client(server, cookie: joinerCookie);
+        using var create = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        create.Content = new StringContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""",
+            Encoding.UTF8, "application/json");
+        using var created = await owner.SendAsync(create);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdJson = JsonDocument.Parse(
+            await created.Content.ReadAsStringAsync());
+        var roomId = createdJson.RootElement.GetProperty("lobbyId").GetString()!;
+        var rooms = server.Services.GetRequiredService<
+            Shirokuro.Application.Lobbies.InMemoryLobbyCoordinator>();
+        var before = rooms.Get(roomId);
+        Assert.Equal(1, before.Revision);
+        Assert.Single(before.Participants);
+        var readsBefore = cache.Reads;
+        var quotasBefore = limiter.Calls;
+
+        cache.ReadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        cache.ResumeRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var join = Mutation(HttpMethod.Post,
+            "/api/lobbies/" + roomId + "/join", "https://game.example");
+        join.Content = new StringContent(
+            """{"teamId":"black","expectedRevision":1}""",
+            Encoding.UTF8, "application/json");
+        var inFlight = joiner.SendAsync(join);
+        await cache.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(readsBefore + 1, cache.Reads);
+
+        drain.Stop();
+        cache.ResumeRead.SetResult(true); // Redis confirms valid old cookie.
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(10));
+        await AssertPostAuthDrainResponseAsync(result);
+        var after = rooms.Get(roomId);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Single(after.Participants);
+        Assert.Equal(before.Participants[0].PlayerId, after.Participants[0].PlayerId);
+        Assert.Equal(quotasBefore, limiter.Calls);
+        Assert.Equal(2, cache.Writes);
     }
 
     [Fact]
