@@ -476,6 +476,24 @@ public sealed class MultiplayerMetricsTests
             Assert.False(denied.Headers.Contains("Set-Cookie"));
         }
 
+        // Neither a missing API path nor a framework method mismatch may
+        // ask the unavailable Redis limiter. Both have closed diagnostic
+        // labels rather than exporting user-controlled URLs.
+        using (var unknown = await client.GetAsync(
+                   "/api/untrusted-private-secret-path"))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+            Assert.Equal("no-store", unknown.Headers.CacheControl?.ToString());
+            Assert.False(unknown.Headers.Contains("Set-Cookie"));
+        }
+        using (var methodMismatch = await client.GetAsync("/api/lobbies"))
+        {
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, methodMismatch.StatusCode);
+            Assert.Equal("no-store",
+                methodMismatch.Headers.CacheControl?.ToString());
+            Assert.False(methodMismatch.Headers.Contains("Set-Cookie"));
+        }
+
         var readings = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
@@ -488,8 +506,14 @@ public sealed class MultiplayerMetricsTests
         // an unexpected Redis quota permit via this measurement.
         using var liveness = await client.GetAsync("/api/health");
         Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
-        Assert.All(readings, o => Assert.DoesNotContain("guest-",
-            string.Join(",", o.Tags.Values), StringComparison.OrdinalIgnoreCase));
+        Assert.All(readings, o =>
+        {
+            var values = string.Join(",", o.Tags.Values);
+            Assert.DoesNotContain("guest-", values, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("untrusted-private-secret-path", values,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(new[] { "reason" }, o.Tags.Keys);
+        });
     }
 
     [Fact]
