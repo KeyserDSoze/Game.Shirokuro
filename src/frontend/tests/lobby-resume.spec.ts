@@ -32,6 +32,8 @@ test('returning online after an outage advances only one verified roster read wi
     if (route.request().method() !== 'POST') return route.continue()
     await route.fulfill({ status: 201, json: original })
   })
+  await page.route('**/api/lobbies/' + code + '/roster', route =>
+    route.fulfill({ status: 200, json: newer }))
   await page.route('**/api/lobbies/' + code + '/roster/peek', async route => {
     if (route.request().method() !== 'GET') return route.continue()
     reads++
@@ -46,6 +48,7 @@ test('returning online after an outage advances only one verified roster read wi
   await page.getByTestId('lobby-sign-in').click()
   await page.getByTestId('lobby-create').click()
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
   page.on('request', request => {
     if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method()) &&
         new URL(request.url()).pathname.startsWith('/api/')) {
@@ -55,6 +58,9 @@ test('returning online after an outage advances only one verified roster read wi
 
   // Normal first passive poll fails on 503, retaining the verified room.
   await expect.poll(() => reads, { timeout: 25_000 }).toBe(1)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-roster-stale')).toContainText('ultima verifica')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveAttribute('role', 'status')
   await expect(page.getByTestId('lobby-revision')).toContainText('1')
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   await page.waitForTimeout(200) // Ensure its async finally has scheduled backoff.
@@ -77,6 +83,7 @@ test('returning online after an outage advances only one verified roster read wi
   expect(times[1] - times[0]).toBeLessThan(27_000)
   expect(validators).toEqual(['"rev-1"', '"rev-1"'])
   await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   await expect(page.getByTestId('lobby-player')).toContainText(playerId)
@@ -88,5 +95,18 @@ test('returning online after an outage advances only one verified roster read wi
   })
   await page.waitForTimeout(250)
   expect(reads).toBe(2)
+  expect(writes).toEqual([])
+
+  // Offline is evidence that the snapshot can no longer be confirmed,
+  // but it is not a reason to discard a previously verified guest/room.
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  // A deliberate read-only, authenticated refresh can confirm the current
+  // revision without waiting for the next passive poll or issuing a write.
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
   expect(writes).toEqual([])
 })
