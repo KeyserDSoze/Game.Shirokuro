@@ -352,7 +352,8 @@ public sealed class PreAuthenticationMutationGuardTests
         {
             Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
             Assert.Contains(item.Tags["outcome"],
-                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
+                new[] { "active", "inactive", "unavailable",
+                        "recovery-cutoff", "unsupported-ticket" });
             Assert.DoesNotContain("guest-", item.Tags["outcome"], StringComparison.Ordinal);
         });
     }
@@ -395,7 +396,8 @@ public sealed class PreAuthenticationMutationGuardTests
         {
             Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
             Assert.Contains(item.Tags["outcome"],
-                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
+                new[] { "active", "inactive", "unavailable",
+                        "recovery-cutoff", "unsupported-ticket" });
         });
 
         // The old node can still independently validate the same cookie;
