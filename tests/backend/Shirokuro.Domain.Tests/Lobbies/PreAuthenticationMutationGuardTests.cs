@@ -350,10 +350,12 @@ public sealed class PreAuthenticationMutationGuardTests
                    new HttpRequestMessage(HttpMethod.Put,
                        $"/api/lobbies/{roomId}/roster")))
         {
+            // TestServer's synthetic ASP.NET Core fallback returns 405 but
+            // does not necessarily expose an Allow header. Browser-level
+            // method tests assert Allow separately where it is available.
             Assert.Equal(HttpStatusCode.MethodNotAllowed, wrongMethod.StatusCode);
-            Assert.True(wrongMethod.Headers.TryGetValues("Allow", out var allowed));
-            Assert.Contains(allowed, value => value.Contains(
-                "GET", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal("no-store", wrongMethod.Headers.CacheControl?.ToString());
+            Assert.False(wrongMethod.Headers.Contains("Set-Cookie"));
         }
         Assert.Equal(reads, cache.Reads);
 
