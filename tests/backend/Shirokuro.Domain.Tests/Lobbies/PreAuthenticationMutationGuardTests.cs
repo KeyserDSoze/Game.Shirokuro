@@ -806,6 +806,102 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.False(invalidRoom);
     }
 
+    [Theory]
+    [InlineData("/api/lobbies", true)]
+    [InlineData("/API/LOBBIES", true)]
+    [InlineData("/api", true)]
+    [InlineData("/hubs/lobbies", true)]
+    [InlineData("/HUBS/OTHER", true)]
+    [InlineData("/apix/lobbies", false)]
+    [InlineData("/hubs-other/lobbies", false)]
+    [InlineData("/preview", false)]
+    public void Synthetic405GuardRecognizesOnlyFrameworkApiAndHubFallback(
+        string path, bool expected)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "GET";
+        context.Request.Path = path;
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask,
+            new EndpointMetadataCollection(),
+            "405 HTTP Method Not Supported"));
+
+        Assert.Equal(expected,
+            ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context));
+    }
+
+    [Fact]
+    public void Synthetic405GuardNeverBypassesOrdinaryEndpoints()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "GET";
+        context.Request.Path = "/api/lobbies";
+
+        Assert.False(ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context));
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask,
+            new EndpointMetadataCollection(),
+            "real lobby endpoint"));
+        Assert.False(ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context));
+
+        // Even a coincidental display name cannot skip authentication if
+        // the endpoint carries any real server-owned metadata.
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask,
+            new EndpointMetadataCollection(new WebMutationGuardRequired()),
+            "405 HTTP Method Not Supported"));
+        Assert.False(ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context));
+    }
+
+    [Fact]
+    public async Task Synthetic405PreservesAllowWithoutSignedGuestRedisLookup()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        // POST is the registered method for room creation. A request with
+        // the wrong method uses the framework's synthetic 405 and Allow
+        // header, not a real lobby handler or cookie Redis authentication.
+        foreach (var method in new[] { HttpMethod.Get, HttpMethod.Put })
+        {
+            using var request = new HttpRequestMessage(method, "/api/lobbies");
+            using var rejected = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.True(rejected.Headers.TryGetValues("Allow", out var values));
+            Assert.Contains("POST", string.Join(",", values));
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Retry-After"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // An actual protected endpoint must still revalidate the signed
+        // cookie against Redis, fail closed, then recover unchanged.
+        using (var unavailable = await guest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                unavailable.StatusCode);
+            Assert.Equal("no-store",
+                unavailable.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(1, cache.Reads);
+        cache.Unavailable = false;
+        using var recovered = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+    }
+
     [Fact]
     public async Task UnmatchedApiAndHubPathsRejectBeforeSignedGuestCookieRedisLookup()
     {
