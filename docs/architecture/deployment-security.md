@@ -1952,3 +1952,42 @@ La selezione del routing resta autoritativa: i fallback framework **405** per me
 ## Risposte 405 sintetiche senza letture guest Redis (#136)
 
 Le route esistenti con verbo HTTP errato producono tramite `HttpMethodMatcherPolicy` un endpoint sintetico `405 HTTP Method Not Supported`, il quale non esegue alcun handler Shirokuro e non porta metadata auth/mutation della route originale. Per non consumare Redis durante uno scarto già determinato dal routing, `ApiMethodMismatchGuard` identifica esclusivamente questo caso con **display name fisso, zero metadata e path segmentato `/api` o `/hubs`**. Il callback `OnValidatePrincipal` non interroga il registry guest per quel fallback, mentre il middleware pre-auth marca la risposta `Cache-Control: no-store`. **Il router continua a eseguire il proprio endpoint e a comporre `405` + header `Allow`**: non si anticipano né si imitano i metodi consentiti, non si eseguono delegate senza autorizzazione. Le rotte normali e i fallback 415 conservano le rispettive verifiche cookie, Origin, ID canonico, limiti di body e quota. I test Production con guest firmato e fake Redis indisponibile verificano il numero zero di GET sul metodo errato, `Allow: POST`, e 503 sulla richiesta realmente protetta; Playwright verifica l'identità invariata nel browser. Un cambiamento del nome/metadata synthetic 405 nel framework interrompe solo l'ottimizzazione (fail closed verso le verifiche preesistenti), e deve essere rilevato dai test. #21 resta aperta per deployment resiliente, osservabilità e anti-Sybil; **la #136 si chiude solo con CI verde verificata sull'HEAD**.
+
+## Telemetria aggregata ingress e cookie legacy (#140)
+
+L'unico `Meter` .NET `Shirokuro.Api.Multiplayer` ora registra tre ulteriori
+esiti **senza cambiare lo schema né aprire nuovi endpoint**:
+
+- `shirokuro.ingress.rejections` con `reason=unknown-route` quando
+  il router non trova endpoint nei **segmenti esatti** `/api` o `/hubs`
+  e l'ingress ritorna 404/no-store prima di cookie auth e Redis (#135).
+- Lo stesso contatore con `reason=method-not-allowed` per il **solo
+  fallback 405 del framework**, identificato da display name/metadata
+  server e confinato agli stessi namespace (#136). Il framework continua
+  a produrre codice e `Allow`; il contatore non cambia il routing.
+- `shirokuro.session.cookie_authority` con `outcome=unsupported-ticket`
+  quando un cookie Data Protection **firmato** contiene un principal non
+  canonico o un presunto account senza provider (#139): il callback lo
+  rifiuta subito senza letture Redis. Cookie guest canonici continuano
+  ad emettere `active/inactive/unavailable/recovery-cutoff` soltanto
+  quando arrivano alla rispettiva fase di verifica.
+
+Le label sono stringhe statiche provenienti da enum chiusi; non includono
+mai indirizzi IP, path, query, identity claim, cookie, invite, chiavi,
+errori, hostname o dati utente. Gli esiti 404 e 405 sono mutuamente esclusivi
+(`GetEndpoint() == null` vs endpoint framework sintetico) e restano diversi
+da 415 e dai guard Origin/body. L'autenticazione dei probe pubblici è
+intenzionalmente indipendente da Redis e non marca cookie rigettati:
+quegli endpoint non accedono a dati privati. Ogni misura è il conteggio
+di **richieste/scarti**, non di attaccanti, utenti unici o tentativi
+fraudolenti verificati: i contatori non sostituiscono anti-Sybil, WAF,
+rate limit e alert gestiti dall'operatore.
+
+Test xUnit catturano le metriche attraverso un `MeterListener` process-wide
+insieme a veri HTTP TestServer con cookie firmati/fake Redis bloccato,
+e verificano il contratto di label a cardinalità finita; l'export TLS OTLP
+resta opt-in, con un test che controlla anche il payload e l'assenza di
+header credenziali. Come per altri contatori, il listener può vedere
+test concorrenti: la correlazione fra richiesta e assenza di I/O Redis
+è comprovata dal fake cache/limiter, non dalla pretesa che un counter
+sia una sessione o un identificatore.
