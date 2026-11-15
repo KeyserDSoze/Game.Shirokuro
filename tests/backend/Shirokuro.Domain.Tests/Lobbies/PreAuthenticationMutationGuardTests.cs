@@ -32,9 +32,17 @@ public sealed class PreAuthenticationMutationGuardTests
         private readonly ConcurrentDictionary<string, byte[]> _data = new();
         private int _reads;
         private int _writes;
+        private int _removes;
         public int Reads => Volatile.Read(ref _reads);
         public int Writes => Volatile.Read(ref _writes);
+        public int Removes => Volatile.Read(ref _removes);
+        public int StoredGuestKeys => _data.Keys.Count(key =>
+            key.StartsWith("guest-session:", StringComparison.Ordinal));
         public bool Unavailable { get; set; }
+        public bool RemoveUnavailable { get; set; }
+        // Pause an in-handler Redis SET until ApplicationStopping is raised.
+        public TaskCompletionSource<bool>? SetStarted { get; set; }
+        public TaskCompletionSource<bool>? ResumeSet { get; set; }
         // Optional async gate for an AUTHENTICATED cookie lookup already in
         // flight before ApplicationStopping; never delay normal fixtures.
         public TaskCompletionSource<bool>? ReadStarted { get; set; }
@@ -62,18 +70,26 @@ public sealed class PreAuthenticationMutationGuardTests
             _data[key] = value;
         }
 
-        public Task SetAsync(string key, byte[] value,
+        public async Task SetAsync(string key, byte[] value,
             DistributedCacheEntryOptions options, CancellationToken token = default)
         {
+            SetStarted?.TrySetResult(true);
+            if (ResumeSet is { } gate)
+                await gate.Task.WaitAsync(token);
             Set(key, value, options);
-            return Task.CompletedTask;
         }
 
         public void Refresh(string key) { }
         public Task RefreshAsync(string key, CancellationToken token = default) =>
             Task.CompletedTask;
 
-        public void Remove(string key) => _data.TryRemove(key, out _);
+        public void Remove(string key)
+        {
+            Interlocked.Increment(ref _removes);
+            if (RemoveUnavailable)
+                throw new IOException("Private Redis rollback endpoint");
+            _data.TryRemove(key, out _);
+        }
         public Task RemoveAsync(string key, CancellationToken token = default)
         {
             Remove(key);
@@ -124,6 +140,35 @@ public sealed class PreAuthenticationMutationGuardTests
         public void Stop() => Interlocked.Exchange(ref _stopping, 1);
     }
 
+    private sealed class PausingExpiryIndex : IGuestExpiryIndex
+    {
+        private int _scheduled;
+        public int Scheduled => Volatile.Read(ref _scheduled);
+        public TaskCompletionSource<bool> ScheduleStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ResumeSchedule { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task ScheduleAsync(string trustedPlayerId,
+            DateTimeOffset expiresUtc,
+            CancellationToken cancellationToken = default,
+            string? trustedSessionToken = null)
+        {
+            Interlocked.Increment(ref _scheduled);
+            ScheduleStarted.TrySetResult(true);
+            await ResumeSchedule.Task.WaitAsync(cancellationToken);
+        }
+
+        public Task<string> ScheduleRevokedAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult("unused");
+        public Task<IReadOnlyList<DueGuestExpiry>> ReadDueAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<DueGuestExpiry>>(Array.Empty<DueGuestExpiry>());
+        public Task AcknowledgeAsync(string protectedMember,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
     private sealed class ReadyProbe : IDeploymentReadiness
     {
         public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
@@ -135,7 +180,8 @@ public sealed class PreAuthenticationMutationGuardTests
 
     private static WebApplicationFactory<Program> Production(
         CountingCache cache, CountingLimiter limiter, bool stubReadiness = false,
-        string? recoveryCutoff = null, IReadinessDrainSignal? drain = null) =>
+        string? recoveryCutoff = null, IReadinessDrainSignal? drain = null,
+        IGuestExpiryIndex? expiryIndex = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -163,6 +209,11 @@ public sealed class PreAuthenticationMutationGuardTests
             {
                 services.RemoveAll<IGuestMutationLimiter>();
                 services.AddSingleton<IGuestMutationLimiter>(limiter);
+                if (expiryIndex is not null)
+                {
+                    services.RemoveAll<IGuestExpiryIndex>();
+                    services.AddSingleton(expiryIndex);
+                }
                 if (drain is not null)
                 {
                     services.RemoveAll<IReadinessDrainSignal>();
@@ -232,6 +283,102 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.DoesNotContain("guest-", body, StringComparison.Ordinal);
         Assert.DoesNotContain("room-", body, StringComparison.Ordinal);
         Assert.DoesNotContain("redis", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GuestRegistrationRedisSetCompletingDuringDrainRevokesUnpublishedTicket()
+    {
+        var cache = new CountingCache
+        {
+            SetStarted = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            ResumeSet = new(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var visitor = Client(server);
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            "https://game.example");
+        var inFlight = visitor.SendAsync(request);
+        await cache.SetStarted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(0, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // Both middleware fences have passed, the handler is awaiting
+        // its own Redis SET. The confirmed SET must NOT produce a cookie.
+        drain.Stop();
+        cache.ResumeSet.SetResult(true);
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(15));
+        await AssertPostAuthDrainResponseAsync(result);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, cache.Reads); // Targeted registry rollback lookup.
+        Assert.Equal(1, cache.Removes);
+        Assert.Equal(0, cache.StoredGuestKeys);
+        Assert.Equal(0, server.Services.GetRequiredService<
+            GuestSessionRegistry>().StoredSessionCount);
+    }
+
+    [Fact]
+    public async Task GuestExpiryScheduleCompletingDuringDrainRevokesUnpublishedTicket()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        var index = new PausingExpiryIndex();
+        using var server = Production(cache, limiter, drain: drain,
+            expiryIndex: index);
+        using var visitor = Client(server);
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            "https://game.example");
+        var inFlight = visitor.SendAsync(request);
+        await index.ScheduleStarted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, cache.StoredGuestKeys);
+        Assert.Equal(1, index.Scheduled);
+
+        // Durable expiry work was started before shutdown. Once it finishes
+        // there must be no new Set-Cookie or successful guest identity.
+        drain.Stop();
+        index.ResumeSchedule.SetResult(true);
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(15));
+        await AssertPostAuthDrainResponseAsync(result);
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, cache.Removes);
+        Assert.Equal(0, cache.StoredGuestKeys);
+        Assert.Equal(0, server.Services.GetRequiredService<
+            GuestSessionRegistry>().StoredSessionCount);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
+    public async Task GuestDrainRollbackOutageNeverLeaksUnpublishedCookieOrRedisDetails()
+    {
+        var cache = new CountingCache
+        {
+            SetStarted = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            ResumeSet = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            RemoveUnavailable = true
+        };
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var visitor = Client(server);
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            "https://game.example");
+        var inFlight = visitor.SendAsync(request);
+        await cache.SetStarted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+        drain.Stop();
+        cache.ResumeSet.SetResult(true);
+        using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(15));
+        await AssertPostAuthDrainResponseAsync(result);
+        Assert.Equal(1, cache.Removes); // Attempted, NOT confirmed.
+        Assert.Equal(1, cache.StoredGuestKeys);
+        Assert.Equal(1, server.Services.GetRequiredService<
+            GuestSessionRegistry>().StoredSessionCount);
+        // The unconfirmed orphan has only the server-side random token,
+        // never a browser cookie. Production Redis will expire its TTL.
+        Assert.Equal(1, limiter.Calls);
     }
 
     [Fact]
