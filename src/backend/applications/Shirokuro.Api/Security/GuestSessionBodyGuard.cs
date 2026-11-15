@@ -3,8 +3,9 @@ using Microsoft.AspNetCore.Http.Features;
 namespace Shirokuro.Api.Security;
 
 /// <summary>
-/// Server-owned endpoint marker: guest issuance takes no request body.
-/// Reject attempts before guest-cookie authority and admission quotas.
+/// Server-owned endpoint marker: guest issuance and logout take no body.
+/// Reject malformed requests before guest-cookie Redis authority and, for
+/// issuance, before the distributed admission quota.
 /// </summary>
 public sealed record GuestSessionEmptyBodyRequired();
 

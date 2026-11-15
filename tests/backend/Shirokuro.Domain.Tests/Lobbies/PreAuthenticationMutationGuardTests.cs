@@ -389,6 +389,107 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public void GuestLogoutHttp2BodyDetectionRejectsWithoutLengthHeaders()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "DELETE";
+        context.Request.Protocol = "HTTP/2";
+        context.Features.Set<IHttpRequestBodyDetectionFeature>(
+            new FakeBodyDetectionFeature(true));
+        Assert.Null(context.Request.ContentLength);
+        Assert.False(context.Request.Headers.ContainsKey("Transfer-Encoding"));
+        Assert.False(GuestSessionBodyGuard.Allows(context));
+        context.Features.Set<IHttpRequestBodyDetectionFeature>(
+            new FakeBodyDetectionFeature(false));
+        Assert.True(GuestSessionBodyGuard.Allows(context));
+    }
+
+    [Fact]
+    public async Task LogoutBodyIsRejectedBeforeGuestRedisAuthOrRevocation()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // The same signed guest cannot be verified during Redis outage.
+        // A malformed DELETE must still be rejected at ingress with 400
+        // before any Redis GET or irreversible lobby/session revocation.
+        cache.Unavailable = true;
+        using (var json = Mutation(HttpMethod.Delete,
+                   "/api/sessions/guest", "https://game.example"))
+        {
+            json.Content = new StringContent(
+                "{}", Encoding.UTF8, "application/json");
+            using var denied = await guest.SendAsync(json);
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+            Assert.False(denied.Headers.Contains("Retry-After"));
+        }
+
+        // HTTP/1.1 chunked framing is invalid even for a zero-byte payload.
+        using (var chunked = Mutation(HttpMethod.Delete,
+                   "/api/sessions/guest", "https://game.example"))
+        {
+            chunked.Headers.TransferEncodingChunked = true;
+            chunked.Content = new ByteArrayContent([]);
+            using var denied = await guest.SendAsync(chunked);
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+
+        // Origin policy remains first even when the body is malformed.
+        using (var hostile = Mutation(HttpMethod.Delete,
+                   "/api/sessions/guest", "https://evil.example"))
+        {
+            hostile.Content = new StringContent("{}", Encoding.UTF8,
+                "application/json");
+            using var forbidden = await guest.SendAsync(hostile);
+            Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
+            Assert.Equal("no-store", forbidden.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // The legitimate bodyless DELETE reaches real auth. During an
+        // outage it fails closed (503), not 400 or a pretend sign-out.
+        using (var valid = Mutation(HttpMethod.Delete,
+                   "/api/sessions/guest", "https://game.example"))
+        using (var unavailable = await guest.SendAsync(valid))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+            Assert.Equal("no-store", unavailable.Headers.CacheControl?.ToString());
+            Assert.False(unavailable.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // The malformed DELETE must not sign out the guest. Recovery of
+        // Redis authority should preserve the original identity/ticket.
+        cache.Unavailable = false;
+        using var recovered = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        using var identity = JsonDocument.Parse(
+            await recovered.Content.ReadAsStringAsync());
+        Assert.StartsWith("guest-",
+            identity.RootElement.GetProperty("playerId").GetString());
+        Assert.Equal("guest",
+            identity.RootElement.GetProperty("kind").GetString());
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
     public async Task GuestIssuanceBodyWithValidOriginRejectsBeforeGuestRedisOrQuota()
     {
         var cache = new CountingCache();

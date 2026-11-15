@@ -555,6 +555,12 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
         return Results.Forbid();
 
     context.Response.Headers.CacheControl = "no-store";
+    // Both guest issuance and logout take no request body. Retain this
+    // handler check as defense in depth after the pre-auth metadata fence:
+    // a malformed DELETE must not revoke any verified guest ticket.
+    if (!GuestSessionBodyGuard.Allows(context))
+        return Results.BadRequest(new { code = "session_request_must_be_empty" });
+
     // Revoke on the server BEFORE the cookie is cleared client-side.
     var registry = context.RequestServices.GetRequiredService<GuestSessionRegistry>();
     bool revoked;
@@ -645,7 +651,8 @@ app.MapDelete("/api/sessions/guest", async (HttpContext context, IHostEnvironmen
     }
 
     return Results.NoContent();
-}).RequireAuthorization().WithMetadata(new WebMutationGuardRequired());
+}).RequireAuthorization().WithMetadata(
+    new WebMutationGuardRequired(), new GuestSessionEmptyBodyRequired());
 
 
 // All pre-match rosters use identical cookie auth and error policy.

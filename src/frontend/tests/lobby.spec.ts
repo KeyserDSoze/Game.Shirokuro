@@ -40,6 +40,36 @@ test('two independent guest browsers create a room, join by invite and select he
     expect(bodylessGuard.replacedCookie).toBe(false)
     await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
 
+    // A malformed logout must not reach cookie/Redis validation or revoke
+    // this already signed-in guest. Confirm authority using a real GET.
+    const rejectedLogout = await first.evaluate(async () => {
+      const response = await fetch('/api/sessions/guest', {
+        method: 'DELETE',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', 'X-Shirokuro-Request': '1' },
+        body: '{}',
+      })
+      const identityReply = await fetch('/api/sessions/me', {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+      })
+      const identity = identityReply.ok
+        ? await identityReply.json() as { kind: string; playerId: string }
+        : null
+      return {
+        status: response.status,
+        cacheControl: response.headers.get('Cache-Control'),
+        identityStatus: identityReply.status,
+        identity,
+      }
+    })
+    expect(rejectedLogout.status).toBe(400)
+    expect(rejectedLogout.cacheControl).toContain('no-store')
+    expect(rejectedLogout.identityStatus).toBe(200)
+    expect(rejectedLogout.identity?.kind).toBe('guest')
+    expect(firstId).toContain(rejectedLogout.identity?.playerId)
+    await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
+
     // A real HTTP 413 must be returned before room creation. Reuse this
     // already signed-in guest instead of spending more shared guest quota.
     const rejectedBody = await first.evaluate(async () => {
