@@ -32,6 +32,31 @@ public static class GuestSessions
         ], CookieAuthenticationDefaults.AuthenticationScheme));
     }
 
+    /// <summary>
+    /// This application's only configured cookie scheme currently issues
+    /// server-generated guest sessions; there is NO verified account provider.
+    /// Reject legacy/non-guest principals instead of accidentally treating an
+    /// otherwise valid Data Protection ticket as an authenticated account.
+    /// A future account provider must use an explicit separate authentication
+    /// scheme and authorization policy, not this guest-cookie fallback.
+    /// </summary>
+    public static bool IsCanonicalGuest(ClaimsPrincipal? user)
+    {
+        if (!IsGuest(user))
+            return false;
+
+        var id = AuthenticatedPlayerIdentity.FromPrincipal(user);
+        if (id is not { Length: 38 } ||
+            !id.StartsWith("guest-", StringComparison.Ordinal))
+            return false;
+
+        foreach (var digit in id.AsSpan(6))
+            if (digit is not (>= '0' and <= '9' or >= 'a' and <= 'f'))
+                return false;
+
+        return true;
+    }
+
     public static bool IsGuest(ClaimsPrincipal? user)
     {
         if (AuthenticatedPlayerIdentity.FromPrincipal(user) is null)
