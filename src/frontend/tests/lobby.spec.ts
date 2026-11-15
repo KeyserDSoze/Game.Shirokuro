@@ -612,7 +612,9 @@ test('session hints are rate-limited after fast responses, but later 401 revokes
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible({ timeout: 6_000 })
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
-  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  // The signed-out view hides the entire authenticated invite form.
+  // An obsolete private invitation must not remain visible after 401.
+  await expect(page.getByTestId('lobby-invite-input')).toHaveCount(0)
   await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
   expect(checks).toBe(before + 4)
   expect(issuances).toBe(1)
