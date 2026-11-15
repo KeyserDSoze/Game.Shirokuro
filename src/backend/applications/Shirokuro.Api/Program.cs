@@ -49,6 +49,9 @@ builder.Services.AddHsts(options =>
     options.Preload = false;
 });
 builder.Services.AddSingleton(TimeProvider.System);
+// Host shutdown is an immediate, monotonic readiness fence in both modes.
+// It must not resolve Redis or use a client-controlled request flag.
+builder.Services.AddSingleton<IReadinessDrainSignal, HostLifetimeReadinessDrainSignal>();
 if (builder.Environment.IsDevelopment())
     builder.Services.AddHostedService<LobbyExpiryWorker>();
 builder.Services.AddSingleton<GuestSessionRegistry>();
@@ -564,10 +567,24 @@ app.MapGet("/api/health", (HttpContext context) =>
 // Liveness above is intentionally independent of Redis; the readiness route
 // is for load balancers and checks BOTH Redis connections plus Data Protection.
 // It returns a minimal, uncached response without exposing failed dependencies.
-app.MapGet("/api/ready", async (HttpContext context, IDeploymentReadiness readiness) =>
+app.MapGet("/api/ready", async (HttpContext context, IReadinessDrainSignal drain) =>
 {
     context.Response.Headers.CacheControl = "no-store";
-    var ready = await readiness.IsReadyAsync(context.RequestAborted);
+
+    // ApplicationStopping must override even a previously cached 200.
+    // Do not resolve the readiness service (and potentially its Redis
+    // connectors) at all when this node is already shutting down.
+    var ready = false;
+    if (!drain.IsDraining)
+    {
+        var readiness = context.RequestServices
+            .GetRequiredService<IDeploymentReadiness>();
+        ready = await readiness.IsReadyAsync(context.RequestAborted);
+    }
+
+    // A shared probe may finish successfully after shutdown began. Checking
+    // again closes that in-flight race without cancelling another waiter.
+    ready = ready && !drain.IsDraining;
     return Results.Json(new { status = ready ? "ready" : "unavailable" },
         statusCode: ready
             ? StatusCodes.Status200OK
