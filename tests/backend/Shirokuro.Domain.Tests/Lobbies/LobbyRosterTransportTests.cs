@@ -396,7 +396,7 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(new[] { "GetRoster", "OnConnectedAsync", "OnDisconnectedAsync" },
             methods.Select(method => method.Name).OrderBy(name => name,
                 StringComparer.Ordinal));
-        var method = Assert.Single(methods.Where(m => m.Name == "GetRoster"));
+        var method = Assert.Single(methods, m => m.Name == "GetRoster");
         var parameter = Assert.Single(method.GetParameters());
         Assert.Equal("lobbyId", parameter.Name);
         Assert.Equal(typeof(string), parameter.ParameterType);
