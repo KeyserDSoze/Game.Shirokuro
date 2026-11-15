@@ -3,6 +3,13 @@ import { expect, test } from '@playwright/test'
 test('preview terrain history shortcuts work without capturing JSON editor undo or writing to API', async ({ page }) => {
   await page.goto('/')
 
+  const hint = page.getByTestId('terrain-shortcut-hint')
+  await expect(hint).toContainText('Ctrl/Cmd+Maiusc+Z')
+  await page.getByTestId('language-toggle').click()
+  await expect(hint).toContainText('Ctrl/Cmd+Shift+Z')
+  await page.getByTestId('language-toggle').click()
+  await expect(hint).toContainText('Ctrl/Cmd+Maiusc+Z')
+
   const mutations: string[] = []
   page.on('request', request => {
     if (['POST', 'PATCH', 'DELETE'].includes(request.method()) &&
