@@ -619,6 +619,10 @@ test('guest session revoked in another tab clears private roster on focus withou
 })
 
 test('401 revokes lobby state, while 400/403/429 and transient HTTP/network errors preserve a valid guest', async ({ page }) => {
+  // This single live-API scenario exercises many sequential HTTP failures,
+  // malformed 200 replies and a confirmed 401. Give its expanded negative
+  // coverage a dedicated wall-clock budget under slower CI browser runners.
+  test.setTimeout(90_000)
   await page.goto('/')
   await page.getByTestId('lobby-sign-in').click()
   await expect(page.getByTestId('lobby-player')).toContainText('guest-')
