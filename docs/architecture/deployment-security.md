@@ -2307,3 +2307,32 @@ Il drain orchestrato (ready=503, stop nuove connessioni lato
 bilanciatore, preStop, grace period), l'osservazione delle risposte
 incerte e l'HA rimangono responsabilità aperte in #21. Nessun
 comando Lua/CAS di lobby già consegnato al Redis è annullato.
+
+## Richieste create/join col JSON body lento durante shutdown (#150)
+
+Le barriere pre/post-auth di #146/#148 sono middleware e terminano
+**prima** che gli endpoint Minimal API deserializzino i DTO JSON. Un
+browser con cookie già verificato e quota room-creation assegnata può
+mantenere la request sospesa durante il binding del body. Se
+`ApplicationStopping` parte mentre manca ancora l'ultimo byte, il
+callback non deve iniziare una nuova mutazione dopo il drain.
+
+I callback di POST `/api/lobbies` e POST
+`/api/lobbies/{roomId}/join` ricontrollano ora il segnale monotono
+server-owned `IReadinessDrainSignal` **dopo** il model binding e
+`TryGuest`, immediatamente **prima** di `IAsyncGuestLobby.CreateAsync`
+o `JoinAsync`. Nel caso draining: 503/`Cache-Control: no-store`,
+nessuna Location, nuova stanza o roster privato, nessuna membership
+aggiunta da un comando che non è mai partito.
+
+Non cambia la precedenza dei guard Origin/intent, dimensione/Content-Type,
+canonical room ID, auth Redis e quota (che può già essere stata spesa
+prima di leggere il JSON). Non blocca hero/team/leave/logout e non
+restituisce un finto 503 per un CAS Redis già committato. Come per #149,
+il controllo non è atomico con `ApplicationStopping`: una chiamata
+`CreateAsync/JoinAsync` già entrata nel Redis CAS può completare, e
+la risposta deve riflettere il risultato certo invece di invitare un
+retry incerto. Il coordinamento del drain con bilanciatore, preStop,
+grace period, in-flight connections e HA resta in #21. Test xUnit
+Production TestServer con stream JSON partizionato provano questa race
+senza usare `Task.Delay`.
