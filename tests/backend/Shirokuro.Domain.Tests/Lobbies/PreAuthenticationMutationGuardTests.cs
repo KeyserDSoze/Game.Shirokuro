@@ -289,9 +289,9 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Theory]
-    [InlineData(null, 4096)]
-    [InlineData(30_000, 4096)]
-    [InlineData(2048, 2048)]
+    [InlineData(null, 4096L)]
+    [InlineData(30_000L, 4096L)]
+    [InlineData(2048L, 2048L)]
     public void LobbyBodyLimitCapsStreamingRequestsWithoutRelaxingHostLimit(
         long? configured, long expected)
     {
