@@ -807,6 +807,46 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task NonJsonContentTypeOnReadEndpointsDoesNotTriggerLobbyFallback()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // A JSON media-type rejection must never mask the Redis authority
+        // failure on read-only endpoints protected by the signed guest cookie.
+        cache.Unavailable = true;
+        foreach (var path in new[]
+                 {
+                     "/api/sessions/me",
+                     "/api/lobbies/room-00000000000000000000000000000000/roster"
+                 })
+        {
+            using var read = new HttpRequestMessage(HttpMethod.Get, path);
+            read.Content = new StringContent("{}", Encoding.UTF8, "text/plain");
+            using var denied = await guest.SendAsync(read);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // Public liveness remains independent of both cookie authority and
+        // the JSON mutation guard, even with a non-JSON content-type header.
+        using var health = new HttpRequestMessage(HttpMethod.Get, "/api/health");
+        health.Content = new StringContent("{}", Encoding.UTF8, "text/plain");
+        using var healthy = await anonymous.SendAsync(health);
+        Assert.Equal(HttpStatusCode.OK, healthy.StatusCode);
+        Assert.Equal(2, cache.Reads);
+    }
+
+    [Fact]
     public async Task NonJsonLobbyMutationsRejectBeforeGuestRedisAndRoomQuota()
     {
         var cache = new CountingCache();
