@@ -2117,3 +2117,37 @@ not a claim that browser SignalR reconnection or multi-node routing is
 implemented. Deployments still need a load-balancer grace period,
 cross-node Redis authority and an explicitly tested reconnect policy
 under #21.
+
+## Stato di freschezza del roster lato browser (#144)
+
+La lobby pre-partita espone una **vista dell'ultimo roster autenticato**.
+Quando il polling `GET /api/lobbies/{room}/roster/peek` fallisce per
+`503`, indisponibilità di rete, un DTO 200 malformato oppure una revisione
+inferiore a quella già verificata, il client **mantiene** lo snapshot
+precedente ma visualizza un avviso IT/EN con `role=status`,
+`aria-live=polite`: non può confermare che le informazioni siano ancora
+attuali. L'avviso non mostra ID, inviti, dettagli Redis, IP, orari arbitrari
+o dati di gioco nascosti. Un evento browser `offline` può solo marcare
+la vista come potenzialmente non aggiornata: non revoca alcun guest.
+
+La freschezza torna `current` **soltanto** dopo un `304` autorizzato
+oppure un `200` completo e verificato per stanza, partecipazione e
+revisione uguale/successiva; una mutazione o lettura esplicita con
+risultato autenticato adottato tramite `showRoom` conferma la stanza.
+Il semplice ritorno online/focus/visibilità, o una risposta `200`
+ben formata ma più vecchia della revisione già vista, **non** bastano.
+Una richiesta sospesa/cancellata non inventa una perdita di membership
+né una prova di recupero. Su `401` o `404` confermati continuano le
+normali revoche di sessione/stanza e l'avviso viene rimosso insieme
+alla vecchia vista; risposte appartenenti a operazioni/identità obsolete
+non possono cambiare lo stato di un'altra room.
+
+Questa indicazione riguarda la sincronizzazione del **roster pre-match
+già autorizzato**, non fornisce osservazioni di match, metodi di
+movimento, reconnect SignalR/WebSocket o una garanzia che il browser
+sappia se Redis sia guasto. I test Vitest coprono le transizioni pure
+fra last-verified/stale; Playwright verifica 503 -> avviso -> nuovo 200
+verificato -> avviso rimosso, stato offline, 200 malformato e rimozione
+della vista con 401/404 senza inviare mutazioni durante il recupero.
+Il deploy multi-nodo, l'orchestrazione e il traffico realtime restano
+in #21.
