@@ -14,6 +14,7 @@ test('returning online after an outage advances only one verified roster read wi
   let responseStatus = 503
   let reads = 0
   const times: number[] = []
+  const validators: (string | undefined)[] = []
   const writes: string[] = []
 
   // Transport-only guest fixture; the separate real-browser scenario covers
@@ -35,9 +36,7 @@ test('returning online after an outage advances only one verified roster read wi
     if (route.request().method() !== 'GET') return route.continue()
     reads++
     times.push(Date.now())
-    expect(route.request().headers()['if-none-match']).toBe(
-      reads === 1 ? '"rev-1"' : '"rev-1"',
-    )
+    validators.push(route.request().headers()['if-none-match'])
     await route.fulfill(responseStatus === 503
       ? { status: 503, headers: { 'Cache-Control': 'no-store' }, body: '{}' }
       : { status: 200, headers: { 'Cache-Control': 'no-store' }, json: newer })
@@ -76,6 +75,7 @@ test('returning online after an outage advances only one verified roster read wi
   await expect.poll(() => reads, { timeout: 24_000 }).toBe(2)
   expect(times[1] - times[0]).toBeGreaterThanOrEqual(14_500)
   expect(times[1] - times[0]).toBeLessThan(27_000)
+  expect(validators).toEqual(['"rev-1"', '"rev-1"'])
   await expect(page.getByTestId('lobby-revision')).toContainText('2')
   await expect(page.getByTestId('lobby-roster')).toContainText('black')
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
