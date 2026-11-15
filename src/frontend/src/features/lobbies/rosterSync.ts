@@ -49,6 +49,34 @@ export function rosterPollDelayMs(
 }
 
 export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing' | 'invalid'
+
+/**
+ * The last member-authorized room snapshot can remain visible through
+ * network/Redis outages. Freshness is a claim about the *last verification*,
+ * not a grant of membership or permission to mutate the room.
+ */
+export type RosterSyncStatus = 'current' | 'stale'
+export type RosterSyncEvidence =
+  | 'verified' | 'outage' | 'invalid' | 'older' | 'paused'
+
+export function nextRosterSyncStatus(
+  current: RosterSyncStatus, evidence: RosterSyncEvidence,
+): RosterSyncStatus {
+  switch (evidence) {
+    case 'verified':
+      // A member-authorized 304 or fully validated same/newer 200 is
+      // sufficient; a stale 200 from a lagging replica is NOT.
+      return 'current'
+    case 'outage':
+    case 'invalid':
+    case 'older':
+      return 'stale'
+    case 'paused':
+      // Hidden tabs, aborted polls and pending user actions are not
+      // server responses and cannot prove either loss or recovery.
+      return current
+  }
+}
 export type PollFailureDecision = 'expired' | 'missing' | 'retain'
 export type ConflictRosterRefreshDecision = 'verified' | 'missing' | 'invalid'
 
