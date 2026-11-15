@@ -2151,3 +2151,46 @@ verificato -> avviso rimosso, stato offline, 200 malformato e rimozione
 della vista con 401/404 senza inviare mutazioni durante il recupero.
 Il deploy multi-nodo, l'orchestrazione e il traffico realtime restano
 in #21.
+
+## Drain delle letture HTTP roster su ApplicationStopping (#145)
+
+Dopo readiness fail-closed (#141) e la chiusura dei socket SignalR
+(#142), anche le **due letture HTTP membro-autorizzate** del roster
+pre-partita rispettano `ApplicationStopping`:
+
+- Solo `GET /api/lobbies/{lobbyId}/roster` (heartbeat esplicito) e
+  `GET /api/lobbies/{lobbyId}/roster/peek` (poll non rinnovante)
+  possiedono il marker **server-owned** `LobbyRosterReadDrainRequired`.
+  Il middleware pre-auth verifica quel marker e il segnale
+  `IReadinessDrainSignal` **prima dell'autenticazione cookie Redis**:
+  quando il nodo sta fermandosi risponde `503/no-store` senza roster,
+  `ETag`, `Retry-After` o un nuovo cookie. I comandi di lobby,
+  `DELETE /api/sessions/guest` e le altre API continuano a seguire
+  la loro normale policy; non è un bypass generale dell'autenticazione.
+- I controlli di routing rimangono prima del drain: una route inesistente
+  o un ID stanza tecnicamente impossibile restituisce ancora `404`,
+  e un metodo non consentito il **405 sintetico** del framework.
+  Il client non può creare marker con header, query, path parziale o
+  falsi cookie.
+- Per richieste iniziate *prima* dello stop, il responder
+  `ServeGuestRosterAsync` ricontrolla il segnale **prima** della lettura
+  member-only e subito **dopo** `await ForMemberAsync/PeekForMemberAsync`.
+  Un roster validato/ETag/304 che completa durante il drain viene
+  convertito in `503/no-store` **senza consegnare i byte del roster**.
+  Questo controllo non annulla né disfa una lettura già effettuata,
+  non revoca sessioni e non cambia TTL/revisioni.
+- Quando il processo è disponibile, entrambe le GET conservano i
+  normali controlli di sessione e membership, l'heartbeat solo per
+  `/roster` e l'ottimizzazione 304 autorizzata solo su `/roster/peek`.
+  Un browser che riceve 503 mantiene il proprio ultimo snapshot come
+  *potenzialmente obsoleto*, grazie alle garanzie #143/#144.
+
+Regressioni xUnit verificano in **Production TestServer** un cookie
+guest firmato con fake Redis indisponibile e conteggi delle letture
+conservati: 503 anticipato sulle due route, 404/405 indipendenti,
+liveness/readiness invariati, 503 normale delle altre API protette.
+Test separati con un provider lobby sospeso coprono anche il
+risultato member-only in-flight e un ETag che altrimenti avrebbe dato
+304. Nessuna di queste protezioni sostituisce il preStop del
+load balancer, un grace period misurato o il traffico multi-nodo reale,
+ancora aperti in #21.
