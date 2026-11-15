@@ -243,13 +243,18 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(1, limiter.Calls);
 
         var outcomes = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
-        Assert.Equal(3, outcomes.Length);
+        // MeterListener is process-wide: other concurrently running xUnit
+        // tests may legitimately emit the same instrument. Assert the
+        // three real statuses, not a global count across test classes;
+        // cache.Reads above proves exactly three actual lookups here.
         foreach (var state in new[] { "active", "unavailable", "inactive" })
-            Assert.Single(outcomes, item => item.Value == 1 &&
+            Assert.Contains(outcomes, item => item.Value == 1 &&
                 item.Tags.Count == 1 && item.Tags["outcome"] == state);
         Assert.All(outcomes, item =>
         {
             Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
+            Assert.Contains(item.Tags["outcome"],
+                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
             Assert.DoesNotContain("guest-", item.Tags["outcome"], StringComparison.Ordinal);
         });
     }
@@ -283,10 +288,17 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(1, limiter.Calls);
 
         var events = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
-        Assert.Single(events);
-        Assert.Equal(1, events[0].Value);
-        Assert.Equal(new[] { "outcome" }, events[0].Tags.Keys);
-        Assert.Equal("recovery-cutoff", events[0].Tags["outcome"]);
+        // The MeterListener is shared across concurrent xUnit test cases.
+        // One matching event plus zero cache GETs proves this node took
+        // the cutoff path; unrelated tests may emit other outcomes.
+        Assert.Contains(events, item => item.Value == 1 &&
+            item.Tags.Count == 1 && item.Tags["outcome"] == "recovery-cutoff");
+        Assert.All(events, item =>
+        {
+            Assert.Equal(new[] { "outcome" }, item.Tags.Keys);
+            Assert.Contains(item.Tags["outcome"],
+                new[] { "active", "inactive", "unavailable", "recovery-cutoff" });
+        });
 
         // The old node can still independently validate the same cookie;
         // the cutoff is a deployment-wide operator setting, not a Redis
@@ -295,7 +307,8 @@ public sealed class PreAuthenticationMutationGuardTests
         using (var active = await original.GetAsync("/api/sessions/me"))
             Assert.Equal(HttpStatusCode.OK, active.StatusCode);
         Assert.Equal(1, cache.Reads);
-        Assert.Equal(2, capture.For(MultiplayerMetrics.GuestCookieAuthorityName).Length);
+        Assert.Contains(capture.For(MultiplayerMetrics.GuestCookieAuthorityName),
+            item => item.Value == 1 && item.Tags["outcome"] == "active");
     }
 
     [Fact]
