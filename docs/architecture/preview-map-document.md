@@ -64,3 +64,23 @@ in localStorage as part of this feature. Undo/redo is preview-only and
 does not authorize game movement, reveal private information, or affect
 the pre-match guest lobby. The rules, map ownership and match replay
 remain dependencies of the approved game design (#3/#5/#9).
+
+## Keyboard shortcuts for local history (#137)
+
+The visual-only editor additionally supports **Ctrl/Cmd+Z** to undo,
+**Ctrl/Cmd+Shift+Z** and **Ctrl/Cmd+Y** to redo. These operate on the same
+bounded 32-step immutable local history as the visible buttons; the shortcut
+handler does not create a second history or send a mutation to the API.
+Italian and English help text sits below the controls. Keyboard events are
+ignored when their target is inside an input, textarea, select, contenteditable
+region or an ARIA textbox/searchbox, including nested elements, so the browser's
+native text Undo/Redo remains available in the map JSON textarea.
+
+A shortcut is also ignored when already handled by another listener, in an
+IME composition, repeated by holding the key, combined with Alt or with both
+Ctrl and Meta, or when its requested history direction is empty. Only a
+recognized, available editor action prevents browser default behavior. The
+`terrainHistoryShortcuts.ts` pure classifier has table-driven Vitest coverage;
+real Playwright presses shortcuts against the terrain editor and verifies that
+a focused JSON textarea and a nested contenteditable do not alter the map.
+No guest/session/roster data is involved and no state leaves the browser.
