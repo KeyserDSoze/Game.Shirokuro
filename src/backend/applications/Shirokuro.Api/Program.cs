@@ -490,6 +490,22 @@ app.Use(async (context, next) =>
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.GuestBody);
         return;
     }
+    // Reject NEW pre-match admissions once ApplicationStopping begins.
+    // The two server-owned quota markers identify only guest issuance and
+    // room creation. Run after Origin/body checks but BEFORE cookie auth,
+    // local/Redis rate limits and any registry/lobby write; a draining node
+    // must not mint a cookie or accept a room it may immediately abandon.
+    // Logout, existing-room mutations and background cleanup still use their
+    // existing authorization/revocation semantics during shutdown.
+    if (metadata?.GetMetadata<GuestMutationRateLimit>() is
+            { Kind: GuestMutationKind.SessionIssuance or GuestMutationKind.RoomCreation } &&
+        context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
+            .IsDraining)
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        return;
+    }
     await next(context);
 });
 
