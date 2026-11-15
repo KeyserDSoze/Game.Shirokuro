@@ -491,14 +491,16 @@ app.Use(async (context, next) =>
         return;
     }
     // Reject NEW pre-match admissions once ApplicationStopping begins.
-    // The two server-owned quota markers identify only guest issuance and
-    // room creation. Run after Origin/body checks but BEFORE cookie auth,
-    // local/Redis rate limits and any registry/lobby write; a draining node
-    // must not mint a cookie or accept a room it may immediately abandon.
-    // Logout, existing-room mutations and background cleanup still use their
-    // existing authorization/revocation semantics during shutdown.
-    if (metadata?.GetMetadata<GuestMutationRateLimit>() is
-            { Kind: GuestMutationKind.SessionIssuance or GuestMutationKind.RoomCreation } &&
+    // Session issuance and room creation carry the existing trusted quota
+    // markers; only the join endpoint carries LobbyJoinDrainRequired.
+    // Run after routing, Origin and body checks but BEFORE cookie auth,
+    // local/Redis limits or any lobby lookup/mutation. In particular a
+    // draining node must not accept a new participant for a room it may
+    // immediately abandon. Leave, hero/team changes, logout and cleanup
+    // preserve their original authorization and revocation semantics.
+    if ((metadata?.GetMetadata<GuestMutationRateLimit>() is
+             { Kind: GuestMutationKind.SessionIssuance or GuestMutationKind.RoomCreation } ||
+         metadata?.GetMetadata<LobbyJoinDrainRequired>() is not null) &&
         context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
             .IsDraining)
     {
