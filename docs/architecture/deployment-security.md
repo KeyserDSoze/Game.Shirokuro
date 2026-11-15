@@ -1886,3 +1886,16 @@ La rimozione amministrativa di un guest revocato/scaduto enumera fino a **256** 
 ## Timestamp di attività Redis corrotti (#107)
 
 Oltre alla forma JSON e al limite di 32768 byte, l'API verifica che un record lobby ripristinato da Redis abbia `LastActivityUtc` **non nel futuro** rispetto all'orologio del nodo che lo legge. Date future (incluso l'estremo `DateTimeOffset.MaxValue`) non rendono valida una stanza e non possono provocare overflow nel calcolo della scadenza: le letture dirette, passive con fence e amministrative rispondono con indisponibilità opaca, senza avviare cleanup, refresh TTL o modifiche agli indici. Un record veramente scaduto continua a risultare assente. Ripristinare solo tramite procedura operativa autorizzata e controllare la sincronizzazione UTC/NTP fra i nodi: uno skew positivo dei clock può causare indisponibilità fail-closed e non è un motivo per aggirare questa barriera.
+
+## Quota delle sessioni guest e verifica del cookie (#127, #128)
+
+Ordine delle operazioni in **Production/Staging** per la sola `POST /api/sessions/guest`:
+
+1. Validazione Host/HTTPS, Origin/intento CSRF e richiesta **senza body**: rifiutare prima di interrogare Redis
+2. Quota condivisa `GuestMutationKind.SessionIssuance` (12/min per IP trusted / prefisso IPv6): 429 con Retry-After, oppure 503 se la quota Redis è indisponibile, **prima** di verificare qualunque ticket guest firmato allegato
+3. Cookie authentication: il server convalida l'identità firmata usando l'autorità Redis senza cache positiva locale; i limiti quota non concedono mai l'accesso
+4. Handler guest: il cookie guest valido risponde con la **stessa** identità e non viene rinnovato. Quando `OnValidatePrincipal` segnala `GuestSessionAuthorityStatus.Unavailable` e rifiuta il principal, l'handler **deve controllare** `GuestSessionRegistry.UnavailableRequestMarker` (solo server-side, `HttpContext.Items`) e dare **503/no-store senza Set-Cookie**. Non trasformare un'autenticazione non verificabile in un browser anonimo che ottiene un nuovo ticket. Un ticket **certamente Inactive**, invece, può permettere una nuova emissione esplicita se la quota e le scritture Redis sono disponibili
+
+Per la distinta `POST /api/lobbies` resta valido l'ordine **autenticazione/autorizzazione guest prima della quota room-creation** (8/min): un client non autorizzato non deve consumare budget di creazione stanza. La funzione di ammissione condivisa usa soltanto metadata degli endpoint assegnati dal server per conservare 429/503 sanificati, Retry-After corretto e metriche una sola volta. In Development la quota locale conserva il suo ordine. Le route GET, SignalR e logout non usano questa quota di ammissione.
+
+I test Production di #127/#128 simulano separatamente redis quota deny/outage, cookie registry GET outage **con SET ancora disponibile**, conferma di sessione Inactive e successivo ripristino; verificano che un guasto di lettura non registri né restituisca un nuovo guest. Questi controlli non certificano protezione Sybil/multi-IP, TLS/HA edge, account permanenti né i failure domain reali richiesti dalla parent #21.
