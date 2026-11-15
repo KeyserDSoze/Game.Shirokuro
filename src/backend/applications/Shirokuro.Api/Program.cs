@@ -126,6 +126,11 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             // Genuine canonical guests still require fresh Redis authority.
             if (!GuestSessions.IsCanonicalGuest(principal))
             {
+                // A signed legacy or unsupported account-looking ticket is
+                // denied without asking Redis. Observability uses a fixed
+                // outcome, never a claim, token, IP or requested path.
+                MultiplayerMetrics.RecordGuestCookieAuthority(
+                    GuestCookieValidationOutcome.UnsupportedTicket);
                 context.HttpContext.Items[
                     GuestSessions.UnsupportedTicketRequestMarker] = true;
                 context.RejectPrincipal();
@@ -326,7 +331,13 @@ app.Use(async (context, next) =>
     // cookie validation skips ONLY this verified fallback, so Redis guest
     // authority is not queried for a method mismatch.
     if (ApiMethodMismatchGuard.IsFrameworkMethodNotAllowed(context))
+    {
         context.Response.Headers.CacheControl = "no-store";
+        // A real ASP.NET Core synthetic 405 has no game handler. Count it
+        // exactly once here, not via auth or the endpoint itself.
+        MultiplayerMetrics.RecordIngressRejection(
+            IngressRejectionReason.MethodNotAllowed);
+    }
 
     // No API or Hub route matched. An unknown address has no authenticated
     // resource to authorize: return the ordinary 404 BEFORE cookie validation
@@ -342,6 +353,8 @@ app.Use(async (context, next) =>
     {
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status404NotFound;
+        MultiplayerMetrics.RecordIngressRejection(
+            IngressRejectionReason.UnknownApiRoute);
         return;
     }
 
