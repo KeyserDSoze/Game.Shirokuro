@@ -300,6 +300,7 @@ app.Use(async (context, next) =>
         // looking up a roster or acquiring a mutation quota.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status404NotFound;
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.RoomId);
         return;
     }
     if ((metadata?.GetMetadata<WebMutationGuardRequired>() is not null &&
@@ -314,6 +315,10 @@ app.Use(async (context, next) =>
         // mutation endpoints still require both Origin and intent header.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        MultiplayerMetrics.RecordIngressRejection(
+            metadata?.GetMetadata<WebMutationGuardRequired>() is not null
+                ? IngressRejectionReason.MutationOrigin
+                : IngressRejectionReason.HubOrigin);
         return;
     }
     if (metadata?.GetMetadata<GuestLobbyMutationBodyLimitRequired>() is not null &&
@@ -324,6 +329,7 @@ app.Use(async (context, next) =>
         // The Kestrel request body feature also bounds chunked input.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.LobbyBodySize);
         return;
     }
     if (metadata?.GetMetadata<GuestSessionEmptyBodyRequired>() is not null &&
@@ -334,6 +340,7 @@ app.Use(async (context, next) =>
         // HTTP/2 DATA is detected even without a Content-Length header.
         context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.GuestBody);
         return;
     }
     await next(context);

@@ -184,6 +184,8 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordMutation(GuestMutationKind.SessionIssuance, MutationOutcome.Allowed);
         MultiplayerMetrics.RecordMutation(GuestMutationKind.SessionIssuance, MutationOutcome.Limited);
         MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, MutationOutcome.Unavailable);
+        foreach (var reason in Enum.GetValues<IngressRejectionReason>())
+            MultiplayerMetrics.RecordIngressRejection(reason);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
         MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
@@ -218,6 +220,8 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.RecordMutation((GuestMutationKind)999, MutationOutcome.Allowed));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordMutation(GuestMutationKind.RoomCreation, (MutationOutcome)999));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordIngressRejection((IngressRejectionReason)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordExpirySweep(false, true, -1));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
@@ -286,6 +290,20 @@ public sealed class MultiplayerMetricsTests
             }
         });
 
+        var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
+        foreach (var reason in new[]
+                 { "room-id", "mutation-origin", "hub-origin",
+                   "lobby-body-size", "guest-body" })
+            Assert.Contains(ingress, m => m.Tags["reason"] == reason && m.Value == 1);
+        Assert.All(ingress, measurement =>
+        {
+            Assert.Single(measurement.Tags);
+            Assert.Equal(new[] { "reason" }, measurement.Tags.Keys);
+            Assert.Contains(measurement.Tags["reason"],
+                new[] { "room-id", "mutation-origin", "hub-origin",
+                         "lobby-body-size", "guest-body" });
+        });
+
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
             m => m.Tags["policy"] == "session" && m.Tags["outcome"] == "limited");
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
@@ -306,6 +324,7 @@ public sealed class MultiplayerMetricsTests
         foreach (var metric in new[]
         {
             MultiplayerMetrics.MutationDecisionsName,
+            MultiplayerMetrics.IngressRejectionsName,
             MultiplayerMetrics.ReadinessProbesName,
             MultiplayerMetrics.RedisConnectionEventsName,
             MultiplayerMetrics.ExpirySweepsName,
@@ -318,6 +337,7 @@ public sealed class MultiplayerMetricsTests
             var expectedKeys = metric switch
             {
                 MultiplayerMetrics.MutationDecisionsName => new[] { "outcome", "policy" },
+                MultiplayerMetrics.IngressRejectionsName => new[] { "reason" },
                 MultiplayerMetrics.ReadinessProbesName => new[] { "outcome" },
                 MultiplayerMetrics.RedisConnectionEventsName => new[] { "client", "event" },
                 MultiplayerMetrics.ExpirySweepsName => new[] { "mode", "outcome" },
@@ -334,6 +354,8 @@ public sealed class MultiplayerMetricsTests
                     "outcome" => value is "allowed" or "limited" or
                         "unavailable" or "ready" or "success" or "failure",
                     "mode" => value is "local" or "redis",
+                    "reason" => value is "room-id" or "mutation-origin" or
+                        "hub-origin" or "lobby-body-size" or "guest-body",
                     "client" => value is "lobby" or "session",
                     "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
@@ -344,6 +366,75 @@ public sealed class MultiplayerMetricsTests
                 Assert.DoesNotContain("password", value, StringComparison.OrdinalIgnoreCase);
             }
         }
+    }
+
+    [Fact]
+    public async Task ProductionIngressGuardsReportFiniteReasonsWithoutRedisAdmission()
+    {
+        var limiter = new Limiter { Outcome = MutationOutcome.Unavailable };
+        using var server = Production(limiter);
+        using var client = Client(server, production: true);
+        using var capture = new MultiplayerMetricCapture();
+
+        // Impossible room IDs are rejected before cookie auth and Redis.
+        using (var invalidRoom = await client.GetAsync(
+                   "/api/lobbies/not-a-room/roster"))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, invalidRoom.StatusCode);
+            Assert.Equal("no-store", invalidRoom.Headers.CacheControl?.ToString());
+        }
+
+        // Browser mutation Origin/intent must be rejected before even the
+        // deliberately unavailable distributed issuance quota.
+        using (var hostile = Post("/api/sessions/guest", production: true))
+        {
+            hostile.Headers.Remove("Origin");
+            hostile.Headers.Add("Origin", "https://evil.example");
+            using var denied = await client.SendAsync(hostile);
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+        }
+
+        // SignalR's browser-only Origin fence also runs before auth.
+        using (var negotiate = new HttpRequestMessage(HttpMethod.Post,
+                   "/hubs/lobbies/negotiate?negotiateVersion=1"))
+        {
+            negotiate.Headers.Add("Origin", "https://evil.example");
+            using var denied = await client.SendAsync(negotiate);
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+        }
+
+        // 4097 bytes are invalid for any pre-match lobby JSON mutation.
+        using (var oversize = Post("/api/lobbies", production: true))
+        {
+            oversize.Content = new StringContent(new string('x', 4097),
+                System.Text.Encoding.UTF8, "application/json");
+            using var denied = await client.SendAsync(oversize);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, denied.StatusCode);
+        }
+
+        // Body-bearing guest issuance is rejected before the unavailable
+        // limiter, never converted into a 503 or new guest cookie.
+        using (var unexpectedBody = Post("/api/sessions/guest", production: true))
+        {
+            unexpectedBody.Content = JsonContent.Create(new { untrusted = true });
+            using var denied = await client.SendAsync(unexpectedBody);
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+
+        var readings = capture.For(MultiplayerMetrics.IngressRejectionsName);
+        foreach (var reason in new[]
+                 { "room-id", "mutation-origin", "hub-origin",
+                   "lobby-body-size", "guest-body" })
+            Assert.Contains(readings, o => o.Value == 1 &&
+                o.Tags.Count == 1 && o.Tags["reason"] == reason);
+
+        // A legitimate read is not an ingress rejection and cannot obtain
+        // an unexpected Redis quota permit via this measurement.
+        using var liveness = await client.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
+        Assert.All(readings, o => Assert.DoesNotContain("guest-",
+            string.Join(",", o.Tags.Values), StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

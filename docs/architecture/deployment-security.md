@@ -1903,3 +1903,15 @@ I test Production di #127/#128 simulano separatamente redis quota deny/outage, c
 ## Guest logout senza body (#129)
 
 `DELETE /api/sessions/guest` non ha un DTO né bisogno di contenuti in ingresso. Come `POST /api/sessions/guest`, ora porta metadata server-owned `GuestSessionEmptyBodyRequired`: dopo il filtro Host/HTTPS e Origin/intento ma **prima** della cookie authentication, qualsiasi body dichiarato (Content-Length positivo o Transfer-Encoding) o segnalato da `IHttpRequestBodyDetectionFeature.CanHaveBody` (HTTP/2/3, anche senza Content-Length) restituisce 400 e Cache-Control no-store, senza lettura Redis o revoca della sessione, senza consumare quote né leggere il corpo. L'handler mantiene lo stesso controllo come difesa in profondità prima di `RevokeAsync`. Un DELETE legittimo senza body continua a verificare autorità Redis e a revocare, installare fence e ripulire membership con le garanzie fail-closed già definite; la protezione non prova che i non-browser siano affidabili e non sostituisce le difese anti-bot/edge della parent #21.
+
+## Contatori di rifiuto all'ingress prima di Redis (#130)
+
+Il meter `Shirokuro.Api.Multiplayer` (esportato via OTLP HTTPS **solo** con opt-in operatore) ora include il counter aggregato `shirokuro.ingress.rejections`. Questo strumento registra solo rifiuti effettivi dei guard precoci, **prima dell'autenticazione cookie Redis e delle quote**: una sola osservazione per risposta. L'unica label `reason` è una stringa fissa scelta dal server da un enum chiuso:
+
+- `room-id`: 404 per codice lobby impossibile sul guard canonico
+- `mutation-origin`: 403 per Origin o intento di mutazione cookie-backed non valido
+- `hub-origin`: 403 per Origin browser ostile sul trasporto SignalR
+- `lobby-body-size`: 413 per lunghezza dichiarata oltre 4096 byte in una mutazione pre-match
+- `guest-body`: 400 per body non previsto su POST/DELETE della sessione guest
+
+Non esportare mai come label IP/X-Forwarded-For, cookie, ID guest, room ID/invito, URL/path raw, header Origin, JSON o exception details. Non ci sono bucket per attore e questi contatori non sostituiscono una protezione edge/WAF. La metrica è distinta da `shirokuro.guest_mutation.decisions`, che misura le decisioni del **rate limiter** già raggiunto. Non interpreta un HTTP 401/429/503 come un rifiuto ingress e non tenta di attribuire l'origine ai singoli giocatori. L'assenza di un collector OTLP in produzione significa che questi dati non vengono trasmessi: gli allarmi esterni, le soglie, la retention e la verifica dell'edge restano responsabilità operative nella #21.

@@ -14,6 +14,7 @@ public static class MultiplayerMetrics
     public const string MeterName = "Shirokuro.Api.Multiplayer";
     public const string MeterVersion = "0.0.1";
     public const string MutationDecisionsName = "shirokuro.guest_mutation.decisions";
+    public const string IngressRejectionsName = "shirokuro.ingress.rejections";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
@@ -31,6 +32,9 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> MutationDecisions = Meter.CreateCounter<long>(
         MutationDecisionsName, unit: "{decision}",
         description: "Server-side guest session and lobby creation limit decisions.");
+    private static readonly Counter<long> IngressRejections = Meter.CreateCounter<long>(
+        IngressRejectionsName, unit: "{rejection}",
+        description: "Early server-side ingress guard rejections before guest Redis validation and quota.");
     private static readonly Counter<long> ReadinessProbes = Meter.CreateCounter<long>(
         ReadinessProbesName, unit: "{probe}",
         description: "Executed node-readiness probes, excluding cache hits.");
@@ -77,6 +81,25 @@ public static class MultiplayerMetrics
         MutationDecisions.Add(1,
             new KeyValuePair<string, object?>("policy", policyName),
             new KeyValuePair<string, object?>("outcome", outcomeName));
+    }
+
+    /// <summary>
+    /// Early drops can bypass both Redis quota and guest auth; report them
+    /// without request-derived labels. Exactly one finite reason per denied
+    /// request, never its path, Origin, IP, cookie or room identifier.
+    /// </summary>
+    public static void RecordIngressRejection(IngressRejectionReason reason)
+    {
+        var value = reason switch
+        {
+            IngressRejectionReason.RoomId => "room-id",
+            IngressRejectionReason.MutationOrigin => "mutation-origin",
+            IngressRejectionReason.HubOrigin => "hub-origin",
+            IngressRejectionReason.LobbyBodySize => "lobby-body-size",
+            IngressRejectionReason.GuestBody => "guest-body",
+            _ => throw new ArgumentOutOfRangeException(nameof(reason))
+        };
+        IngressRejections.Add(1, new KeyValuePair<string, object?>("reason", value));
     }
 
     public static void RecordReadinessProbe(bool ready) =>
@@ -222,6 +245,16 @@ public static class MultiplayerMetrics
 }
 
 public enum MutationOutcome { Allowed, Limited, Unavailable }
+
+/// <summary>Fixed ingress rejection categories, never raw input data.</summary>
+public enum IngressRejectionReason
+{
+    RoomId,
+    MutationOrigin,
+    HubOrigin,
+    LobbyBodySize,
+    GuestBody
+}
 
 /// <summary>Finite technical readiness probe phase; never error text.</summary>
 public enum ReadinessProbeStage

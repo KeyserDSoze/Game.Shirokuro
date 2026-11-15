@@ -169,6 +169,7 @@ public sealed class MultiplayerMetricsExportTests
         var meter = provider.GetRequiredService<MeterProvider>();
 
         MultiplayerMetrics.RecordReadinessProbe(true);
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.MutationOrigin);
         MultiplayerMetrics.RecordReadinessDuration(
             true, ReadinessProbeStage.Success, 0.12);
         MultiplayerMetrics.RecordReadinessDuration(
@@ -204,6 +205,7 @@ public sealed class MultiplayerMetricsExportTests
             .Select(call => Encoding.UTF8.GetString(call.Body)));
         Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
         Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
+        Assert.Contains(MultiplayerMetrics.IngressRejectionsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectionEventsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisReplicationObservationsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectedReplicasName, payload);
