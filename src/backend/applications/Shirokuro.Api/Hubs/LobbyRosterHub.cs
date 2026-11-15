@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Shirokuro.Api.Security;
+using Shirokuro.Api.Readiness;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Application.Lobbies;
 
@@ -13,10 +14,35 @@ namespace Shirokuro.Api.Hubs;
 /// </summary>
 [Authorize]
 public sealed class LobbyRosterHub(LobbyRosterReader reader,
-    GuestSessionRegistry? sessions = null, IAsyncGuestLobby? lobby = null) : Hub
+    GuestSessionRegistry? sessions = null, IAsyncGuestLobby? lobby = null,
+    IReadinessDrainSignal? drain = null,
+    LobbyConnectionDrainRegistry? connections = null) : Hub
 {
+    // SignalR invokes these lifecycle callbacks, not as callable Hub methods.
+    public override async Task OnConnectedAsync()
+    {
+        if (drain?.IsDraining == true || connections?.IsDraining == true ||
+            (connections is not null && !connections.TryTrack(Context)))
+        {
+            Context.Abort();
+            return;
+        }
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        connections?.Untrack(Context);
+        await base.OnDisconnectedAsync(exception);
+    }
+
     public async Task<LobbyRosterView> GetRoster(string lobbyId)
     {
+        // Already-open sockets must not outlive a node drain with access to
+        // a member-only roster. Fail with the same opaque error as a missing
+        // room, before asking Redis to revalidate any guest session.
+        if (drain?.IsDraining == true || connections?.IsDraining == true)
+            throw new HubException("Lobby unavailable.");
         // A cached SignalR principal may outlive revocation. Malformed room
         // input, however, cannot be a real server-issued lobby: reject it
         // before any guest Redis authority lookup or room storage access.
@@ -42,10 +68,15 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
 
         try
         {
-            return lobby is null
+            var roster = lobby is null
                 ? reader.ForMember(lobbyId, trustedPlayerId)
                 : await lobby.ForMemberAsync(
                     lobbyId, trustedPlayerId, Context.ConnectionAborted);
+            // Shutdown might begin during an awaited Redis roster read.
+            // Even a successful in-flight result is no longer deliverable.
+            if (drain?.IsDraining == true || connections?.IsDraining == true)
+                throw new HubException("Lobby unavailable.");
+            return roster;
         }
         catch (Exception error) when (
             error is KeyNotFoundException or
