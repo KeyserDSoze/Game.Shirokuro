@@ -133,6 +133,36 @@ test('two independent guest browsers create a room, join by invite and select he
     expect(firstId).toContain(unknownRoutes.identity?.playerId)
     await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
 
+    // An existing route with an unsupported method is NOT an unknown
+    // route. ASP.NET's 405 must retain its Allow header without issuing
+    // or replacing the authenticated browser's signed guest cookie.
+    const wrongMethod = await first.evaluate(async () => {
+      const response = await fetch('/api/lobbies', {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+      })
+      const identity = await fetch('/api/sessions/me', {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+      })
+      return {
+        status: response.status,
+        allow: response.headers.get('Allow'),
+        cacheControl: response.headers.get('Cache-Control'),
+        setCookie: response.headers.has('Set-Cookie'),
+        identityStatus: identity.status,
+        me: identity.ok
+          ? await identity.json() as { kind: string; playerId: string }
+          : null,
+      }
+    })
+    expect(wrongMethod.status).toBe(405)
+    expect(wrongMethod.allow).toContain('POST')
+    expect(wrongMethod.cacheControl).toContain('no-store')
+    expect(wrongMethod.setCookie).toBe(false)
+    expect(wrongMethod.identityStatus).toBe(200)
+    expect(wrongMethod.me?.kind).toBe('guest')
+    expect(firstId).toContain(wrongMethod.me?.playerId)
+    await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
+
     // A real HTTP 413 must be returned before room creation. Reuse this
     // already signed-in guest instead of spending more shared guest quota.
     const rejectedBody = await first.evaluate(async () => {
