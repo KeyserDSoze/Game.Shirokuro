@@ -70,13 +70,17 @@ public sealed class PreAuthenticationMutationGuardTests
     {
         private int _calls;
         public int Calls => Volatile.Read(ref _calls);
+        public bool Allowed { get; set; } = true;
+        public bool Unavailable { get; set; }
 
         public Task<GuestMutationDecision> AcquireAsync(
             GuestMutationRateLimit rule, IPAddress? clientIp,
             CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref _calls);
-            return Task.FromResult(new GuestMutationDecision(true, 60_000));
+            if (Unavailable)
+                throw new IOException("Sensitive Redis connection details");
+            return Task.FromResult(new GuestMutationDecision(Allowed, 60_000));
         }
     }
 
@@ -167,6 +171,92 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.False(response.Headers.Contains("Set-Cookie"));
         Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    [Fact]
+    public async Task GuestIssuanceQuotaRunsBeforeSignedCookieRedisAuthority()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(1, limiter.Calls); // Only the genuine guest admission.
+        Assert.Equal(0, cache.Reads);
+
+        // The signed guest cookie would require an authoritative Redis
+        // read. A denied quota MUST be returned first, even during outage,
+        // with no session validation or cookie replacement.
+        cache.Unavailable = true;
+        limiter.Allowed = false;
+        using (var deniedRequest = Mutation(HttpMethod.Post,
+                   "/api/sessions/guest", "https://game.example"))
+        using (var denied = await guest.SendAsync(deniedRequest))
+        {
+            Assert.Equal(HttpStatusCode.TooManyRequests, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.Equal("60", Assert.Single(
+                denied.Headers.GetValues("Retry-After")));
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(2, limiter.Calls);
+
+        limiter.Unavailable = true;
+        using (var outageRequest = Mutation(HttpMethod.Post,
+                   "/api/sessions/guest", "https://game.example"))
+        using (var outage = await guest.SendAsync(outageRequest))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, outage.StatusCode);
+            Assert.Equal("no-store", outage.Headers.CacheControl?.ToString());
+            Assert.False(outage.Headers.Contains("Set-Cookie"));
+            Assert.False(outage.Headers.Contains("Retry-After"));
+            Assert.DoesNotContain("Sensitive Redis",
+                await outage.Content.ReadAsStringAsync());
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(3, limiter.Calls);
+
+        // A genuine permit now reaches cookie validation and fails closed
+        // on the unavailable registry rather than minting a new identity.
+        limiter.Unavailable = false;
+        limiter.Allowed = true;
+        using (var allowedRequest = Mutation(HttpMethod.Post,
+                   "/api/sessions/guest", "https://game.example"))
+        using (var authUnavailable = await guest.SendAsync(allowedRequest))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                authUnavailable.StatusCode);
+            Assert.Equal("no-store",
+                authUnavailable.Headers.CacheControl?.ToString());
+            Assert.False(authUnavailable.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(4, limiter.Calls);
+
+        // A separate room-creation POST still validates the signed cookie
+        // BEFORE attempting its distinct quota, even under registry outage.
+        using (var roomRequest = Mutation(HttpMethod.Post,
+                   "/api/lobbies", "https://game.example"))
+        using (var blockedRoom = await guest.SendAsync(roomRequest))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                blockedRoom.StatusCode);
+        }
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(4, limiter.Calls);
+
+        // Recovery preserves idempotence: no new cookie or new guest ID.
+        cache.Unavailable = false;
+        using var recoveredRequest = Mutation(HttpMethod.Post,
+            "/api/sessions/guest", "https://game.example");
+        using var recovered = await guest.SendAsync(recoveredRequest);
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.False(recovered.Headers.Contains("Set-Cookie"));
+        Assert.Equal("no-store", recovered.Headers.CacheControl?.ToString());
+        Assert.Equal(3, cache.Reads);
+        Assert.Equal(5, limiter.Calls);
     }
 
     [Fact]

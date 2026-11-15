@@ -339,54 +339,79 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
+// The authenticated cookie registry and the distributed guest admission
+// budget are independent Redis services. A bodyless, CSRF-valid guest POST
+// should spend at most one admission permit BEFORE it asks Redis to revalidate
+// an attached signed cookie: exhausted/failed quota buckets must not still
+// trigger unlimited guest-session reads. This metadata is SERVER-OWNED.
+// Room creation is different: authorize the guest first so anonymous callers
+// cannot drain another player's room-creation allowance.
+static async Task<bool> AdmitGuestMutationAsync(
+    HttpContext context, GuestMutationKind expectedKind)
+{
+    var rule = context.GetEndpoint()?.Metadata.GetMetadata<GuestMutationRateLimit>();
+    if (rule is null || rule.Kind != expectedKind)
+        return true;
+
+    context.Response.Headers.CacheControl = "no-store";
+    GuestMutationDecision decision;
+    try
+    {
+        decision = await context.RequestServices
+            .GetRequiredService<IGuestMutationLimiter>()
+            .AcquireAsync(rule, context.Connection.RemoteIpAddress,
+                context.RequestAborted);
+    }
+    catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        // Never leak Redis endpoints, credentials or trusted client IPs.
+        // Neither a timeout nor an outage grants an unverified permit.
+        MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Unavailable);
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        return false;
+    }
+    if (!decision.Allowed)
+    {
+        MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Limited);
+        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        context.Response.Headers.RetryAfter =
+            Math.Max(1, (long)Math.Ceiling(
+                decision.RetryAfterMilliseconds / 1000d)).ToString(
+                System.Globalization.CultureInfo.InvariantCulture);
+        return false;
+    }
+    MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Allowed);
+    return true;
+}
+
+if (!app.Environment.IsDevelopment())
+{
+    // Runs after host/HTTPS + early Origin/intent/body checks and before
+    // auth. Only guest issuance owns this specific rate-limit metadata.
+    app.Use(async (context, next) =>
+    {
+        if (!await AdmitGuestMutationAsync(
+            context, GuestMutationKind.SessionIssuance))
+            return;
+        await next(context);
+    });
+}
+
 // Keep authentication on the root pipeline so ASP.NET Core does NOT insert
 // an additional automatic authentication middleware before the CSRF guard.
-// For the public probes, OnValidatePrincipal skips only the Redis lookup,
-// not cookie middleware or protected-route authorization.
+// Public probes still skip only the optional guest Redis lookup.
 app.UseAuthentication();
 app.UseAuthorization();
 
-// The two explicit POST endpoints alone carry admission-budget metadata.
-// Authorization still precedes the per-IP Redis limiter for authenticated
-// room creation. Failed Origin checks cannot spend Redis budget or auth reads.
 if (!app.Environment.IsDevelopment())
 {
+    // Room creation continues to authenticate and authorize the guest
+    // BEFORE spending its separate Redis quota. Never charge it twice.
     app.Use(async (context, next) =>
     {
-        var rule = context.GetEndpoint()?.Metadata
-            .GetMetadata<GuestMutationRateLimit>();
-        if (rule is not null)
-        {
-            context.Response.Headers.CacheControl = "no-store";
-            GuestMutationDecision decision;
-            try
-            {
-                decision = await context.RequestServices
-                    .GetRequiredService<IGuestMutationLimiter>()
-                    .AcquireAsync(rule, context.Connection.RemoteIpAddress,
-                        context.RequestAborted);
-            }
-            catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
-            {
-                // Fail closed on Redis/connection/protocol outages, without
-                // printing remote IP, Redis credentials or secret identities.
-                MultiplayerMetrics.RecordMutation(
-                    rule.Kind, MutationOutcome.Unavailable);
-                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-                return;
-            }
-            if (!decision.Allowed)
-            {
-                MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Limited);
-                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-                context.Response.Headers.RetryAfter =
-                    Math.Max(1, (long)Math.Ceiling(
-                        decision.RetryAfterMilliseconds / 1000d)).ToString(
-                            System.Globalization.CultureInfo.InvariantCulture);
-                return;
-            }
-            MultiplayerMetrics.RecordMutation(rule.Kind, MutationOutcome.Allowed);
-        }
+        if (!await AdmitGuestMutationAsync(
+            context, GuestMutationKind.RoomCreation))
+            return;
         await next(context);
     });
 }
