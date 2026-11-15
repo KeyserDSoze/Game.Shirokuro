@@ -728,6 +728,58 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(allowed, GuestLobbyMutationMediaTypeGuard.Allows(context));
     }
 
+    [Theory]
+    [InlineData("POST", "/api/lobbies", true, false)]
+    [InlineData("post", "/API/LOBBIES/", true, false)]
+    [InlineData("POST", "/api/lobbies/room-00000000000000000000000000000000/join", true, false)]
+    [InlineData("PATCH", "/api/lobbies/room-00000000000000000000000000000000/hero", true, false)]
+    [InlineData("PATCH", "/api/lobbies/room-00000000000000000000000000000000/team", true, false)]
+    [InlineData("DELETE", "/api/lobbies/room-00000000000000000000000000000000/membership", true, false)]
+    [InlineData("POST", "/api/lobbies/not-a-room/join", true, true)]
+    [InlineData("GET", "/api/lobbies", false, false)]
+    [InlineData("DELETE", "/api/lobbies", false, false)]
+    [InlineData("POST", "/api/lobbies/room-00000000000000000000000000000000/hero", false, false)]
+    [InlineData("POST", "/api/lobbies/room-00000000000000000000000000000000/join/extra", false, false)]
+    [InlineData("POST", "/api/lobbies/room-00000000000000000000000000000000/roster", false, false)]
+    [InlineData("POST", "/api/sessions/guest", false, false)]
+    public void Synthetic415FallbackIsLimitedToKnownLobbyMutations(
+        string method, string path, bool expected, bool invalidRoom)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = method;
+        context.Request.Path = path;
+        context.Request.Headers.ContentType = "text/plain";
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask, new EndpointMetadataCollection(),
+            "415 HTTP Unsupported Media Type"));
+
+        Assert.Equal(expected,
+            GuestLobbyMutationMediaTypeGuard.IsFrameworkUnsupportedLobbyRoute(
+                context, out var actualInvalidRoom));
+        Assert.Equal(invalidRoom, actualInvalidRoom);
+    }
+
+    [Theory]
+    [InlineData("application/json", "415 HTTP Unsupported Media Type")]
+    [InlineData("application/vnd.shirokuro+json", "415 HTTP Unsupported Media Type")]
+    [InlineData("text/plain", "real lobby endpoint")]
+    public void Synthetic415FallbackRequiresBothFrameworkEndpointAndNonJson(
+        string contentType, string displayName)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "POST";
+        context.Request.Path = "/api/lobbies";
+        context.Request.Headers.ContentType = contentType;
+        context.SetEndpoint(new Endpoint(
+            _ => Task.CompletedTask, new EndpointMetadataCollection(),
+            displayName));
+
+        Assert.False(
+            GuestLobbyMutationMediaTypeGuard.IsFrameworkUnsupportedLobbyRoute(
+                context, out var invalidRoom));
+        Assert.False(invalidRoom);
+    }
+
     [Fact]
     public async Task NonJsonLobbyMutationsRejectBeforeGuestRedisAndRoomQuota()
     {
