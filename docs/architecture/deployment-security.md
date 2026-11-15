@@ -2029,3 +2029,53 @@ segnale monotono iniettato, in entrambe le modalità; verificano sia il
 salto totale della risoluzione del readiness service sia il race con un
 probe positivo in volo, e l'indipendenza di liveness. Un test unitario
 verifica il collegamento al vero token di `IHostApplicationLifetime`.
+
+## Drenaggio delle connessioni SignalR su ApplicationStopping (#142)
+
+Oltre al fail-closed di `/api/ready` (#141), il processo applica il
+segnale **server-owned** `IHostApplicationLifetime.ApplicationStopping`
+al trasporto lobby SignalR `/hubs/lobbies`:
+
+- Nel middleware **pre-auth**, il marker server `CookieSocketOriginGuardRequired`
+  identifica esclusivamente le route hub reali selezionate da ASP.NET Core.
+  Dopo i normali 404 per URL inesistenti, ma **prima** di cookie auth/Redis,
+  negoziazione e upgrade del WebSocket ritornano `503/no-store` durante
+  lo shutdown, senza `Set-Cookie` o `Retry-After`. Non sono intercettate
+  route `/hubs` estranee, fallback 405, API pubbliche o mutazioni lobby.
+  Gli altri controlli Host/HTTPS esistenti restano attivi.
+- `LobbyConnectionDrainRegistry` è un singleton per **singolo nodo**:
+  mantiene solo `ConnectionId -> HubCallerContext` per i socket attivi,
+  mai ID giocatore, cookie, room, inviti, indirizzi IP o altri dati di gioco.
+  `OnConnectedAsync` registra l'istanza solo finché il nodo non è in
+  arresto, con un controllo dopo l'inserimento per coprire la race;
+  `OnDisconnectedAsync` la rimuove. Il callback `ApplicationStopping`
+  invoca `HubCallerContext.Abort()` su ogni connessione tracciata;
+  eventuali errori di un trasporto già chiuso non bloccano gli altri.
+  Una registrazione tardiva si abortisce autonomamente.
+- `GetRoster` continua a ri-autorizzare il guest per ogni invocazione
+  e a filtrare i membri per room come prima. Durante lo shutdown
+  ritorna l'errore generico `Lobby unavailable.` **prima** delle letture
+  guest/room e **dopo** l'eventuale await di un roster Redis avviato
+  prima dello stop. Nessun roster letto in volo viene restituito da
+  un nodo osservato come draining al termine dell'attesa.
+  Non vengono aggiunti nuovi metodi SignalR invocabili dai client.
+
+**Contratto e limiti:** la readiness resta `503/no-store` durante lo
+stop, `/api/health` resta liveness mentre Kestrel risponde, e gli
+endpoint API non-hub conservano i propri controlli di autenticazione.
+Non esiste un endpoint per comandare il drain da un browser e non
+viene conferito alcun privilegio PvP. Il server non promette che un
+bilanciatore vedrà il `503` dopo che Kestrel ha già smesso di accettare
+connessioni: distribuire preStop/grace period, polling e protezione dei
+WebSocket con l'orchestratore è un'attività **esterna** ancora sotto #21.
+Il client può riconnettersi attraverso il bilanciatore verso un altro
+nodo, ma la resilienza del reconnect reale non è garantita da questo
+solo change.
+
+Regressioni: TestServer Production con cookie guest firmato e Redis
+fake indisponibile verifica `503/no-store` su hub negotiate e GET
+upgrade senza lookup guest né quota, `404` sulle rotte non-hub,
+`/api/ready` draining e `/api/health` indipendente. xUnit sui
+lifecycle Hub e sul registry verificano chiusura dei socket attivi,
+rimozione dei disconnected, registrazioni tardive abortite, shutdown
+idempotente, e race della lettura roster in volo.
