@@ -14,6 +14,9 @@ import { paintTerrainCell, terrainAtCell, type TerrainId } from '@/game/terrain'
 import {
   commitTerrainEdit, createTerrainHistory, redoTerrainEdit, undoTerrainEdit,
 } from '@/game/terrainHistory'
+import {
+  classifyTerrainHistoryShortcut, TERRAIN_HISTORY_EDITABLE_SELECTOR,
+} from '@/game/terrainHistoryShortcuts'
 import type { HexCoordinate } from '@/game/hex'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -50,6 +53,36 @@ export default function App() {
   const selectedTerrain = terrainAtCell(selected, terrainOverrides)
 
   useEffect(() => { document.documentElement.lang = i18n.language }, [i18n.language])
+
+  // The shortcut is local to this preview editor; never steal the browser's
+  // native Undo/Redo when typing in a form, the JSON document textarea or
+  // an accessible text widget. The 32-step history remains the only state.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const target = event.target
+      const action = classifyTerrainHistoryShortcut({
+        key: event.key,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        repeat: event.repeat,
+        isComposing: event.isComposing,
+        defaultPrevented: event.defaultPrevented,
+        editableTarget: target instanceof Element &&
+          target.closest(TERRAIN_HISTORY_EDITABLE_SELECTOR) !== null,
+      })
+      if (action === null ||
+          (action === 'undo' && terrainHistory.past.length === 0) ||
+          (action === 'redo' && terrainHistory.future.length === 0)) return
+
+      event.preventDefault()
+      setTerrainHistory(action === 'undo' ? undoTerrainEdit : redoTerrainEdit)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [terrainHistory.past.length, terrainHistory.future.length])
 
   return (
     <div className="min-h-screen bg-background text-foreground">
