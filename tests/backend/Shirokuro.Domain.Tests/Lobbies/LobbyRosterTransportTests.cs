@@ -36,7 +36,7 @@ public sealed class LobbyRosterTransportTests
     private const string GuestCara = "guest-cccccccccccccccccccccccccccccccc";
 
     private static WebApplicationFactory<Program> CreateServer(
-        IAsyncGuestLobby? overrideLobby = null) =>
+        IAsyncGuestLobby? overrideLobby = null, IReadinessDrainSignal? drain = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
             {
@@ -55,6 +55,11 @@ public sealed class LobbyRosterTransportTests
                 {
                     services.RemoveAll<IAsyncGuestLobby>();
                     services.AddSingleton(overrideLobby);
+                }
+                if (drain is not null)
+                {
+                    services.RemoveAll<IReadinessDrainSignal>();
+                    services.AddSingleton(drain);
                 }
             }));
 
@@ -95,11 +100,15 @@ public sealed class LobbyRosterTransportTests
     {
         public int Reads { get; private set; }
         public TaskCompletionSource<LobbyRosterView>? Pending { get; set; }
+        public TaskCompletionSource<LobbyRosterView>? PendingPeek { get; set; }
+        public TaskCompletionSource<bool> ReadStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task<LobbyRosterView> ForMemberAsync(string roomId, string trustedPlayerId,
             CancellationToken cancellationToken = default)
         {
             Reads++;
+            ReadStarted.TrySetResult(true);
             // Simulate the Redis runtime's bounded heartbeat CAS retry
             // exhaustion AFTER auth/member routing, without real contention
             // races or an arbitrary InvalidOperationException catch-all.
@@ -110,7 +119,8 @@ public sealed class LobbyRosterTransportTests
             string trustedPlayerId, CancellationToken cancellationToken = default)
         {
             Reads++;
-            return Task.FromException<LobbyRosterView>(
+            ReadStarted.TrySetResult(true);
+            return PendingPeek?.Task ?? Task.FromException<LobbyRosterView>(
                 new LobbySnapshotUnavailableException());
         }
 
@@ -136,6 +146,71 @@ public sealed class LobbyRosterTransportTests
         public Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class ManualRosterDrain : IReadinessDrainSignal
+    {
+        private int _stopping;
+        public bool IsDraining => Volatile.Read(ref _stopping) != 0;
+        public void Stop() => Interlocked.Exchange(ref _stopping, 1);
+    }
+
+    [Theory]
+    [InlineData("roster")]
+    [InlineData("roster/peek")]
+    public async Task AuthenticatedInFlightHttpRosterCannotPublishAfterDrain(
+        string relativePath)
+    {
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby();
+        if (relativePath == "roster")
+            lobby.Pending = pending;
+        else
+            lobby.PendingPeek = pending;
+
+        var drain = new ManualRosterDrain();
+        using var server = CreateServer(lobby, drain);
+        using var guest = MemberClientFor(server, GuestAlice);
+        var view = new LobbyRosterReader(
+            server.Services.GetRequiredService<InMemoryLobbyCoordinator>())
+            .ForMember(RoomA, GuestAlice);
+
+        // Test both the explicit heartbeat and the passive conditional GET.
+        // Without the post-await fence they would return 200 and 304.
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"/api/lobbies/{RoomA}/{relativePath}");
+        request.Headers.TryAddWithoutValidation("If-None-Match",
+            "\"rev-" + view.Revision + "\"");
+        var inFlight = guest.SendAsync(request);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, lobby.Reads);
+
+        drain.Stop();
+        pending.SetResult(view);
+        using (var rejected = await inFlight)
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("ETag"));
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            var body = await rejected.Content.ReadAsStringAsync();
+            Assert.DoesNotContain(RoomA, body, StringComparison.Ordinal);
+            Assert.DoesNotContain(GuestAlice, body, StringComparison.Ordinal);
+            Assert.DoesNotContain("participants", body,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        using (var afterStop = await guest.GetAsync(
+                   $"/api/lobbies/{RoomA}/{relativePath}"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                afterStop.StatusCode);
+            Assert.Equal("no-store",
+                afterStop.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(1, lobby.Reads); // No further storage access.
+        using var health = await guest.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
     }
 
     [Fact]
