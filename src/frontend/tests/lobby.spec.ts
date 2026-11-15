@@ -19,6 +19,27 @@ test('two independent guest browsers create a room, join by invite and select he
     const secondId = await second.getByTestId('lobby-player').textContent()
     expect(firstId).not.toBe(secondId)
 
+    // A body-bearing guest issuance must be refused at ingress before
+    // consuming another session quota or replacing the signed cookie.
+    const bodylessGuard = await first.evaluate(async () => {
+      const response = await fetch('/api/sessions/guest', {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', 'X-Shirokuro-Request': '1' },
+        body: JSON.stringify({ untrusted: true }),
+      })
+      return {
+        status: response.status,
+        cacheControl: response.headers.get('Cache-Control'),
+        replacedCookie: response.headers.has('Set-Cookie'),
+      }
+    })
+    expect(bodylessGuard.status).toBe(400)
+    expect(bodylessGuard.cacheControl).toContain('no-store')
+    expect(bodylessGuard.replacedCookie).toBe(false)
+    await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
+
     // A real HTTP 413 must be returned before room creation. Reuse this
     // already signed-in guest instead of spending more shared guest quota.
     const rejectedBody = await first.evaluate(async () => {

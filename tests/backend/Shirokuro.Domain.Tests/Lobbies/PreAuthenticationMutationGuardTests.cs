@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -233,6 +234,80 @@ public sealed class PreAuthenticationMutationGuardTests
         using var recovered = await guest.GetAsync("/api/sessions/me");
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
         Assert.Equal(3, cache.Reads);
+    }
+
+    private sealed class FakeBodyDetectionFeature(bool canHaveBody) :
+        IHttpRequestBodyDetectionFeature
+    {
+        public bool CanHaveBody { get; } = canHaveBody;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GuestIssuanceBodyGuardUsesHttp2BodyDetectionWithoutHeaders(
+        bool canHaveBody)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Protocol = "HTTP/2";
+        context.Features.Set<IHttpRequestBodyDetectionFeature>(
+            new FakeBodyDetectionFeature(canHaveBody));
+        Assert.Null(context.Request.ContentLength);
+        Assert.False(context.Request.Headers.ContainsKey("Transfer-Encoding"));
+        Assert.Equal(!canHaveBody, GuestSessionBodyGuard.Allows(context));
+
+        // A caller-supplied Content-Length: 0 is permitted only when the
+        // transport reports that no body frame can follow.
+        context.Request.ContentLength = 0;
+        Assert.Equal(!canHaveBody, GuestSessionBodyGuard.Allows(context));
+    }
+
+    [Fact]
+    public void GuestIssuanceBodyGuardDeniesFramedBodiesWithoutReadingThem()
+    {
+        var context = new DefaultHttpContext();
+        context.Features.Set<IHttpRequestBodyDetectionFeature>(
+            new FakeBodyDetectionFeature(false));
+        Assert.True(GuestSessionBodyGuard.Allows(context));
+        context.Request.ContentLength = 1;
+        Assert.False(GuestSessionBodyGuard.Allows(context));
+        context.Request.ContentLength = null;
+        context.Request.Headers.TransferEncoding = "chunked";
+        Assert.False(GuestSessionBodyGuard.Allows(context));
+    }
+
+    [Fact]
+    public async Task GuestIssuanceBodyWithValidOriginRejectsBeforeGuestRedisOrQuota()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        // If this reaches cookie validation, Redis would be unavailable
+        // and report 503; if it reaches admission, quota would increment.
+        using var body = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            "https://game.example");
+        body.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+        using var denied = await guest.SendAsync(body);
+        Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+        Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
+        Assert.False(denied.Headers.Contains("Retry-After"));
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // Valid bodyless reads remain authenticated and fail closed when
+        // the shared authority is unavailable, unlike this early 400.
+        using var me = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, me.StatusCode);
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
     }
 
     [Fact]

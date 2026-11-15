@@ -326,6 +326,16 @@ app.Use(async (context, next) =>
         context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
         return;
     }
+    if (metadata?.GetMetadata<GuestSessionEmptyBodyRequired>() is not null &&
+        !GuestSessionBodyGuard.Allows(context))
+    {
+        // Invalid guest issuance must not spend a Redis/local admission
+        // permit or ask Redis to validate any attached signed guest cookie.
+        // HTTP/2 DATA is detected even without a Content-Length header.
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        return;
+    }
     await next(context);
 });
 
@@ -425,8 +435,7 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
         return Results.StatusCode(StatusCodes.Status403Forbidden);
 
     context.Response.Headers.CacheControl = "no-store";
-    if (context.Request.ContentLength is > 0 ||
-        context.Request.Headers.ContainsKey("Transfer-Encoding"))
+    if (!GuestSessionBodyGuard.Allows(context))
         return Results.BadRequest(new { code = "session_request_must_be_empty" });
 
     var existingId = AuthenticatedPlayerIdentity.FromPrincipal(context.User);
@@ -492,6 +501,7 @@ var guestSessionIssuance = app.MapPost("/api/sessions/guest",
 // Metadata has only trusted enum values for both deployment modes.
 guestSessionIssuance.WithMetadata(
     new WebMutationGuardRequired(),
+    new GuestSessionEmptyBodyRequired(),
     new GuestMutationRateLimit(GuestMutationKind.SessionIssuance));
 if (app.Environment.IsDevelopment())
     guestSessionIssuance.RequireRateLimiting("guest-session-issuance");

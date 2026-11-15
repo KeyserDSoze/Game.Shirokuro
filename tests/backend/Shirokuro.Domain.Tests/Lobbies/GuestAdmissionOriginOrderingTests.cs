@@ -1,6 +1,7 @@
 using System.IO;
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -119,6 +120,40 @@ public sealed class GuestAdmissionOriginOrderingTests
         Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
         Assert.False(unavailable.Headers.Contains("Set-Cookie"));
         Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
+    public async Task ProductionBodyBearingGuestIssuanceNeverConsumesRedisAdmission()
+    {
+        var limiter = new CountingLimiter();
+        using var server = Production(limiter);
+        using var client = Client(server);
+
+        foreach (var payload in new[] { "{}", "{\"bad\":true}" })
+        {
+            using var rejected = Post("/api/sessions/guest", "https://game.example");
+            rejected.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var response = await client.SendAsync(rejected);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.False(response.Headers.Contains("Set-Cookie"));
+            Assert.False(response.Headers.Contains("Retry-After"));
+            Assert.Equal(0, limiter.Calls);
+        }
+
+        // The browser's actual bodyless POST still issues a guest once.
+        using var valid = Post("/api/sessions/guest", "https://game.example");
+        using var success = await client.SendAsync(valid);
+        Assert.Equal(HttpStatusCode.OK, success.StatusCode);
+        Assert.True(success.Headers.Contains("Set-Cookie"));
+        Assert.Equal(1, limiter.Calls);
+
+        // A declared zero-length body cannot exhaust the shared quota.
+        using var zero = Post("/api/sessions/guest", "https://game.example");
+        zero.Content = new ByteArrayContent([]);
+        using var empty = await client.SendAsync(zero);
+        Assert.Equal(HttpStatusCode.OK, empty.StatusCode);
+        Assert.Equal(2, limiter.Calls);
     }
 
     [Fact]
