@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
@@ -27,6 +28,50 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 /// </summary>
 public sealed class PreAuthenticationMutationGuardTests
 {
+    /// <summary>
+    /// A real HTTP body stream: transport sends all but the final JSON byte
+    /// before pausing. Endpoint middleware must already have authenticated
+    /// the cookie (and acquired create quota) while JSON binding is stuck.
+    /// </summary>
+    private sealed class PausedJsonContent : HttpContent
+    {
+        private readonly byte[] _payload;
+
+        public PausedJsonContent(string json)
+        {
+            _payload = Encoding.UTF8.GetBytes(json);
+            Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        }
+
+        public TaskCompletionSource<bool> FirstChunkSent { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ResumeBody { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _payload.Length;
+            return true;
+        }
+
+        protected override Task SerializeToStreamAsync(
+            Stream stream, TransportContext? context) =>
+            SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+        protected override async Task SerializeToStreamAsync(
+            Stream stream, TransportContext? context,
+            CancellationToken cancellationToken)
+        {
+            await stream.WriteAsync(
+                _payload.AsMemory(0, _payload.Length - 1), cancellationToken);
+            await stream.FlushAsync(cancellationToken);
+            FirstChunkSent.TrySetResult(true);
+            await ResumeBody.Task.WaitAsync(cancellationToken);
+            await stream.WriteAsync(
+                _payload.AsMemory(_payload.Length - 1, 1), cancellationToken);
+        }
+    }
+
     private sealed class CountingCache : IDistributedCache
     {
         private readonly ConcurrentDictionary<string, byte[]> _data = new();
@@ -283,6 +328,131 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.DoesNotContain("guest-", body, StringComparison.Ordinal);
         Assert.DoesNotContain("room-", body, StringComparison.Ordinal);
         Assert.DoesNotContain("redis", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RoomCreateSlowJsonCompletingAfterDrainDoesNotStartLobbyMutation()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+
+        var rooms = server.Services.GetRequiredService<
+            Shirokuro.Application.Lobbies.InMemoryLobbyCoordinator>();
+        Assert.Equal(0, rooms.StoredRoomCount);
+        cache.ReadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        limiter.PermitStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var body = new PausedJsonContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""");
+        using var create = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        create.Content = body;
+        var request = guest.SendAsync(create);
+        // The actual cookie Redis lookup and room quota must complete
+        // BEFORE the last body byte arrives; both drain middleware ran.
+        await Task.WhenAll(body.FirstChunkSent.Task, cache.ReadStarted.Task,
+            limiter.PermitStarted.Task).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(2, limiter.Calls); // Guest issuance and room creation.
+        Assert.Equal(0, rooms.StoredRoomCount);
+
+        drain.Stop();
+        body.ResumeBody.SetResult(true);
+        using var rejected = await request.WaitAsync(TimeSpan.FromSeconds(15));
+        await AssertPostAuthDrainResponseAsync(rejected);
+        Assert.Null(rejected.Headers.Location);
+        Assert.Equal(0, rooms.StoredRoomCount);
+        Assert.Equal(1, cache.Writes); // Existing signed guest only.
+        Assert.Equal(2, limiter.Calls); // Quota already consumed once.
+    }
+
+    [Fact]
+    public async Task RoomJoinSlowJsonCompletingAfterDrainDoesNotAdmitNewMember()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, drain: drain);
+        using var anonymous = Client(server);
+        var ownerCookie = await Issue(anonymous, "https://game.example");
+        var joinerCookie = await Issue(anonymous, "https://game.example");
+        using var owner = Client(server, cookie: ownerCookie);
+        using var joiner = Client(server, cookie: joinerCookie);
+        using var create = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        create.Content = new StringContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""",
+            Encoding.UTF8, "application/json");
+        using var created = await owner.SendAsync(create);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var json = JsonDocument.Parse(
+            await created.Content.ReadAsStringAsync());
+        var roomId = json.RootElement.GetProperty("lobbyId").GetString()!;
+        var rooms = server.Services.GetRequiredService<
+            Shirokuro.Application.Lobbies.InMemoryLobbyCoordinator>();
+        var before = rooms.Get(roomId);
+        Assert.Single(before.Participants);
+        Assert.Equal(1, before.Revision);
+        var initialReads = cache.Reads;
+        var initialQuota = limiter.Calls;
+
+        cache.ReadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var body = new PausedJsonContent(
+            """{"teamId":"black","expectedRevision":1}""");
+        using var join = Mutation(HttpMethod.Post,
+            "/api/lobbies/" + roomId + "/join", "https://game.example");
+        join.Content = body;
+        var request = joiner.SendAsync(join);
+        await Task.WhenAll(body.FirstChunkSent.Task,
+            cache.ReadStarted.Task).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(initialReads + 1, cache.Reads);
+        Assert.Equal(initialQuota, limiter.Calls);
+        Assert.Equal(before.Revision, rooms.Get(roomId).Revision);
+
+        drain.Stop();
+        body.ResumeBody.SetResult(true);
+        using var rejected = await request.WaitAsync(TimeSpan.FromSeconds(15));
+        await AssertPostAuthDrainResponseAsync(rejected);
+        Assert.Null(rejected.Headers.Location);
+        var after = rooms.Get(roomId);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Single(after.Participants);
+        Assert.Equal(before.Participants[0].PlayerId, after.Participants[0].PlayerId);
+        Assert.Equal(initialQuota, limiter.Calls);
+        Assert.Equal(2, cache.Writes);
+    }
+
+    [Fact]
+    public async Task SlowJsonBodyStillCreatesRoomNormallyWithoutDrain()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        using var body = new PausedJsonContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""");
+        using var request = Mutation(HttpMethod.Post, "/api/lobbies",
+            "https://game.example");
+        request.Content = body;
+        var pending = guest.SendAsync(request);
+        await body.FirstChunkSent.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        body.ResumeBody.SetResult(true);
+        using var created = await pending.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var json = JsonDocument.Parse(
+            await created.Content.ReadAsStringAsync());
+        var roomId = json.RootElement.GetProperty("lobbyId").GetString()!;
+        var rooms = server.Services.GetRequiredService<
+            Shirokuro.Application.Lobbies.InMemoryLobbyCoordinator>();
+        Assert.Equal(1, rooms.StoredRoomCount);
+        Assert.Equal(1, rooms.Get(roomId).Revision);
+        Assert.Equal(2, limiter.Calls);
     }
 
     [Fact]
