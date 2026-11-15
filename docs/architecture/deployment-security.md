@@ -1991,3 +1991,41 @@ header credenziali. Come per altri contatori, il listener può vedere
 test concorrenti: la correlazione fra richiesta e assenza di I/O Redis
 è comprovata dal fake cache/limiter, non dalla pretesa che un counter
 sia una sessione o un identificatore.
+
+## Shutdown del nodo e readiness fail-closed (#141)
+
+In **Development** e **Production/Staging**, il server usa
+`HostLifetimeReadinessDrainSignal` (`IHostApplicationLifetime.ApplicationStopping`)
+come unica fonte **server-owned** del segnale di spegnimento. Non esiste
+un header, query parameter o endpoint client per iniziare/arrestare il drain.
+
+`GET /api/ready`, da quando è iniziato `ApplicationStopping`, ritorna
+sempre **503** con il contratto JSON minimale `{"status":"unavailable"}`
+e `Cache-Control: no-store`, senza cookie, dettagli dei backend o `Retry-After`.
+La verifica del segnale avviene **prima della risoluzione DI** di
+`IDeploymentReadiness`: il solo accesso alla readiness durante lo
+shutdown non crea i connector Redis né esegue probe Redis/keyring.
+Il segnale è ricontrollato **dopo** `await IsReadyAsync`, così anche un
+probe partito prima dello shutdown, o il suo positivo cache di 3 secondi,
+non può dichiarare il nodo ready quando la richiesta termina già in drain.
+Un probe condiviso in volo non viene cancellato da questo segnale; termina
+per chi era già in attesa, mentre l'esito HTTP viene correttamente negato.
+
+`GET /api/health` rimane un puro controllo di liveness (`200/no-store`
+finché il server può rispondere) e non diventa una readiness implicita.
+Il contatore `shirokuro.readiness.probes` continua a contare soltanto i
+probe tecnici realmente eseguiti, non richieste 503 per shutdown. Il drain
+non cambia il comportamento di autenticazione, lobby, SignalR o dati PvP.
+
+**Operazione:** il bilanciatore deve usare `/api/ready`, non `/api/health`,
+per scegliere nuovi nodi. Un `SIGTERM`/host shutdown cancella
+`ApplicationStopping` e rende non-ready le eventuali richieste ancora
+servite. Questo non sostituisce una finestra `preStop`/propagazione dei
+poll del bilanciatore, `terminationGracePeriod`, drenaggio WebSocket e
+controlli HA sul cluster: tali attività rimangono in #21. Non si sostiene
+che il 503 possa essere osservato se Kestrel ha già smesso di accettare
+nuove connessioni. I test xUnit TestServer simulano lo shutdown con un
+segnale monotono iniettato, in entrambe le modalità; verificano sia il
+salto totale della risoluzione del readiness service sia il race con un
+probe positivo in volo, e l'indipendenza di liveness. Un test unitario
+verifica il collegamento al vero token di `IHostApplicationLifetime`.
