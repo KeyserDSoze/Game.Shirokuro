@@ -164,7 +164,7 @@ public sealed class GuestSessionTests
     }
 
     [Fact]
-    public async Task AmbiguousAndNonGuestSessionsCannotBeReplaced()
+    public async Task AmbiguousAndUnsupportedSignedSessionsCannotBeReplaced()
     {
         using var server = CreateServer();
         using var ambiguous = Client(server, SignedCookie(server,
@@ -172,13 +172,99 @@ public sealed class GuestSessionTests
             new Claim(ClaimTypes.NameIdentifier, "bob")));
         using (var req = Mutation(HttpMethod.Post, "/api/sessions/guest"))
         using (var response = await ambiguous.SendAsync(req))
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
 
         using var nonGuest = Client(server, SignedCookie(server,
             new Claim(ClaimTypes.NameIdentifier, "alice")));
         using var request = Mutation(HttpMethod.Post, "/api/sessions/guest");
         using var result = await nonGuest.SendAsync(request);
-        Assert.Equal(HttpStatusCode.Conflict, result.StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, result.StatusCode);
+        Assert.Equal("no-store", result.Headers.CacheControl?.ToString());
+        Assert.False(result.Headers.Contains("Set-Cookie"));
+    }
+
+    [Fact]
+    public void OnlyCanonicalGuestPrincipalsAreSupportedByTheGuestCookieScheme()
+    {
+        const string canonical = "guest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const string token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        var valid = GuestSessions.CreatePrincipal(canonical, token);
+        Assert.True(GuestSessions.IsCanonicalGuest(valid));
+
+        foreach (var claims in new Claim[][]
+                 {
+                     [new(ClaimTypes.NameIdentifier, "alice")],
+                     [new(ClaimTypes.NameIdentifier, canonical)],
+                     [new(ClaimTypes.NameIdentifier, "guest-alice"),
+                      new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)],
+                     [new(ClaimTypes.NameIdentifier, "guest-" + new string('A', 32)),
+                      new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)],
+                     [new(ClaimTypes.NameIdentifier, canonical),
+                      new(GuestSessions.SessionKindClaim, "other")],
+                     [new(ClaimTypes.NameIdentifier, canonical),
+                      new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind),
+                      new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)],
+                     [new(ClaimTypes.NameIdentifier, canonical),
+                      new(ClaimTypes.NameIdentifier, "alice"),
+                      new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)]
+                 })
+        {
+            var unsupported = new ClaimsPrincipal(new ClaimsIdentity(
+                claims, CookieAuthenticationDefaults.AuthenticationScheme));
+            Assert.False(GuestSessions.IsCanonicalGuest(unsupported));
+        }
+    }
+
+    [Fact]
+    public async Task UnsupportedSignedTicketCannotReadPrivateEndpointsOrIssueAnotherGuest()
+    {
+        using var server = CreateServer();
+        const string canonical = "guest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var cases = new Claim[][]
+        {
+            [new(ClaimTypes.NameIdentifier, "alice")],
+            [new(ClaimTypes.NameIdentifier, canonical)],
+            [new(ClaimTypes.NameIdentifier, "guest-" + new string('A', 32)),
+             new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)],
+            [new(ClaimTypes.NameIdentifier, canonical),
+             new(GuestSessions.SessionKindClaim, "account")],
+            [new(ClaimTypes.NameIdentifier, canonical),
+             new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind),
+             new(GuestSessions.SessionKindClaim, GuestSessions.GuestKind)]
+        };
+        foreach (var claims in cases)
+        {
+            using var client = Client(server, SignedCookie(server, claims));
+            using (var privateRead = await client.GetAsync("/api/sessions/me"))
+            {
+                Assert.Equal(HttpStatusCode.Unauthorized, privateRead.StatusCode);
+                Assert.Equal("no-store",
+                    privateRead.Headers.CacheControl?.ToString());
+                Assert.False(privateRead.Headers.Contains("Set-Cookie"));
+            }
+
+            using (var issuance = Mutation(HttpMethod.Post, "/api/sessions/guest"))
+            using (var response = await client.SendAsync(issuance))
+            {
+                Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+                Assert.Equal("no-store",
+                    response.Headers.CacheControl?.ToString());
+                Assert.False(response.Headers.Contains("Set-Cookie"));
+            }
+
+            using (var negotiate = await client.PostAsync(
+                       "/hubs/lobbies/negotiate?negotiateVersion=1", null))
+            {
+                Assert.Equal(HttpStatusCode.Unauthorized, negotiate.StatusCode);
+            }
+        }
+
+        // A regular anonymous browser is still able to explicitly sign in.
+        using var anonymous = Client(server);
+        var (_, cookie) = await Issue(anonymous);
+        using var member = Client(server, cookie);
+        using var responseMe = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, responseMe.StatusCode);
     }
 
     [Fact]
