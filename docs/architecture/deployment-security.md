@@ -1912,6 +1912,6 @@ Il meter `Shirokuro.Api.Multiplayer` (esportato via OTLP HTTPS **solo** con opt-
 - `mutation-origin`: 403 per Origin o intento di mutazione cookie-backed non valido
 - `hub-origin`: 403 per Origin browser ostile sul trasporto SignalR
 - `lobby-body-size`: 413 per lunghezza dichiarata oltre 4096 byte in una mutazione pre-match
-- `guest-body`: 400 per body non previsto su POST/DELETE della sessione guest
+- `session-body`: 400 per body non previsto su POST/DELETE della sessione guest
 
 Non esportare mai come label IP/X-Forwarded-For, cookie, ID guest, room ID/invito, URL/path raw, header Origin, JSON o exception details. Non ci sono bucket per attore e questi contatori non sostituiscono una protezione edge/WAF. La metrica è distinta da `shirokuro.guest_mutation.decisions`, che misura le decisioni del **rate limiter** già raggiunto. Non interpreta un HTTP 401/429/503 come un rifiuto ingress e non tenta di attribuire l'origine ai singoli giocatori. L'assenza di un collector OTLP in produzione significa che questi dati non vengono trasmessi: gli allarmi esterni, le soglie, la retention e la verifica dell'edge restano responsabilità operative nella #21.

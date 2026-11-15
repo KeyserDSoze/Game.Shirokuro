@@ -96,7 +96,7 @@ public static class MultiplayerMetrics
             IngressRejectionReason.MutationOrigin => "mutation-origin",
             IngressRejectionReason.HubOrigin => "hub-origin",
             IngressRejectionReason.LobbyBodySize => "lobby-body-size",
-            IngressRejectionReason.GuestBody => "guest-body",
+            IngressRejectionReason.GuestBody => "session-body",
             _ => throw new ArgumentOutOfRangeException(nameof(reason))
         };
         IngressRejections.Add(1, new KeyValuePair<string, object?>("reason", value));
