@@ -103,6 +103,13 @@ public sealed class PreAuthenticationMutationGuardTests
         (HttpMethod.Delete, "/api/lobbies/room-00000000000000000000000000000000/membership")
     ];
 
+    private sealed class ManualDrainSignal : IReadinessDrainSignal
+    {
+        private int _stopping;
+        public bool IsDraining => Volatile.Read(ref _stopping) != 0;
+        public void Stop() => Interlocked.Exchange(ref _stopping, 1);
+    }
+
     private sealed class ReadyProbe : IDeploymentReadiness
     {
         public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
@@ -114,7 +121,7 @@ public sealed class PreAuthenticationMutationGuardTests
 
     private static WebApplicationFactory<Program> Production(
         CountingCache cache, CountingLimiter limiter, bool stubReadiness = false,
-        string? recoveryCutoff = null) =>
+        string? recoveryCutoff = null, IReadinessDrainSignal? drain = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -142,6 +149,11 @@ public sealed class PreAuthenticationMutationGuardTests
             {
                 services.RemoveAll<IGuestMutationLimiter>();
                 services.AddSingleton<IGuestMutationLimiter>(limiter);
+                if (drain is not null)
+                {
+                    services.RemoveAll<IReadinessDrainSignal>();
+                    services.AddSingleton(drain);
+                }
                 if (stubReadiness)
                 {
                     services.RemoveAll<IDeploymentReadiness>();
@@ -192,6 +204,84 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.False(response.Headers.Contains("Set-Cookie"));
         Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    [Fact]
+    public async Task DrainingLobbyHubRejectsNegotiateAndUpgradeBeforeGuestRedis()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, stubReadiness: true,
+            drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        var negotiatePath = "/hubs/lobbies/negotiate?negotiateVersion=1";
+
+        // Before shutdown a real authenticated guest may negotiate normally.
+        using (var open = await guest.PostAsync(negotiatePath, null))
+            Assert.Equal(HttpStatusCode.OK, open.StatusCode);
+        var reads = cache.Reads;
+        Assert.True(reads > 0);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        drain.Stop();
+        foreach (var (method, path) in new[]
+                 {
+                     (HttpMethod.Post, negotiatePath),
+                     (HttpMethod.Get, "/hubs/lobbies"),
+                     (HttpMethod.Post, negotiatePath)
+                 })
+        {
+            using var request = new HttpRequestMessage(method, path);
+            using var rejected = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+            Assert.Equal("no-store",
+                rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Retry-After"));
+        }
+
+        // No extra signed-cookie authority GET or quota read on shutdown.
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // Unrelated paths keep their normal 404, not a broad hub 503.
+        foreach (var path in new[]
+                 {
+                     "/hubs/lobbies-extra",
+                     "/hubs/not-a-hub",
+                     "/hubs/lobbies/unknown"
+                 })
+        {
+            using var missing = await guest.GetAsync(path);
+            Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+            Assert.Equal("no-store", missing.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(reads, cache.Reads);
+
+        // Existing liveness, readiness and public board endpoints are
+        // independent of whether the SignalR transport accepts new sockets.
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var board = await guest.GetAsync("/api/preview/board"))
+            Assert.Equal(HttpStatusCode.OK, board.StatusCode);
+        using (var ready = await guest.GetAsync("/api/ready"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+            Assert.Equal("no-store", ready.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(reads, cache.Reads);
+
+        // Actual protected API routes are NOT globally exempted during
+        // shutdown. A signed real guest still fails closed on Redis outage.
+        using var privateRead = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, privateRead.StatusCode);
+        Assert.Equal(reads + 1, cache.Reads);
     }
 
     [Fact]
