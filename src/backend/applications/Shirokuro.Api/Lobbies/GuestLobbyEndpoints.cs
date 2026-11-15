@@ -57,7 +57,8 @@ public static class GuestLobbyEndpoints
             return await Respond(async () => Results.Ok(await lobby.JoinAsync(
                 roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
-        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
+        }).WithMetadata(new CanonicalLobbyIdRequired("roomId"),
+            new Shirokuro.Api.Readiness.LobbyJoinDrainRequired());
 
         route.MapPatch("/{roomId}/hero", async (string roomId, ChooseHeroRequest request,
             HttpContext context, IHostEnvironment environment, IAsyncGuestLobby lobby) =>
