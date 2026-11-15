@@ -204,7 +204,9 @@ public sealed class PreAuthenticationMutationGuardTests
         using (var health = await anonymous.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, health.StatusCode);
         var cookie = await Issue(anonymous, "https://game.example");
-        Assert.Empty(capture.For(MultiplayerMetrics.GuestCookieAuthorityName));
+        // A process-wide MeterListener also observes independent tests.
+        // The fake cache, not the global meter queue, proves that this
+        // anonymous issuance performed no cookie authority reads.
         Assert.Equal(0, cache.Reads);
 
         using var guest = Client(server, cookie: cookie);
