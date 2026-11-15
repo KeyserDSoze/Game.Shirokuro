@@ -2336,3 +2336,87 @@ retry incerto. Il coordinamento del drain con bilanciatore, preStop,
 grace period, in-flight connections e HA resta in #21. Test xUnit
 Production TestServer con stream JSON partizionato provano questa race
 senza usare `Task.Delay`.
+
+## PreStop Linux opzionale prima di SIGTERM — #151
+
+Per i rollout orchestrati, il solo `ApplicationStopping` (SIGTERM)
+arriva **troppo tardi** per offrire al bilanciatore una finestra di
+propagazione readiness **prima** della terminazione. La #151 abilita,
+**solo su Linux e solo con opt-in esplicito**, un secondo evento trusted
+locale per `IReadinessDrainSignal`: `SIGUSR1` (numero Linux **10**).
+Non è un HTTP/SignalR endpoint amministrativo; nessun header, Origin,
+cookie o query può iniziare un drain. Per compatibilità il default è
+**disabilitato** e il comportamento di `ApplicationStopping` è invariato.
+
+Configurazione .NET in Production/Staging:
+
+```sh
+Security__PreStopDrain__EnableSigusr1=true
+```
+
+Valori ammessi **solo** `true` e `false` minuscoli (omissione = `false`).
+Una stringa non valida, l'opt-in in Development o l'opt-in fuori da Linux
+sono errori di avvio, non permissive fallback. Il segnale viene
+registrato **prima** che Kestrel accetti traffico, e smontato al
+dispose del processo.
+
+Al ricevimento di SIGUSR1, il processo intercetta/cancella il normale
+comportamento OS del segnale, si marca in drain **monotonico** e resta
+in esecuzione: `GET /api/ready` torna immediatamente **503/no-store**
+senza risolvere Redis/DP; `GET /api/health` continua 200; le nuove
+sessioni guest, creazioni/ingressi in lobby, negoziazioni SignalR e
+roster GET seguono le barriere di drain già esistenti. Logout e azioni
+autorizzate dei membri esistenti mantengono la policy corrente per
+consentire cleanup. Ripetere SIGUSR1 è idempotente. Il successivo
+SIGTERM esegue il **normale** host shutdown di ASP.NET Core.
+
+### Esempio di sequenza operatore per un pod Linux
+
+**Non** è un manifesto completo pronto per la produzione. Solo se il
+processo `dotnet Shirokuro.Api.dll` è davvero **PID 1**, l'immagine
+contiene `/bin/sh` e `kill`, e il servizio è dietro un bilanciatore
+che rispetta la readiness, un esempio di hook è:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+    - name: shirokuro-api
+      env:
+        - name: Security__PreStopDrain__EnableSigusr1
+          value: "true"
+      lifecycle:
+        preStop:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - 'kill -USR1 1 && sleep 10'
+```
+
+Prima del rollout l'operatore deve **verificare** PID, disponibilità
+della shell e il controllo di readiness configurato correttamente con
+l'allowlist Host/HTTPS/proxy già attiva. Se `dotnet` non è PID 1, non
+inviare il segnale arbitrariamente a PID 1: selezionare il PID reale in
+modo sicuro secondo il runtime dell'immagine. Il `sleep` è un esempio
+di periodo minimo per propagazione al proxy/LB, **non** una garanzia di
+svuotamento dei client. Testare tempi reali in staging; ricalibrare
+grace period per coprire **sia** preStop **sia** SIGTERM/shutdown, inclusi
+Redis persistente e connessioni in corso. Il grace countdown di
+Kubernetes comincia **prima** di preStop e SIGTERM è inviato dopo la
+conclusione dell'hook; un hook fallito può terminare il container.
+Non utilizzare un probe HTTP interno ingenuamente su `http://`:
+l'API Production richiede HTTPS effettivo e Host allowlisted anche
+sul readiness probe.
+
+### Limiti importanti
+
+SIGUSR1 non trasferisce connessioni WebSocket esistenti, non annulla
+comandi Redis Lua/CAS già iniziati e non conferma che il bilanciatore
+abbia rimosso il pod. La policy di routing, l'osservabilità, un vero
+tempo di grace misurato, l'HA multi-node e il protocollo di gestione
+di risposte incerte restano responsabilità di deployment in #21. Gli
+xUnit #151 **simulano la transizione** del callback POSIX con l'identico
+metodo in-processo, e installano in Linux la registrazione reale senza
+inviare SIGUSR1 all'intero processo di test. Una prova operativa di
+preStop+LB resta necessaria in staging.
