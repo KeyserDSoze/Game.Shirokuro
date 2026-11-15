@@ -2079,3 +2079,41 @@ upgrade senza lookup guest né quota, `404` sulle rotte non-hub,
 lifecycle Hub e sul registry verificano chiusura dei socket attivi,
 rimozione dei disconnected, registrazioni tardive abortite, shutdown
 idempotente, e race della lettura roster in volo.
+
+## Client-side recovery of the pre-match roster after failover (#143)
+
+The web client currently uses **read-only authenticated HTTP polling** on
+`GET /api/lobbies/{room}/roster/peek`, not a persistent SignalR browser
+connection. Its existing 15-second normal cadence and bounded 30/60/120s
+backoff still protect the API and shared Redis during failures.
+
+When an existing tab returns **online**, gains **focus**, or becomes
+**visible**, its single polling effect can move the next read forward
+without waiting for the remainder of an outage backoff. The wake:
+- Applies only to the **currently verified** guest and pre-match room.
+  It never signs in, issues a mutation, retries an uncertain command or
+  trusts an unverified room ID or response.
+- Requires the tab to be visible and `navigator.onLine` true, and does not
+  start any passive GET while an explicit user mutation is active.
+- Enforces at least **15 seconds since the previous passive read** (also
+  since first room display), and accepts at most **one wake hint in 30
+  seconds**; a single timer keeps the earliest scheduled deadline, so
+  bursts of focus/online/visibility events cannot create GET storms.
+- Never overlaps a read already in flight. One pending wake hint can be
+  coalesced into a later check, still respecting the 15s floor; abandoned
+  reads remain abortable on session change, room change or unmount.
+- Does **not** reset an outage counter on a hint. Only a verified 200
+  (strict member/room/revision DTO) or an authorized 304 resets backoff.
+  Confirmed 401/404 still revoke the guest/room respectively; 5xx and
+  network failures preserve the last verified view.
+
+Vitest covers the pure wake-delay/cooldown decisions including invalid
+and backwards monotonic clocks. Playwright creates a deterministic guest
+and pre-match room without spending production quota, observes a real
+browser 503, emits a burst of wake events, and proves that only one
+subsequent conditional GET adopts a verified newer revision without
+mutation replay. This is resilience for the **current HTTP implementation**,
+not a claim that browser SignalR reconnection or multi-node routing is
+implemented. Deployments still need a load-balancer grace period,
+cross-node Redis authority and an explicitly tested reconnect policy
+under #21.
