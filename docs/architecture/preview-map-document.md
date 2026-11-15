@@ -84,3 +84,25 @@ recognized, available editor action prevents browser default behavior. The
 real Playwright presses shortcuts against the terrain editor and verifies that
 a focused JSON textarea and a nested contenteditable do not alter the map.
 No guest/session/roster data is involved and no state leaves the browser.
+
+## Accessible hex selection (#138)
+
+The 3D WebGL map is a visual-only preview and cannot be the only way to
+select terrain. The selection panel now provides six natively focusable
+buttons, labelled in Italian and English, for the exact six pointy-top
+axial neighbours: east (+1,0), northeast (+1,-1), northwest (0,-1),
+west (-1,0), southwest (-1,+1), southeast (0,+1). Buttons are disabled
+if the destination would leave the validated radius-two (19-cell) board.
+The current Q/R values are announced as an ARIA live status. Keyboard
+Tab + Enter/Space controls the same selected cell as pointer clicks in
+React Three Fiber, so painting, undo/redo, reset, export and validated
+JSON import continue to use the same immutable local terrain preview.
+
+`hexNavigation.ts` implements pure bounded navigation and rejects
+non-integer or out-of-bounds coordinates; Vitest confirms all 19 preview
+hexes are reachable without escaping the board. Playwright checks the
+accessible button labels and live coordinates, keyboard activation,
+edge disabling, local paint/export on the correct tile, mobile English
+and no API mutation. These controls do **not** represent permitted
+character movement, turns, visibility or PvP match actions; official
+gameplay and authoritative maps still depend on approved design #3/#5.
