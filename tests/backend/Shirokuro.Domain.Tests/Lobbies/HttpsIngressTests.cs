@@ -76,6 +76,7 @@ public sealed class HttpsIngressTests
         {
             using var response = await http.GetAsync(path);
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
             Assert.False(response.Headers.Location is not null);
             Assert.False(response.Headers.Contains("Strict-Transport-Security"));
         }

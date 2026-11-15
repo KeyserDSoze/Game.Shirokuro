@@ -97,6 +97,8 @@ public static class MultiplayerMetrics
             IngressRejectionReason.HubOrigin => "hub-origin",
             IngressRejectionReason.LobbyBodySize => "lobby-body-size",
             IngressRejectionReason.GuestBody => "session-body",
+            IngressRejectionReason.Host => "host",
+            IngressRejectionReason.Transport => "transport",
             _ => throw new ArgumentOutOfRangeException(nameof(reason))
         };
         IngressRejections.Add(1, new KeyValuePair<string, object?>("reason", value));
@@ -253,7 +255,9 @@ public enum IngressRejectionReason
     MutationOrigin,
     HubOrigin,
     LobbyBodySize,
-    GuestBody
+    GuestBody,
+    Host,
+    Transport
 }
 
 /// <summary>Finite technical readiness probe phase; never error text.</summary>

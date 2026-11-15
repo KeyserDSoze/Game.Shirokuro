@@ -162,6 +162,7 @@ public sealed class IngressHostPolicyTests
                 using var request = Request(HttpMethod.Get, path, host);
                 using var rejected = await client.SendAsync(request);
                 Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+                Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
                 Assert.False(rejected.Headers.Contains("Set-Cookie"));
             }
         }
@@ -264,6 +265,7 @@ public sealed class IngressHostPolicyTests
 
         var rejected = await Send("evil.example", "game.example");
         Assert.Equal(400, rejected.Response.StatusCode);
+        Assert.Equal("no-store", rejected.Response.Headers.CacheControl.ToString());
 
         // The trusted proxy is allowed to report the client IP/scheme but
         // must not overwrite a valid Host with its forwarded host value.

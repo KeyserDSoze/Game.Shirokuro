@@ -251,7 +251,11 @@ app.Use(async (context, next) =>
         .GetRequiredService<IOptions<IngressHostPolicyOptions>>().Value.Policy;
     if (!policy.Allows(context.Request))
     {
+        // The supplied Host is untrusted: never use its value as an OTLP
+        // dimension or let this 400 be cached by a browser/proxy.
+        context.Response.Headers.CacheControl = "no-store";
         context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         return;
     }
     await next(context);
@@ -269,6 +273,10 @@ if (!app.Environment.IsDevelopment())
         {
             context.Response.Headers.CacheControl = "no-store";
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            // Read the scheme only after the trusted proxy hop. Never
+            // include raw X-Forwarded-Proto as a metric dimension.
+            MultiplayerMetrics.RecordIngressRejection(
+                IngressRejectionReason.Transport);
             return;
         }
         await next(context);

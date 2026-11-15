@@ -293,7 +293,7 @@ public sealed class MultiplayerMetricsTests
         var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "session-body" })
+                   "lobby-body-size", "session-body", "host", "transport" })
             Assert.Contains(ingress, m => m.Tags["reason"] == reason && m.Value == 1);
         Assert.All(ingress, measurement =>
         {
@@ -301,7 +301,7 @@ public sealed class MultiplayerMetricsTests
             Assert.Equal(new[] { "reason" }, measurement.Tags.Keys);
             Assert.Contains(measurement.Tags["reason"],
                 new[] { "room-id", "mutation-origin", "hub-origin",
-                         "lobby-body-size", "session-body" });
+                         "lobby-body-size", "session-body", "host", "transport" });
         });
 
         Assert.Contains(capture.For(MultiplayerMetrics.MutationDecisionsName),
@@ -355,7 +355,8 @@ public sealed class MultiplayerMetricsTests
                         "unavailable" or "ready" or "success" or "failure",
                     "mode" => value is "local" or "redis",
                     "reason" => value is "room-id" or "mutation-origin" or
-                        "hub-origin" or "lobby-body-size" or "session-body",
+                        "hub-origin" or "lobby-body-size" or "session-body" or
+                        "host" or "transport",
                     "client" => value is "lobby" or "session",
                     "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
@@ -375,6 +376,28 @@ public sealed class MultiplayerMetricsTests
         using var server = Production(limiter);
         using var client = Client(server, production: true);
         using var capture = new MultiplayerMetricCapture();
+
+        // Invalid Host wins over plaintext; it is exactly one rejection,
+        // before cookie auth, quota, or any other metadata guard.
+        using (var badHost = new HttpRequestMessage(
+                   HttpMethod.Get, "http://game.example/api/health"))
+        {
+            badHost.Headers.Host = "evil.example";
+            using var denied = await client.SendAsync(badHost);
+            Assert.Equal(HttpStatusCode.BadRequest, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+
+        // Plaintext with a valid Host has its own fixed reason.
+        using (var plaintext = new HttpRequestMessage(
+                   HttpMethod.Get, "http://game.example/api/health"))
+        using (var denied = await client.SendAsync(plaintext))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
 
         // Impossible room IDs are rejected before cookie auth and Redis.
         using (var invalidRoom = await client.GetAsync(
@@ -425,7 +448,7 @@ public sealed class MultiplayerMetricsTests
         var readings = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "session-body" })
+                   "lobby-body-size", "session-body", "host", "transport" })
             Assert.Contains(readings, o => o.Value == 1 &&
                 o.Tags.Count == 1 && o.Tags["reason"] == reason);
 
