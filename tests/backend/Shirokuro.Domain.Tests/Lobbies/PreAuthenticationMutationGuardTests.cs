@@ -351,7 +351,9 @@ public sealed class PreAuthenticationMutationGuardTests
                        $"/api/lobbies/{roomId}/roster")))
         {
             Assert.Equal(HttpStatusCode.MethodNotAllowed, wrongMethod.StatusCode);
-            Assert.Contains("GET", wrongMethod.Headers.Allow);
+            Assert.True(wrongMethod.Headers.TryGetValues("Allow", out var allowed));
+            Assert.Contains(allowed, value => value.Contains(
+                "GET", StringComparison.OrdinalIgnoreCase));
         }
         Assert.Equal(reads, cache.Reads);
 
