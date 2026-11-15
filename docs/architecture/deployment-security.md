@@ -2221,3 +2221,30 @@ già entrate nel server prima dello shutdown: questa barriera agisce
 sull'arrivo della richiesta, non annulla transazioni già in-flight.
 xUnit Development/Production coprono gli endpoint, cookie guest
 firmato, quota Redis, error precedence e logout. #21 resta aperta.
+
+## Drain degli ingressi in stanza pre-partita (#147)
+
+La policy di admission in shutdown descritta in #146 ora include anche
+`POST /api/lobbies/{roomId}/join`. Questo è un **nuovo ingresso** di
+partecipante, non una modifica di un membro esistente: un nodo che ha
+ricevuto `ApplicationStopping` non può più confermare nuove membership
+di stanza. Il solo endpoint join ha il metadata server-owned
+`LobbyJoinDrainRequired`. Con il segnale host `IReadinessDrainSignal`,
+il guard pre-auth risponde `503`, `Cache-Control: no-store` senza
+`Set-Cookie`, `Retry-After`, roster o dettagli Redis, prima di qualunque
+verifica cookie/registry o lookup lobby. Non esiste un parametro URL/header
+per attivare o disattivare questo comportamento.
+
+Le validation di routing e canonical room ID precedono il drain (404/405),
+come Origin/intent, body-size e Content-Type (403/413/415). La quota per
+creazione stanza e la quota per session issuance rimangono quelle di #146.
+Una PATCH hero/team, il DELETE membership e il logout guest **non sono
+nuove ammissioni** e conservano autenticazione, privacy e possibilità di
+cleanup nel drain. Restano indipendenti i controlli GET roster e SignalR
+(#145/#142). xUnit con guest guest reale su TestServer Production/Development
+esercita queste distinzioni.
+
+La barriera protegge le richieste arrivate **dopo** lo stop: non offre
+atomicità col CAS Redis di un join già avviato. Un deploy in produzione
+necessita di preStop e grace period orchestrati, retry client senza
+duplicare intenti e gestione dei socket multi-nodo (#21).
