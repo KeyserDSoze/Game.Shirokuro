@@ -285,6 +285,91 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task DrainingHttpRosterReadsReturn503BeforeSignedGuestRedisLookup()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, stubReadiness: true,
+            drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+
+        // The actual canonical signed guest still authenticates normally.
+        using (var active = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+        var reads = cache.Reads;
+        Assert.True(reads > 0);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // Drain and Redis loss together: the *route-owned* pre-auth fence
+        // must respond before even checking the attached valid guest cookie.
+        cache.Unavailable = true;
+        drain.Stop();
+        const string roomId = "room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        foreach (var path in new[]
+                 {
+                     $"/api/lobbies/{roomId}/roster",
+                     $"/api/lobbies/{roomId}/roster/peek",
+                     $"/api/lobbies/{roomId}/roster/peek"
+                 })
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, path);
+            request.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-3\"");
+            using var rejected = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("ETag"));
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Retry-After"));
+            var payload = await rejected.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("participants", payload,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(roomId, payload, StringComparison.Ordinal);
+        }
+        // No Redis registry lookups, session writes or rate limit allowance
+        // consumed for any shutdown read, even with a stolen signed cookie.
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // The normal framework/route guards remain authoritative.
+        using (var invalid = await guest.GetAsync("/api/lobbies/invalid/roster"))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, invalid.StatusCode);
+            Assert.Equal("no-store", invalid.Headers.CacheControl?.ToString());
+        }
+        using (var unknown = await guest.GetAsync("/api/lobbies/not-a-route"))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+            Assert.Equal("no-store", unknown.Headers.CacheControl?.ToString());
+        }
+        using (var wrongMethod = await guest.SendAsync(
+                   new HttpRequestMessage(HttpMethod.Put,
+                       $"/api/lobbies/{roomId}/roster")))
+        {
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, wrongMethod.StatusCode);
+            Assert.Contains("GET", wrongMethod.Headers.Allow);
+        }
+        Assert.Equal(reads, cache.Reads);
+
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var ready = await guest.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+        Assert.Equal(reads, cache.Reads);
+
+        // Shutdown does not exempt actual protected non-roster endpoints
+        // from authoritative Redis guest validation during an outage.
+        using var identity = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, identity.StatusCode);
+        Assert.Equal(reads + 1, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
     public async Task UnsupportedSignedCookieFailsClosedBeforeRedisEvenDuringOutage()
     {
         var cache = new CountingCache();
