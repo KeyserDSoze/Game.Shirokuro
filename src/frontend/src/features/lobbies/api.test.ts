@@ -318,7 +318,7 @@ describe('bounded authenticated lobby HTTP requests (#123)', () => {
     const rejected = expect(pending).rejects.toThrow('Lobby request timed out')
     await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS)
     await rejected
-    expect((mocked.mock.calls[0][1] as RequestInit).signal.aborted).toBe(true)
+    expect((mocked.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true)
     expect(mocked).toHaveBeenCalledOnce()
   })
 
