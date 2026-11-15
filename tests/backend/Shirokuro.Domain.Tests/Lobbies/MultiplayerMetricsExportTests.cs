@@ -173,9 +173,12 @@ public sealed class MultiplayerMetricsExportTests
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Transport);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.LobbyMediaType);
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.UnknownApiRoute);
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.MethodNotAllowed);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Active);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Unavailable);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.RecoveryCutoff);
+        MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.UnsupportedTicket);
         MultiplayerMetrics.RecordReadinessDuration(
             true, ReadinessProbeStage.Success, 0.12);
         MultiplayerMetrics.RecordReadinessDuration(
@@ -218,6 +221,9 @@ public sealed class MultiplayerMetricsExportTests
         Assert.Contains("transport", payload);
         Assert.Contains("host", payload);
         Assert.Contains("lobby-media-type", payload);
+        Assert.Contains("unknown-route", payload);
+        Assert.Contains("method-not-allowed", payload);
+        Assert.Contains("unsupported-ticket", payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectionEventsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisReplicationObservationsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectedReplicasName, payload);
