@@ -781,6 +781,18 @@ public sealed class PreAuthenticationMutationGuardTests
         Assert.Equal(0, cache.Reads);
         Assert.Equal(1, limiter.Calls);
 
+        // The framework 415 fallback must not bypass canonical room-ID
+        // validation even when both fields are invalid.
+        using (var badRoom = Mutation(HttpMethod.Post,
+                   "/api/lobbies/not-a-room/join", "https://game.example"))
+        {
+            badRoom.Content = new StringContent("{}", Encoding.UTF8, "text/plain");
+            using var denied = await guest.SendAsync(badRoom);
+            Assert.Equal(HttpStatusCode.NotFound, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(0, cache.Reads);
+
         // Both JSON media types must pass this syntactic guard. Redis is
         // intentionally unavailable, so existing auth fails closed at 503.
         foreach (var contentType in new[]

@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http.Features;
+using Shirokuro.Api.Lobbies;
 
 namespace Shirokuro.Api.Security;
 
@@ -49,5 +50,60 @@ public static class GuestLobbyMutationMediaTypeGuard
         ArgumentNullException.ThrowIfNull(context);
         return !context.Request.Headers.ContainsKey("Content-Type") ||
                context.Request.HasJsonContentType();
+    }
+
+    /// <summary>
+    /// ASP.NET Core's AcceptsMatcherPolicy can replace a JSON DTO endpoint
+    /// with a synthetic 415 *during routing*. Its endpoint metadata is then
+    /// lost, BEFORE the usual pre-auth metadata guard can reject the media
+    /// type. Recognize that exact framework rejection on ONLY the five
+    /// server-defined JSON lobby methods. This never grants authorization.
+    ///
+    /// Return an invalid room ID flag so canonical 404 still precedes 415.
+    /// All path strings are used only to identify the framework fallback,
+    /// never exported as metric labels or trusted as a guest identity.
+    /// </summary>
+    public static bool IsFrameworkUnsupportedLobbyRoute(
+        HttpContext context, out bool invalidRoomId)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        invalidRoomId = false;
+        if (!string.Equals(context.GetEndpoint()?.DisplayName,
+                "415 HTTP Unsupported Media Type", StringComparison.Ordinal) ||
+            !context.Request.Headers.ContainsKey("Content-Type") ||
+            Allows(context))
+            return false;
+
+        var path = context.Request.Path.Value?.TrimEnd('/');
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        if (HttpMethods.IsPost(context.Request.Method) &&
+            string.Equals(path, "/api/lobbies", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        const string prefix = "/api/lobbies/";
+        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+        var tail = path.AsSpan(prefix.Length);
+        var separator = tail.IndexOf('/');
+        if (separator < 0)
+            return false;
+        var room = tail[..separator];
+        var action = tail[(separator + 1)..];
+
+        var method = context.Request.Method;
+        var isKnown = (HttpMethods.IsPost(method) &&
+                       action.Equals("join".AsSpan(), StringComparison.OrdinalIgnoreCase)) ||
+                      (HttpMethods.IsPatch(method) &&
+                       (action.Equals("hero".AsSpan(), StringComparison.OrdinalIgnoreCase) ||
+                        action.Equals("team".AsSpan(), StringComparison.OrdinalIgnoreCase))) ||
+                      (HttpMethods.IsDelete(method) &&
+                       action.Equals("membership".AsSpan(), StringComparison.OrdinalIgnoreCase));
+        if (!isKnown)
+            return false;
+
+        invalidRoomId = !CanonicalLobbyId.IsValid(room.ToString());
+        return true;
     }
 }

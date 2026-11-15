@@ -314,6 +314,43 @@ if (app.Environment.IsDevelopment())
 app.Use(async (context, next) =>
 {
     var metadata = context.GetEndpoint()?.Metadata;
+
+    // The framework's AcceptsMatcherPolicy creates a synthetic 415 during
+    // routing when a JSON DTO route receives an explicit non-JSON media type.
+    // Its replacement endpoint has NONE of the original route metadata:
+    // intercept only that verified framework 415 for our five known lobby
+    // methods, before automatic cookie Redis auth can run. Normal JSON
+    // requests continue through the metadata-owned guards below.
+    if (GuestLobbyMutationMediaTypeGuard.IsFrameworkUnsupportedLobbyRoute(
+            context, out var invalidFallbackRoomId))
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        if (invalidFallbackRoomId)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.RoomId);
+        }
+        else if (!WebMutationGuard.Allows(context, app.Environment))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            MultiplayerMetrics.RecordIngressRejection(
+                IngressRejectionReason.MutationOrigin);
+        }
+        else if (!GuestLobbyMutationBodyLimit.TryApply(context))
+        {
+            context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+            MultiplayerMetrics.RecordIngressRejection(
+                IngressRejectionReason.LobbyBodySize);
+        }
+        else
+        {
+            context.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
+            MultiplayerMetrics.RecordIngressRejection(
+                IngressRejectionReason.LobbyMediaType);
+        }
+        return;
+    }
+
     var roomGuard = metadata?.GetMetadata<CanonicalLobbyIdRequired>();
     if (roomGuard is not null &&
         (!context.Request.RouteValues.TryGetValue(roomGuard.RouteParameter, out var raw) ||
