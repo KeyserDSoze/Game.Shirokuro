@@ -18,6 +18,7 @@ import {
   classifyTerrainHistoryShortcut, TERRAIN_HISTORY_EDITABLE_SELECTOR,
 } from '@/game/terrainHistoryShortcuts'
 import type { HexCoordinate } from '@/game/hex'
+import { previewHexDirections, stepPreviewHex } from '@/game/hexNavigation'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 
@@ -156,16 +157,37 @@ export default function App() {
               <CardDescription>{t('selectionHint')}</CardDescription>
             </CardHeader>
             <CardContent>
-              <div data-testid="selected-hex" className="grid grid-cols-2 gap-3">
+              <div data-testid="selected-hex" role="status" aria-live="polite" aria-label={t('selection')} className="grid grid-cols-2 gap-3">
                 <div className="rounded-lg bg-secondary p-3">
                   <span className="block text-xs text-muted-foreground">Q</span>
-                  <span className="text-2xl font-bold tabular-nums">{selected.q}</span>
+                  <span data-testid="selected-q" className="text-2xl font-bold tabular-nums">{selected.q}</span>
                 </div>
                 <div className="rounded-lg bg-secondary p-3">
                   <span className="block text-xs text-muted-foreground">R</span>
-                  <span className="text-2xl font-bold tabular-nums">{selected.r}</span>
+                  <span data-testid="selected-r" className="text-2xl font-bold tabular-nums">{selected.r}</span>
                 </div>
               </div>
+              <div role="group" aria-label={t('hexNavigationTitle')} data-testid="hex-navigation" className="mt-4 grid grid-cols-2 gap-2">
+                {previewHexDirections.map(direction => {
+                  const next = stepPreviewHex(selected, direction.id)
+                  return (
+                    <Button
+                      key={direction.id}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-auto min-h-9 whitespace-normal text-xs"
+                      data-testid={`hex-nav-${direction.id}`}
+                      aria-label={t(direction.labelKey)}
+                      disabled={next === null}
+                      onClick={() => { if (next !== null) setSelected(next) }}
+                    >
+                      {t(direction.labelKey)}
+                    </Button>
+                  )
+                })}
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">{t('hexNavigationHint')}</p>
             </CardContent>
           </Card>
           <TerrainEditor
