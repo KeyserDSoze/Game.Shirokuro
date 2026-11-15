@@ -426,6 +426,19 @@ app.Use(async (context, next) =>
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.RoomId);
         return;
     }
+    // During ApplicationStopping, real member-only HTTP roster reads
+    // become unavailable BEFORE authenticating a cookie in Redis. Only the
+    // two GET endpoints own this trusted routing marker; invalid lobby IDs
+    // already returned 404 and method mismatches retain their real 405.
+    if (metadata?.GetMetadata<LobbyRosterReadDrainRequired>() is not null &&
+        context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
+            .IsDraining)
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        return;
+    }
+
     if ((metadata?.GetMetadata<WebMutationGuardRequired>() is not null &&
             !WebMutationGuard.Allows(context, app.Environment)) ||
         (metadata?.GetMetadata<CookieSocketOriginGuardRequired>() is not null &&
@@ -824,6 +837,9 @@ static async Task<IResult> ServeGuestRosterAsync(
     IAsyncGuestLobby lobby, bool heartbeat)
 {
     context.Response.Headers.CacheControl = "no-store";
+    var drain = context.RequestServices.GetRequiredService<IReadinessDrainSignal>();
+    if (drain.IsDraining)
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     var trustedPlayerId = AuthenticatedPlayerIdentity.FromPrincipal(user);
     if (trustedPlayerId is null)
         return Results.Forbid();
@@ -833,6 +849,12 @@ static async Task<IResult> ServeGuestRosterAsync(
         var roster = heartbeat
             ? await lobby.ForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted)
             : await lobby.PeekForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted);
+        // A node may start shutdown while a guest/room read is awaiting
+        // Redis. Never publish a 200/304 body or ETag from that in-flight
+        // result once the host is draining, even when the snapshot was
+        // otherwise member-authorized.
+        if (drain.IsDraining)
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         // A revision is merely a representation validator, never proof
         // of guest identity or room membership. Both checks above MUST run
         // before considering any conditional response.
@@ -874,14 +896,16 @@ app.MapGet("/api/lobbies/{lobbyId}/roster",
     (string lobbyId, ClaimsPrincipal user, HttpContext context, IAsyncGuestLobby lobby) =>
         ServeGuestRosterAsync(lobbyId, user, context, lobby, heartbeat: true))
     .RequireAuthorization()
-    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"));
+    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"),
+        new LobbyRosterReadDrainRequired());
 
 // Automatic 15-second polling uses a separate member-only, non-renewing GET.
 app.MapGet("/api/lobbies/{lobbyId}/roster/peek",
     (string lobbyId, ClaimsPrincipal user, HttpContext context, IAsyncGuestLobby lobby) =>
         ServeGuestRosterAsync(lobbyId, user, context, lobby, heartbeat: false))
     .RequireAuthorization()
-    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"));
+    .WithMetadata(new CanonicalLobbyIdRequired("lobbyId"),
+        new LobbyRosterReadDrainRequired());
 
 // Server-owned guest room mutations, with CSRF and revision controls.
 app.MapGuestLobbyEndpoints();
