@@ -2248,3 +2248,32 @@ La barriera protegge le richieste arrivate **dopo** lo stop: non offre
 atomicità col CAS Redis di un join già avviato. Un deploy in produzione
 necessita di preStop e grace period orchestrati, retry client senza
 duplicare intenti e gestione dei socket multi-nodo (#21).
+
+## Seconda barriera ingressi dopo autenticazione/limiter (#148)
+
+La barriera pre-auth di #146/#147 non basta per richieste già passate
+quando il nodo era `ready`: la validazione di cookie Redis o l'acquisizione
+di una quota IP può completarsi **dopo** l'inizio dello shutdown. Un secondo
+middleware, posizionato **dopo** autenticazione/autorizzazione e limitatori
+ma **prima** degli handler, ricontrolla l'indicatore server-owned
+`IReadinessDrainSignal`, usando gli stessi marker verificati da
+`IsNewGuestAdmission`: POST `/api/sessions/guest`, POST `/api/lobbies`,
+POST `/api/lobbies/{roomId}/join`.
+
+Il fence restituisce 503 con `Cache-Control: no-store`, senza cookie
+nuovo, ETag, `Retry-After` o rappresentazione privata. La **prima**
+barriera conserva la priorità di 404/405, Origin/intent, body-size,
+Content-Type, canonical room ID, e nega le richieste iniziate già in
+shutdown prima che autenticazione e Redis possano spendere risorse.
+La seconda barriera intercetta richieste sospese nelle operazioni auth
+o limiter: queste ultime **possono già avere consumato una quota**; la
+risposta 503 non implica che Redis abbia rimborsato un permesso.
+
+Sono volutamente esclusi logout, leave, hero/team e cleanup, oltre a
+health, readiness, roster e Hub che hanno policy dedicate. Nuovi test
+xUnit Production TestServer guidano la race con gate asincroni, senza
+sleep: permesso sessione, permesso creazione stanza, validazione cookie
+per join. Non si promette un rollback dei comandi che hanno **già
+iniziato** una scrittura Redis o un CAS di lobby prima di
+`ApplicationStopping`: per questo servono load balancer preStop,
+grace period, gestione delle risposte incerte e HA (#21).
