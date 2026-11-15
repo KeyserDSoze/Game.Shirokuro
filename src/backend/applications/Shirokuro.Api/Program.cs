@@ -272,6 +272,17 @@ if (builder.Environment.IsDevelopment())
 }
 
 var app = builder.Build();
+// The only three new guest admissions. Reuse the same trusted endpoint
+// metadata in BOTH ingress fences; never inspect client-controlled paths,
+// headers, query parameters or claims to select the shutdown policy.
+static bool IsNewGuestAdmission(HttpContext context)
+{
+    var metadata = context.GetEndpoint()?.Metadata;
+    return metadata?.GetMetadata<GuestMutationRateLimit>() is
+               { Kind: GuestMutationKind.SessionIssuance or GuestMutationKind.RoomCreation } ||
+           metadata?.GetMetadata<LobbyJoinDrainRequired>() is not null;
+}
+
 // Must precede CORS, authentication and the per-IP rate limiter.
 // Without trusted proxies, ForwardedHeaders.None consumes nothing.
 app.UseForwardedHeaders();
@@ -498,9 +509,7 @@ app.Use(async (context, next) =>
     // draining node must not accept a new participant for a room it may
     // immediately abandon. Leave, hero/team changes, logout and cleanup
     // preserve their original authorization and revocation semantics.
-    if ((metadata?.GetMetadata<GuestMutationRateLimit>() is
-             { Kind: GuestMutationKind.SessionIssuance or GuestMutationKind.RoomCreation } ||
-         metadata?.GetMetadata<LobbyJoinDrainRequired>() is not null) &&
+    if (IsNewGuestAdmission(context) &&
         context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
             .IsDraining)
     {
@@ -601,6 +610,26 @@ if (app.Environment.IsDevelopment())
         await next(context);
     });
 }
+
+// The first, pre-auth fence catches requests that ARRIVE during drain.
+// A request already inside guest Redis cookie validation or the distributed
+// admission limiter can cross ApplicationStopping during that awaited work.
+// Recheck the SAME three trusted admission markers after auth/limiting but
+// BEFORE their endpoint handlers mutate guest/session/lobby state. This is
+// intentionally not a transaction with Redis CAS or already-started writes.
+// Do not block existing-member operations, logout, probes or roster routes.
+app.Use(async (context, next) =>
+{
+    if (IsNewGuestAdmission(context) &&
+        context.RequestServices.GetRequiredService<IReadinessDrainSignal>()
+            .IsDraining)
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        return;
+    }
+    await next(context);
+});
 
 // Liveness is intentionally independent of Redis, the key ring and guests.
 // Never allow a browser/proxy/monitor to reuse an old positive probe after
