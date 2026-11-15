@@ -6,7 +6,7 @@ import {
   LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS,
   classifyConflictRosterRefresh, classifyRosterPollFailure,
   isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
-  rosterCanHonorResumeHint, rosterResumeDelayMs,
+  rosterCanHonorResumeHint, rosterResumeDelayMs, nextRosterSyncStatus,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -144,6 +144,42 @@ describe('pre-match authenticated lobby polling', () => {
     expect(rosterResumeDelayMs(0, 120_000)).toBe(0)
     // Waking can advance the next check, but does not grant a session,
     // mutate a room or classify an outage as confirmation of membership.
+  })
+
+  it('marks the last verified roster stale on outage, bad DTO and lagging server', () => {
+    for (const evidence of ['outage', 'invalid', 'older'] as const) {
+      expect(nextRosterSyncStatus('current', evidence)).toBe('stale')
+      expect(nextRosterSyncStatus('stale', evidence)).toBe('stale')
+    }
+    // A 503/429/fetch failure is not evidence that the user was revoked.
+    for (const status of [429, 502, 503, 504, undefined]) {
+      expect(classifyRosterPollFailure(status)).toBe('retain')
+    }
+    expect(reconcilePolledRoster(roster(7), roster(6), alice.playerId))
+      .toBe('unchanged')
+    // A stale 200 must never replace the locally newer revision.
+    expect(roster(7).revision).toBeGreaterThan(roster(6).revision)
+  })
+
+  it('clears the freshness warning only after an authorized 304 or verified same/newer 200', () => {
+    expect(nextRosterSyncStatus('stale', 'verified')).toBe('current')
+    expect(nextRosterSyncStatus('current', 'verified')).toBe('current')
+    for (const evidence of ['outage', 'invalid', 'older'] as const) {
+      expect(nextRosterSyncStatus(
+        nextRosterSyncStatus('current', evidence), 'verified')).toBe('current')
+    }
+    expect(isVerifiedLobbyRoster(roster(8), alice.playerId, lobbyId, 7)).toBe(true)
+    expect(reconcilePolledRoster(roster(7), roster(8), alice.playerId))
+      .toBe('updated')
+    expect(reconcilePolledRoster(roster(7), roster(7), alice.playerId))
+      .toBe('unchanged')
+  })
+
+  it('pause or abort alone never changes roster freshness or interprets a guest logout', () => {
+    expect(nextRosterSyncStatus('stale', 'paused')).toBe('stale')
+    expect(nextRosterSyncStatus('current', 'paused')).toBe('current')
+    expect(classifyRosterPollFailure(401)).toBe('expired')
+    expect(classifyRosterPollFailure(404)).toBe('missing')
   })
 
   it('backs off on transient errors, caps retry delay and resets after success', () => {
