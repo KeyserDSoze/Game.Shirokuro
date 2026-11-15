@@ -807,6 +807,73 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task UnmatchedApiAndHubPathsRejectBeforeSignedGuestCookieRedisLookup()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        // Routing has no endpoint for any of these namespace-bound paths.
+        // The explicit non-JSON body must not turn a missing route into the
+        // synthetic 415 fallback reserved for five actual DTO commands.
+        foreach (var path in new[]
+                 {
+                     "/api",
+                     "/api/not-a-route",
+                     "/API/NOT-A-ROUTE",
+                     "/api/lobbies/not-a-room/join/extra",
+                     "/hubs/not-a-hub"
+                 })
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, path);
+            using var missing = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+            Assert.Equal("no-store", missing.Headers.CacheControl?.ToString());
+            Assert.False(missing.Headers.Contains("Set-Cookie"));
+            Assert.False(missing.Headers.Contains("Retry-After"));
+        }
+
+        using (var request = Mutation(
+                   HttpMethod.Post, "/api/lobbies/not-a-room/join/extra",
+                   "https://game.example"))
+        {
+            request.Content = new StringContent(
+                "{}", Encoding.UTF8, "text/plain");
+            using var missing = await guest.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+            Assert.Equal("no-store", missing.Headers.CacheControl?.ToString());
+            Assert.False(missing.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // Only a real, authorized API route asks the Redis-backed cookie
+        // authority; it must remain fail-closed during the same outage.
+        using (var protectedRead = await guest.GetAsync("/api/sessions/me"))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                protectedRead.StatusCode);
+            Assert.Equal("no-store",
+                protectedRead.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(1, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = false;
+        using var restored = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, restored.StatusCode);
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+    }
+
+    [Fact]
     public async Task NonJsonContentTypeOnReadEndpointsDoesNotTriggerLobbyFallback()
     {
         var cache = new CountingCache();
