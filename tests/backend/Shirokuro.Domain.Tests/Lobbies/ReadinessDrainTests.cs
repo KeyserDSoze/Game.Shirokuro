@@ -58,7 +58,7 @@ public sealed class ReadinessDrainTests
     }
 
     private static WebApplicationFactory<Program> Host(
-        string environment, ManualDrain drain,
+        string environment, IReadinessDrainSignal drain,
         Action<IServiceCollection> configureReadiness) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
@@ -118,6 +118,140 @@ public sealed class ReadinessDrainTests
         lifetime.StopApplication();
         Assert.True(signal.IsDraining);
         Assert.True(signal.IsDraining);
+    }
+
+    [Fact]
+    public void PreStopIsMonotonicAndDoesNotTriggerHostShutdown()
+    {
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        Assert.False(signal.IsDraining);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+
+        signal.BeginPreStopDrain();
+        Assert.True(signal.IsDraining);
+        // The orchestrator can let the LB remove this node while it stays
+        // alive. SIGTERM/ApplicationStopping is still a separate phase.
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        signal.BeginPreStopDrain(); // Safe if preStop is delivered twice.
+        Assert.True(signal.IsDraining);
+        lifetime.StopApplication();
+        Assert.True(signal.IsDraining);
+    }
+
+    [Theory]
+    [InlineData("yes")]
+    [InlineData("TRUE")]
+    [InlineData("1")]
+    [InlineData(" ")]
+    public void InvalidPreStopOptionAlwaysFailsClosed(string malformed)
+    {
+        using var lifetime = new FakeLifetime();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [HostLifetimeReadinessDrainSignal.EnablePreStopSignalKey] =
+                    malformed
+            }).Build();
+        Assert.Throws<InvalidOperationException>(() =>
+            new HostLifetimeReadinessDrainSignal(lifetime, configuration));
+    }
+
+    [Fact]
+    public void OptInLinuxSignalCanBeInstalledWithoutStoppingTheHost()
+    {
+        using var lifetime = new FakeLifetime();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [HostLifetimeReadinessDrainSignal.EnablePreStopSignalKey] =
+                    "true"
+            }).Build();
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Throws<PlatformNotSupportedException>(() =>
+                new HostLifetimeReadinessDrainSignal(lifetime, configuration));
+            return;
+        }
+
+        // Register the same real POSIX handler that the host installs during
+        // startup. Do not send a global signal to the xUnit test process.
+        using var signal = new HostLifetimeReadinessDrainSignal(
+            lifetime, configuration);
+        Assert.False(signal.IsDraining);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        signal.BeginPreStopDrain(); // The POSIX callback's only transition.
+        Assert.True(signal.IsDraining);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Theory]
+    [InlineData("Development")]
+    [InlineData("Production")]
+    public async Task EarlyPreStopTurnsOffReadinessAndAdmissionButKeepsHostAlive(
+        string environment)
+    {
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var readiness = new ManualReadiness();
+        using var server = Host(environment, signal, services =>
+            services.AddSingleton<IDeploymentReadiness>(readiness));
+        using var client = Client(server, environment);
+
+        using (var ready = await client.GetAsync("/api/ready"))
+            await AssertReadyResponse(ready, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, readiness.Calls);
+
+        signal.BeginPreStopDrain();
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        using (var draining = await client.GetAsync("/api/ready"))
+            await AssertReadyResponse(draining,
+                HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(1, readiness.Calls); // Not a new Redis/keyring probe.
+
+        using var post = new HttpRequestMessage(HttpMethod.Post,
+            "/api/sessions/guest");
+        post.Headers.TryAddWithoutValidation("Origin", environment ==
+            "Production" ? "https://game.example" : "http://localhost");
+        post.Headers.TryAddWithoutValidation(
+            "X-Shirokuro-Request", "1");
+        using var rejected = await client.SendAsync(post);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+        Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+        Assert.False(rejected.Headers.Contains("Set-Cookie"));
+        Assert.False(rejected.Headers.Contains("Retry-After"));
+        Assert.False(rejected.Headers.Contains("Location"));
+        using var health = await client.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Theory]
+    [InlineData("Development")]
+    [InlineData("Production")]
+    public async Task EarlyPreStopWinsAgainstInFlightReadinessDependency(
+        string environment)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var readiness = new ManualReadiness(completion.Task);
+        using var server = Host(environment, signal, services =>
+            services.AddSingleton<IDeploymentReadiness>(readiness));
+        using var client = Client(server, environment);
+        var pending = client.GetAsync("/api/ready");
+        await readiness.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        signal.BeginPreStopDrain();
+        completion.SetResult(true);
+        using (var denied = await pending.WaitAsync(TimeSpan.FromSeconds(10)))
+            await AssertReadyResponse(denied,
+                HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(1, readiness.Calls);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        using var health = await client.GetAsync("/api/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
     }
 
     [Theory]
