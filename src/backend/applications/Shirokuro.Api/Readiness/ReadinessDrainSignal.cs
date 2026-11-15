@@ -18,7 +18,7 @@ public interface IReadinessDrainSignal
 /// endpoint metadata (not a URL prefix) prevents a draining node from
 /// changing unknown paths or framework 405 replies into misleading 503s.
 /// </summary>
-public sealed class LobbyRosterReadDrainRequired;
+public sealed class LobbyRosterReadDrainRequired { }
 
 /// <summary>
 /// Once ApplicationStopping is cancelled, this node must not advertise ready.
