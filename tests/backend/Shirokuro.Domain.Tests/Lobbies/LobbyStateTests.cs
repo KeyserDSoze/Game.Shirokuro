@@ -152,7 +152,7 @@ public sealed class LobbyStateTests
         Assert.Equal("white", original.Participants[0].TeamId);
         Assert.Null(original.Participants[0].HeroId);
         Assert.Equal(2, original.Participants.Count);
-        Assert.Equal(1, left.Participants.Count);
+        Assert.Single(left.Participants);
     }
 
     [Fact]
