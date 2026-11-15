@@ -1392,3 +1392,58 @@ test('an explicit pre-match action aborts a stalled passive GET without revoking
   expect(mutations).toBe(1)
   expect((await pollStats()).started).toBe(1) // no immediate retry
 })
+
+
+test('hung lobby creation times out, unlocks controls and never replays a mutation (#123)', async ({ page }) => {
+  test.setTimeout(45_000)
+  const actor = 'guest-' + 'a'.repeat(32)
+  let loggedIn = false
+  let issuance = 0
+  await page.route('**/api/sessions/me', route =>
+    route.fulfill(loggedIn
+      ? { status: 200, json: { kind: 'guest', playerId: actor } }
+      : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    issuance++
+    loggedIn = true
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+
+  // Local fetch interception models a half-open request with a real
+  // AbortSignal, without issuing a guest/lobby mutation to the backend.
+  await page.evaluate(() => {
+    const realFetch = window.fetch.bind(window)
+    const state = window as Window & { pendingLobbyPosts?: number; abortedLobbyPosts?: number }
+    state.pendingLobbyPosts = 0
+    state.abortedLobbyPosts = 0
+    window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (input === '/api/lobbies' && init?.method === 'POST') {
+        state.pendingLobbyPosts!++
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            state.abortedLobbyPosts!++
+            reject(new DOMException('Aborted', 'AbortError'))
+          }, { once: true })
+        })
+      }
+      return realFetch(input, init)
+    }
+  })
+
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-create')).toBeDisabled()
+  await expect(page.getByTestId('lobby-message'))
+    .toContainText('Servizio temporaneamente non disponibile', { timeout: 25_000 })
+  await expect(page.getByTestId('lobby-create')).toBeEnabled()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  const stats = await page.evaluate(() => {
+    const state = window as Window & { pendingLobbyPosts?: number; abortedLobbyPosts?: number }
+    return [state.pendingLobbyPosts, state.abortedLobbyPosts]
+  })
+  expect(stats).toEqual([1, 1])
+  expect(issuance).toBe(1)
+})

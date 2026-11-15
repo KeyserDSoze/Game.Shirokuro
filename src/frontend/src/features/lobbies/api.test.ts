@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  guestLobbyApi, LobbyHttpError, LobbyInputError,
+  guestLobbyApi, LOBBY_HTTP_REQUEST_TIMEOUT_MS, LobbyHttpError, LobbyInputError,
   isCanonicalGuestPlayerId, parseCurrentSession, parseGuestSession, parseInviteCode, parseTeamIds,
 } from './api'
 
 const roomCode = 'room-' + 'a'.repeat(32)
 const canonicalGuest = 'guest-' + 'b'.repeat(32)
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('guest lobby client boundaries', () => {
   it.each([
@@ -166,7 +166,7 @@ describe('guest lobby client boundaries', () => {
     },
   )
 
-  it('forwards AbortSignal only to passive roster polling and never to an explicit refresh', async () => {
+  it('forwards caller AbortSignal only to passive polling and uses a distinct internal signal for explicit refresh', async () => {
     const controller = new AbortController()
     const roster = {
       lobbyId: roomCode, revision: 2, teamIds: ['white', 'black'], participants: [],
@@ -192,7 +192,8 @@ describe('guest lobby client boundaries', () => {
     controller.abort()
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(await guestLobbyApi.read(roomCode)).toEqual(roster)
-    expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeUndefined()
+    expect((mocked.mock.calls[1][1] as RequestInit).signal).toBeInstanceOf(AbortSignal)
+    expect((mocked.mock.calls[1][1] as RequestInit).signal).not.toBe(controller.signal)
   })
 
   it.each([
@@ -285,3 +286,63 @@ describe('guest lobby client boundaries', () => {
   })
 })
 
+
+
+describe('bounded authenticated lobby HTTP requests (#123)', () => {
+  it('aborts stalled mutation after 15s even when fetch ignores cancellation; never replays', async () => {
+    vi.useFakeTimers()
+    expect(LOBBY_HTTP_REQUEST_TIMEOUT_MS).toBe(15_000)
+    const mocked = vi.fn((_path: string, _options: RequestInit) =>
+      new Promise<Response>(() => { /* deliberately never settles */ }))
+    vi.stubGlobal('fetch', mocked)
+
+    const pending = guestLobbyApi.create(['white', 'black'], 'white')
+    const rejected = expect(pending).rejects.toThrow('Lobby request timed out')
+    await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS - 1)
+    expect(mocked).toHaveBeenCalledOnce()
+    const signal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    expect(signal.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    await rejected
+    expect(signal.aborted).toBe(true)
+    expect(mocked).toHaveBeenCalledOnce()
+  })
+
+  it('also bounds an indefinitely pending 200 JSON body, without treating it as a 401', async () => {
+    vi.useFakeTimers()
+    const mocked = vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: () => new Promise<never>(() => {}),
+    })
+    vi.stubGlobal('fetch', mocked)
+    const pending = guestLobbyApi.session()
+    const rejected = expect(pending).rejects.toThrow('Lobby request timed out')
+    await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS)
+    await rejected
+    expect((mocked.mock.calls[0][1] as RequestInit).signal.aborted).toBe(true)
+    expect(mocked).toHaveBeenCalledOnce()
+  })
+
+  it('clears the deadline after successful 204 without aborting the completed command', async () => {
+    vi.useFakeTimers()
+    const mocked = vi.fn().mockResolvedValue({ ok: true, status: 204 })
+    vi.stubGlobal('fetch', mocked)
+    await expect(guestLobbyApi.signOut()).resolves.toBeUndefined()
+    const signal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS + 1)
+    expect(signal.aborted).toBe(false)
+    expect(mocked).toHaveBeenCalledOnce()
+  })
+
+  it.each([401, 503])('preserves an immediate %i HTTP error and cancels its timer', async status => {
+    vi.useFakeTimers()
+    const mocked = vi.fn().mockResolvedValue({ ok: false, status })
+    vi.stubGlobal('fetch', mocked)
+    await expect(guestLobbyApi.read(roomCode)).rejects.toMatchObject({
+      name: 'LobbyHttpError', status,
+    })
+    const signal = (mocked.mock.calls[0][1] as RequestInit).signal!
+    await vi.advanceTimersByTimeAsync(LOBBY_HTTP_REQUEST_TIMEOUT_MS + 1)
+    expect(signal.aborted).toBe(false)
+    expect(mocked).toHaveBeenCalledOnce()
+  })
+})

@@ -83,21 +83,42 @@ export function parseInviteCode(input: string): string {
   return code
 }
 
+/** Bounded browser wait; a timed-out mutation may still commit server-side. */
+export const LOBBY_HTTP_REQUEST_TIMEOUT_MS = 15_000
+
 async function request<T>(path: string, method = 'GET', body?: object): Promise<T> {
   const mutating = method !== 'GET'
-  const response = await fetch('/api' + path, {
-    method,
-    credentials: 'include',
-    cache: 'no-store',
-    headers: {
-      ...(mutating ? { 'X-Shirokuro-Request': '1' } : {}),
-      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-    },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  const controller = new AbortController()
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  // Race the whole operation, including JSON decoding: an abort-ignoring
+  // transport must not keep all explicit lobby controls busy indefinitely.
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error('Lobby request timed out'))
+      controller.abort()
+    }, LOBBY_HTTP_REQUEST_TIMEOUT_MS)
   })
-  if (!response.ok) throw new LobbyHttpError(response.status)
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
+  const operation = (async (): Promise<T> => {
+    const response = await fetch('/api' + path, {
+      method,
+      credentials: 'include',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: {
+        ...(mutating ? { 'X-Shirokuro-Request': '1' } : {}),
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    })
+    if (!response.ok) throw new LobbyHttpError(response.status)
+    if (response.status === 204) return undefined as T
+    return response.json() as Promise<T>
+  })()
+  try {
+    return await Promise.race([operation, timeout])
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 export const guestLobbyApi = {
