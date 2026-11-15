@@ -133,6 +133,29 @@ public sealed class LobbyStateTests
     }
 
     [Fact]
+    public void SameRevisionAlwaysRepresentsTheSameImmutableRoster()
+    {
+        var original = Empty()
+            .Join("alice", "white", 0)
+            .Join("bob", "black", 1);
+        Assert.Same(original, original.Join("alice", "white", original.Revision));
+        Assert.Same(original, original.ChangeTeam("alice", "white", original.Revision));
+
+        var hero = original.ChooseHero("alice", "kira", original.Revision);
+        Assert.Equal(original.Revision + 1, hero.Revision);
+        Assert.Same(hero, hero.ChooseHero("alice", "kira", hero.Revision));
+        var team = hero.ChangeTeam("alice", "black", hero.Revision);
+        Assert.Equal(hero.Revision + 1, team.Revision);
+        var left = team.Leave("bob", team.Revision);
+        Assert.Equal(team.Revision + 1, left.Revision);
+
+        Assert.Equal("white", original.Participants[0].TeamId);
+        Assert.Null(original.Participants[0].HeroId);
+        Assert.Equal(2, original.Participants.Count);
+        Assert.Equal(1, left.Participants.Count);
+    }
+
+    [Fact]
     public void SelectingSameHeroOrSameTeamIsIdempotent()
     {
         var first = Empty().Join("alice", "white", 0).ChooseHero("alice", "kira", 1);

@@ -726,6 +726,16 @@ test('401 revokes lobby state, while 400/403/429 and transient HTTP/network erro
       participants: verified.participants.map(
         (member: { playerId: string; teamId: string; heroId: string | null }) =>
           ({ ...member, teamId: member.teamId === 'black' ? 'gold' : member.teamId })) },
+    // A 200 with exactly the verified revision may not rewrite the
+    // verified players/hero selections or remove the actor (#121).
+    { ...verified, participants: verified.participants.map(
+      (member: { playerId: string; teamId: string; heroId: string | null }) =>
+        ({ ...member, heroId: member.heroId === 'kira' ? 'shilla' : 'kira' })) },
+    { ...verified, participants: verified.participants.map(
+      (member: { playerId: string; teamId: string; heroId: string | null }) =>
+        ({ ...member, teamId: member.teamId === 'white' ? 'black' : 'white' })) },
+    { ...verified, participants: [
+      { playerId: 'guest-' + 'f'.repeat(32), teamId: 'white', heroId: null }] },
     { ...verified, secretRoute: 'should-not-be-imported' },
     { ...verified, revision: 0 },
   ]) {
@@ -1028,6 +1038,12 @@ test('409 refresh rejects malformed membership loss and only clears on verified 
       { playerId: actorId, teamId: 'white', heroId: null },
       { playerId: otherId, teamId: 'black', heroId: null },
     ] },
+    // Both DTOs are well formed and revision 1 is legal for one member.
+    // Yet this same revision cannot swap the actor or change its hero.
+    { ...initial, participants: [
+      { playerId: otherId, teamId: 'black', heroId: null }] },
+    { ...initial, participants: [
+      { playerId: actorId, teamId: 'white', heroId: 'kira' }] },
   ]
   for (const [index, reply] of invalidReplies.entries()) {
     refreshPayload = reply

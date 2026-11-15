@@ -30,6 +30,26 @@ export type PollFailureDecision = 'expired' | 'missing' | 'retain'
 export type ConflictRosterRefreshDecision = 'verified' | 'missing' | 'invalid'
 
 /**
+ * LobbyState is immutable: an idempotent action returns the exact current
+ * snapshot, while every real join/leave/hero/team edit increments revision.
+ * A same-room, same-revision 200 with *different* members cannot be
+ * authoritative, including changed ordering or opponent hero selection.
+ * Call this only after the incoming DTO has passed strict shape validation.
+ */
+function isSameRosterSnapshot(current: LobbyRoster, incoming: LobbyRoster): boolean {
+  return incoming.lobbyId === current.lobbyId &&
+    incoming.revision === current.revision &&
+    current.teamIds.length === incoming.teamIds.length &&
+    current.teamIds.every((team, index) => team === incoming.teamIds[index]) &&
+    current.participants.length === incoming.participants.length &&
+    current.participants.every((member, index) => {
+      const next = incoming.participants[index]
+      return member.playerId === next.playerId &&
+        member.teamId === next.teamId && member.heroId === next.heroId
+    })
+}
+
+/**
  * A 409 may be followed by a 200 that is malformed, foreign, or stale.
  * Only a fully verified room/revision/participant DTO can establish that
  * the actor really lost membership. Never examine unvalidated participants.
@@ -40,7 +60,9 @@ export function classifyConflictRosterRefresh(
   if (!isCanonicalGuestPlayerId(actorId) ||
       !isWellFormedLobbyRoster(
         incoming, current.lobbyId, current.revision, current.teamIds,
-      ))
+      ) ||
+      (incoming.revision === current.revision &&
+        !isSameRosterSnapshot(current, incoming)))
     return 'invalid'
   return incoming.participants.some(participant => participant.playerId === actorId)
     ? 'verified' : 'missing'
@@ -63,7 +85,9 @@ export function reconcilePolledRoster(
   // absent, and do not count as invalid transport data.
   if (incoming.revision < current.revision)
     return 'unchanged'
-  // Only a structurally valid, current roster can prove membership loss.
+  if (incoming.revision === current.revision)
+    return isSameRosterSnapshot(current, incoming) ? 'unchanged' : 'invalid'
+  // Only a structurally valid, *newer* roster can prove membership loss.
   if (!incoming.participants.some(participant => participant.playerId === actorId))
     return 'missing'
   return incoming.revision > current.revision ? 'updated' : 'unchanged'
@@ -79,6 +103,8 @@ export function reconcilePolledRoster(
  * on .NET; even an otherwise well-formed 200 cannot replace them (#119).
  * .NET LobbyState.Restore also requires revision >= participant count:
  * every joined participant consumed at least one revision (#120).
+ * A same-version response must match the *entire* previously verified
+ * roster, because .NET changes can never rewrite an existing revision (#121).
  */
 function isWellFormedLobbyRoster(
   payload: unknown, expectedRoomId?: string, minimumRevision?: number,
@@ -133,15 +159,21 @@ function isWellFormedLobbyRoster(
  * among the participants. A structurally valid passive roster with no actor
  * is treated separately by reconcilePolledRoster as missing membership.
  * For an existing room, also compare its immutable ordered team definition.
+ * A same-revision response must also match its full previous snapshot.
  */
 export function isVerifiedLobbyRoster(
   payload: unknown, actorId: string, expectedRoomId?: string,
   minimumRevision?: number, expectedTeamIds?: readonly string[],
+  previousRoster?: LobbyRoster,
 ): payload is LobbyRoster {
   return typeof actorId === 'string' && actorId.length > 0 &&
     isWellFormedLobbyRoster(
       payload, expectedRoomId, minimumRevision, expectedTeamIds,
     ) &&
+    (previousRoster === undefined ||
+      payload.lobbyId !== previousRoster.lobbyId ||
+      payload.revision !== previousRoster.revision ||
+      isSameRosterSnapshot(previousRoster, payload)) &&
     payload.participants.some(participant => participant.playerId === actorId)
 }
 

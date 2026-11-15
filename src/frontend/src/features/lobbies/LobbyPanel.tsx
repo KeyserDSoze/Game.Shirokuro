@@ -399,6 +399,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       ? previous.teamIds : undefined
     if (!session || !isVerifiedLobbyRoster(
       next, session.playerId, expectedRoomId, minRevision, expectedTeams,
+      previous?.lobbyId === next?.lobbyId ? previous : undefined,
     )) throw new Error('Invalid authenticated lobby roster response')
     // A stale passive response must never see a previous room as current
     // between a confirmed user action and the next React effect (#109).

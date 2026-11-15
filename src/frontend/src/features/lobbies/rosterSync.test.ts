@@ -42,7 +42,8 @@ describe('pre-match authenticated lobby polling', () => {
 
   it('treats an authorized 200 that lost actor membership as missing, not public roster', () => {
     expect(reconcilePolledRoster(roster(1), roster(2, [bob]), alice.playerId)).toBe('missing')
-    expect(reconcilePolledRoster(roster(1), roster(1, [bob]), alice.playerId)).toBe('missing')
+    // The membership cannot change at a revision already observed.
+    expect(reconcilePolledRoster(roster(2), roster(2, [bob]), alice.playerId)).toBe('invalid')
   })
 
   it.each([
@@ -92,7 +93,7 @@ describe('pre-match authenticated lobby polling', () => {
       .toBe('invalid')
     expect(reconcilePolledRoster(current, roster(6), alice.playerId)).toBe('unchanged')
     expect(reconcilePolledRoster(current, roster(7), alice.playerId)).toBe('unchanged')
-    expect(reconcilePolledRoster(current, roster(7, [bob]), alice.playerId)).toBe('missing')
+    expect(reconcilePolledRoster(current, roster(7, [bob]), alice.playerId)).toBe('invalid')
     expect(reconcilePolledRoster(current, roster(6, [bob]), alice.playerId)).toBe('unchanged')
     expect(reconcilePolledRoster(current, roster(8), alice.playerId)).toBe('updated')
     // Scheduler maps repeated invalid DTOs to the same capped delays
@@ -336,6 +337,66 @@ describe('server-compatible minimum revision for a populated roster (#120)', () 
   })
 })
 
+
+describe('immutable same-revision lobby snapshots (#121)', () => {
+  const current = roster(5)
+
+  it('accepts an identical independently decoded 200 across all adoption paths', () => {
+    const equivalent = roster(5, [
+      { ...alice }, { ...bob },
+    ])
+    expect(isVerifiedLobbyRoster(
+      equivalent, alice.playerId, lobbyId, 5, current.teamIds, current,
+    )).toBe(true)
+    expect(reconcilePolledRoster(current, equivalent, alice.playerId))
+      .toBe('unchanged')
+    expect(classifyConflictRosterRefresh(current, equivalent, alice.playerId))
+      .toBe('verified')
+  })
+
+  it.each([
+    ['hero changed', roster(5, [alice, { ...bob, heroId: 'shilla' }])],
+    ['team changed', roster(5, [alice, { ...bob, teamId: 'white' }])],
+    ['member order changed', roster(5, [bob, alice])],
+    ['member added', roster(5, [alice, bob, {
+      playerId: 'guest-' + '3'.repeat(32), teamId: 'black', heroId: null,
+    }])],
+    ['member removed', roster(5, [alice])],
+    ['actor lost', roster(5, [bob])],
+  ])('rejects same-revision %s even when the new DTO is structurally valid', (_name, bad) => {
+    expect(reconcilePolledRoster(current, bad, alice.playerId)).toBe('invalid')
+    expect(classifyConflictRosterRefresh(current, bad, alice.playerId))
+      .toBe('invalid')
+    if (bad.participants.some(p => p.playerId === alice.playerId)) {
+      // Without the previous snapshot the response is superficially valid;
+      // explicit adoption must compare the previously verified snapshot.
+      expect(isVerifiedLobbyRoster(bad, alice.playerId, lobbyId, 5))
+        .toBe(true)
+      expect(isVerifiedLobbyRoster(
+        bad, alice.playerId, lobbyId, 5, current.teamIds, current,
+      )).toBe(false)
+    }
+  })
+
+  it('allows newer content, and stale snapshots never establish membership loss', () => {
+    const newer = roster(6, [bob])
+    expect(reconcilePolledRoster(current, newer, alice.playerId))
+      .toBe('missing')
+    expect(classifyConflictRosterRefresh(current, newer, alice.playerId))
+      .toBe('missing')
+    const modified = roster(6, [alice, { ...bob, heroId: 'shilla' }])
+    expect(reconcilePolledRoster(current, modified, alice.playerId))
+      .toBe('updated')
+    expect(isVerifiedLobbyRoster(
+      modified, alice.playerId, lobbyId, 5, current.teamIds, current,
+    )).toBe(true)
+    expect(reconcilePolledRoster(current, roster(4, [bob]), alice.playerId))
+      .toBe('unchanged')
+    expect(classifyConflictRosterRefresh(current, roster(4, [bob]), alice.playerId))
+      .toBe('invalid')
+  })
+})
+
 describe('409 conflict refresh requires validated membership proof (#115)', () => {
   it('adopts only current, same-room, strictly verified member rosters', () => {
     const current = roster(4)
@@ -345,10 +406,10 @@ describe('409 conflict refresh requires validated membership proof (#115)', () =
       .toBe('verified')
     expect(classifyConflictRosterRefresh(current, roster(5, [bob]), alice.playerId))
       .toBe('missing')
-    // A valid equal revision with confirmed membership loss still proves
-    // absence, but an obsolete revision cannot revoke a newer local view.
+    // Same revision means the same immutable snapshot. A different member
+    // set cannot prove revocation without a newer revision.
     expect(classifyConflictRosterRefresh(current, roster(4, [bob]), alice.playerId))
-      .toBe('missing')
+      .toBe('invalid')
     expect(classifyConflictRosterRefresh(current, roster(3, [bob]), alice.playerId))
       .toBe('invalid')
   })
