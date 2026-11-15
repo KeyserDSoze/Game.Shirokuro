@@ -100,6 +100,7 @@ public static class MultiplayerMetrics
             IngressRejectionReason.MutationOrigin => "mutation-origin",
             IngressRejectionReason.HubOrigin => "hub-origin",
             IngressRejectionReason.LobbyBodySize => "lobby-body-size",
+            IngressRejectionReason.LobbyMediaType => "lobby-media-type",
             IngressRejectionReason.GuestBody => "session-body",
             IngressRejectionReason.Host => "host",
             IngressRejectionReason.Transport => "transport",
@@ -282,6 +283,7 @@ public enum IngressRejectionReason
     MutationOrigin,
     HubOrigin,
     LobbyBodySize,
+    LobbyMediaType,
     GuestBody,
     Host,
     Transport

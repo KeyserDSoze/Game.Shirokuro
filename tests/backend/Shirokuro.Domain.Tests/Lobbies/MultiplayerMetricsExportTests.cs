@@ -172,6 +172,7 @@ public sealed class MultiplayerMetricsExportTests
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.MutationOrigin);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Transport);
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.LobbyMediaType);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Active);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.Unavailable);
         MultiplayerMetrics.RecordGuestCookieAuthority(GuestCookieValidationOutcome.RecoveryCutoff);
@@ -216,6 +217,7 @@ public sealed class MultiplayerMetricsExportTests
         Assert.Contains("reason", payload);
         Assert.Contains("transport", payload);
         Assert.Contains("host", payload);
+        Assert.Contains("lobby-media-type", payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectionEventsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisReplicationObservationsName, payload);
         Assert.Contains(MultiplayerMetrics.RedisConnectedReplicasName, payload);

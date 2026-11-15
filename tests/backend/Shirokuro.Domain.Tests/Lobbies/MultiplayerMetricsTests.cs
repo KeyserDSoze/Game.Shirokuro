@@ -297,7 +297,7 @@ public sealed class MultiplayerMetricsTests
         var ingress = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "session-body", "host", "transport" })
+                   "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" })
             Assert.Contains(ingress, m => m.Tags["reason"] == reason && m.Value == 1);
         Assert.All(ingress, measurement =>
         {
@@ -305,7 +305,7 @@ public sealed class MultiplayerMetricsTests
             Assert.Equal(new[] { "reason" }, measurement.Tags.Keys);
             Assert.Contains(measurement.Tags["reason"],
                 new[] { "room-id", "mutation-origin", "hub-origin",
-                         "lobby-body-size", "session-body", "host", "transport" });
+                         "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" });
         });
 
         var validations = capture.For(MultiplayerMetrics.GuestCookieAuthorityName);
@@ -373,8 +373,8 @@ public sealed class MultiplayerMetricsTests
                         "active" or "inactive" or "recovery-cutoff",
                     "mode" => value is "local" or "redis",
                     "reason" => value is "room-id" or "mutation-origin" or
-                        "hub-origin" or "lobby-body-size" or "session-body" or
-                        "host" or "transport",
+                        "hub-origin" or "lobby-body-size" or "lobby-media-type" or
+                        "session-body" or "host" or "transport",
                     "client" => value is "lobby" or "session",
                     "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
@@ -453,6 +453,16 @@ public sealed class MultiplayerMetricsTests
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, denied.StatusCode);
         }
 
+        // An explicit non-JSON lobby request also rejects before Redis.
+        using (var unsupported = Post("/api/lobbies", production: true))
+        {
+            unsupported.Content = new StringContent("{}", System.Text.Encoding.UTF8,
+                "text/plain");
+            using var denied = await client.SendAsync(unsupported);
+            Assert.Equal(HttpStatusCode.UnsupportedMediaType, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+        }
+
         // Body-bearing guest issuance is rejected before the unavailable
         // limiter, never converted into a 503 or new guest cookie.
         using (var unexpectedBody = Post("/api/sessions/guest", production: true))
@@ -466,7 +476,7 @@ public sealed class MultiplayerMetricsTests
         var readings = capture.For(MultiplayerMetrics.IngressRejectionsName);
         foreach (var reason in new[]
                  { "room-id", "mutation-origin", "hub-origin",
-                   "lobby-body-size", "session-body", "host", "transport" })
+                   "lobby-body-size", "lobby-media-type", "session-body", "host", "transport" })
             Assert.Contains(readings, o => o.Value == 1 &&
                 o.Tags.Count == 1 && o.Tags["reason"] == reason);
 

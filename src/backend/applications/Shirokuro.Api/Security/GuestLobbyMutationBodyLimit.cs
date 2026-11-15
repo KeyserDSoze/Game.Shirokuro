@@ -36,3 +36,18 @@ public static class GuestLobbyMutationBodyLimit
         return true;
     }
 }
+
+/// <summary>
+/// JSON-bound lobby commands never support an explicitly non-JSON media type.
+/// Match ASP.NET Core's JSON body binder before reading the signed guest
+/// ticket from Redis. Missing Content-Type stays with the normal binder.
+/// </summary>
+public static class GuestLobbyMutationMediaTypeGuard
+{
+    public static bool Allows(HttpContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return !context.Request.Headers.ContainsKey("Content-Type") ||
+               context.Request.HasJsonContentType();
+    }
+}

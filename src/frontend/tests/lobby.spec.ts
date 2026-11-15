@@ -70,6 +70,33 @@ test('two independent guest browsers create a room, join by invite and select he
     expect(firstId).toContain(rejectedLogout.identity?.playerId)
     await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
 
+    // A syntactically unsupported lobby media type is rejected before
+    // guest Redis auth and room creation quota, without changing identity.
+    const unsupportedMedia = await first.evaluate(async () => {
+      const response = await fetch('/api/lobbies', {
+        method: 'POST', credentials: 'include', cache: 'no-store',
+        headers: { 'Content-Type': 'text/plain', 'X-Shirokuro-Request': '1' },
+        body: JSON.stringify({ teamIds: ['white', 'black'], teamId: 'white' }),
+      })
+      const identityReply = await fetch('/api/sessions/me', {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+      })
+      const identity = identityReply.ok
+        ? await identityReply.json() as { kind: string; playerId: string }
+        : null
+      return {
+        status: response.status,
+        cacheControl: response.headers.get('Cache-Control'),
+        identityStatus: identityReply.status, identity,
+      }
+    })
+    expect(unsupportedMedia.status).toBe(415)
+    expect(unsupportedMedia.cacheControl).toContain('no-store')
+    expect(unsupportedMedia.identityStatus).toBe(200)
+    expect(unsupportedMedia.identity?.kind).toBe('guest')
+    expect(firstId).toContain(unsupportedMedia.identity?.playerId)
+    await expect(first.getByTestId('lobby-player')).toHaveText(firstId!)
+
     // A real HTTP 413 must be returned before room creation. Reuse this
     // already signed-in guest instead of spending more shared guest quota.
     const rejectedBody = await first.evaluate(async () => {

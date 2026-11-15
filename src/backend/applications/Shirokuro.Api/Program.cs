@@ -356,6 +356,17 @@ app.Use(async (context, next) =>
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.LobbyBodySize);
         return;
     }
+    if (metadata?.GetMetadata<GuestLobbyMutationBodyLimitRequired>() is not null &&
+        !GuestLobbyMutationMediaTypeGuard.Allows(context))
+    {
+        // Declared non-JSON bytes cannot bind to a lobby DTO. Reject them
+        // before cookie Redis validation or any room-creation quota. Origin
+        // and declared body-size guards have already taken precedence.
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
+        MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.LobbyMediaType);
+        return;
+    }
     if (metadata?.GetMetadata<GuestSessionEmptyBodyRequired>() is not null &&
         !GuestSessionBodyGuard.Allows(context))
     {

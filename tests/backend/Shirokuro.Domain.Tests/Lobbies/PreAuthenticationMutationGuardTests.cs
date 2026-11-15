@@ -711,6 +711,100 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Theory]
+    [InlineData(null, true)]
+    [InlineData("application/json", true)]
+    [InlineData("application/json; charset=utf-8", true)]
+    [InlineData("application/vnd.shirokuro+json", true)]
+    [InlineData("text/plain", false)]
+    [InlineData("application/x-www-form-urlencoded", false)]
+    [InlineData("multipart/form-data", false)]
+    [InlineData("application/json, text/plain", false)]
+    public void LobbyMediaTypeGuardMatchesJsonBinderForExplicitHeaders(
+        string? contentType, bool allowed)
+    {
+        var context = new DefaultHttpContext();
+        if (contentType is not null)
+            context.Request.Headers.ContentType = contentType;
+        Assert.Equal(allowed, GuestLobbyMutationMediaTypeGuard.Allows(context));
+    }
+
+    [Fact]
+    public async Task NonJsonLobbyMutationsRejectBeforeGuestRedisAndRoomQuota()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        using var server = Production(cache, limiter);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = true;
+        // All five DTO-bound mutations share the server-owned metadata.
+        foreach (var (method, path) in MutationRoutes.Skip(2))
+        foreach (var contentType in new[]
+                 { "text/plain", "application/x-www-form-urlencoded" })
+        {
+            using var nonJson = Mutation(method, path, "https://game.example");
+            nonJson.Content = new StringContent("{}", Encoding.UTF8, contentType);
+            using var denied = await guest.SendAsync(nonJson);
+            Assert.Equal(HttpStatusCode.UnsupportedMediaType, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+            Assert.False(denied.Headers.Contains("Retry-After"));
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // CSRF Origin still wins over an unsupported media type. Size 413
+        // also wins, and neither attempt can read Redis or consume quota.
+        using (var hostile = Mutation(HttpMethod.Post, "/api/lobbies",
+                   "https://evil.example"))
+        {
+            hostile.Content = new StringContent("{}", Encoding.UTF8, "text/plain");
+            using var denied = await guest.SendAsync(hostile);
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+        }
+        using (var tooLarge = Mutation(HttpMethod.Post, "/api/lobbies",
+                   "https://game.example"))
+        {
+            tooLarge.Content = new StringContent(
+                new string('x', (int)GuestLobbyMutationBodyLimit.MaxBytes + 1),
+                Encoding.UTF8, "text/plain");
+            using var denied = await guest.SendAsync(tooLarge);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, denied.StatusCode);
+        }
+        Assert.Equal(0, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        // Both JSON media types must pass this syntactic guard. Redis is
+        // intentionally unavailable, so existing auth fails closed at 503.
+        foreach (var contentType in new[]
+                 { "application/json", "application/vnd.shirokuro+json" })
+        {
+            using var json = Mutation(HttpMethod.Post, "/api/lobbies",
+                "https://game.example");
+            json.Content = new StringContent("{}", Encoding.UTF8, contentType);
+            using var unavailable = await guest.SendAsync(json);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+            Assert.Equal("no-store", unavailable.Headers.CacheControl?.ToString());
+        }
+        Assert.Equal(2, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        cache.Unavailable = false;
+        using var me = await guest.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+        Assert.Equal(3, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Theory]
     [InlineData(null, 4096L)]
     [InlineData(30_000L, 4096L)]
     [InlineData(2048L, 2048L)]
