@@ -506,15 +506,117 @@ test('cross-tab recheck signals are strict and burst-coalesced without guest iss
   })
   await expect.poll(() => checks).toBe(1)
   release()
-  await expect.poll(() => checks).toBe(2)
-  // No additional fan-out after the single trailing read has completed.
+  // Trailing read is delayed to the 2-second monotonic cooldown rather
+  // than issued immediately after the first quick /me response (#122).
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(2)
   await page.waitForTimeout(150)
   expect(checks).toBe(2)
+
+  // A second burst after the first GETs are complete still cannot bypass
+  // the cooldown. Keep exactly one delayed read, not 50 sequential GETs.
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    for (let i = 0; i < 50; i++) {
+      channel.postMessage('recheck')
+      window.dispatchEvent(new Event('focus'))
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+    channel.close()
+  })
+  expect(checks).toBe(2)
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(3)
+  await page.waitForTimeout(150)
+  expect(checks).toBe(3)
   expect(issuancePosts).toBe(0)
   await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
   await expect(page.getByTestId('lobby-player')).toHaveCount(0)
   await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
   await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+})
+
+test('session hints are rate-limited after fast responses, but later 401 revokes the room', async ({ page }) => {
+  const actor = 'guest-' + 'c'.repeat(32)
+  const roomId = 'room-' + 'c'.repeat(32)
+  const room = { lobbyId: roomId, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }] }
+  let signedIn = false
+  let status: 200 | 401 | 503 = 200
+  let checks = 0
+  let issuances = 0
+  let creates = 0
+
+  // Fully mocked guest and room; no real admission quota or other
+  // members' data are involved in this load-shedding regression.
+  await page.route('**/api/sessions/me', route => {
+    checks++
+    if (!signedIn || status === 401) return route.fulfill({ status: 401 })
+    if (status === 503) return route.fulfill({ status: 503 })
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/sessions/guest', route => {
+    issuances++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    creates++
+    return route.fulfill({ status: 201, json: room })
+  })
+
+  const initial = page.waitForResponse(response =>
+    response.url().endsWith('/api/sessions/me') && response.status() === 401)
+  await page.goto('/')
+  await initial
+  await page.getByTestId('lobby-sign-in').click()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+  const initialRoster = await page.getByTestId('lobby-roster').textContent()
+
+  const before = checks
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    for (let i = 0; i < 50; i++) {
+      channel.postMessage('recheck')
+      window.dispatchEvent(new Event('focus'))
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+    channel.close()
+  })
+  // One request now, and at most one delayed read for all 100 hints.
+  expect(checks).toBe(before + 1)
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 2)
+  await page.waitForTimeout(150)
+  expect(checks).toBe(before + 2)
+
+  // Even a failed server verification is neither an implicit logout nor
+  // permission for immediate repeated Redis lookups.
+  status = 503
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 3)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+  await expect(page.getByTestId('lobby-roster')).toHaveText(initialRoster!)
+
+  // A confirmed revocation signalled during a cooldown is delayed by no
+  // more than one window. It must clear room, invite and guest without
+  // issuing a new guest or replaying any room mutation.
+  status = 401
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    channel.postMessage('recheck')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    channel.close()
+  })
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible({ timeout: 6_000 })
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
+  expect(checks).toBe(before + 4)
+  expect(issuances).toBe(1)
+  expect(creates).toBe(1)
 })
 
 test('guest session revoked in another tab clears private roster on focus without auto-login', async ({ context }) => {

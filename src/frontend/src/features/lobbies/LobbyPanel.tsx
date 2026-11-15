@@ -11,6 +11,7 @@ import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
   classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
 } from './rosterSync'
+import { sessionRecheckDelayMs } from './sessionRecheck'
 
 type Props = { previewHeroId: string }
 const SESSION_CHANGE_CHANNEL = 'shirokuro:guest-session-changed'
@@ -103,17 +104,38 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let active = true
     let inFlight = false
     let pendingRecheck = false
+    let cooldownTimer: number | undefined
+    let lastStartedAt: number | null = null
 
     const recheck = () => {
       if (!active) return
       if (inFlight) {
-        // Coalesce bursts of focus/visibility/BC events, but don't lose a
-        // logout/login that occurs while the first /me read is outstanding.
-        // Exactly one trailing read is sufficient for any pending burst.
+        // Never lose a logout/login which happens during an outstanding GET,
+        // but coalesce an arbitrary number of hints into one trailing check.
         pendingRecheck = true
         return
       }
+      const delay = sessionRecheckDelayMs(lastStartedAt, performance.now())
+      if (delay > 0) {
+        // Fast responses must not permit unlimited Redis-backed rechecks.
+        // Keep the first deadline fixed even if more focus/BC hints arrive.
+        pendingRecheck = true
+        if (cooldownTimer === undefined) {
+          cooldownTimer = window.setTimeout(() => {
+            cooldownTimer = undefined
+            pendingRecheck = false
+            recheck()
+          }, delay)
+        }
+        return
+      }
+      if (cooldownTimer !== undefined) {
+        window.clearTimeout(cooldownTimer)
+        cooldownTimer = undefined
+      }
+      pendingRecheck = false
       inFlight = true
+      lastStartedAt = performance.now()
       const generation = sessionGenerationRef.current
       void guestLobbyApi.session()
         .then(identity => {
@@ -171,6 +193,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     channel?.addEventListener('message', onMessage)
     return () => {
       active = false
+      window.clearTimeout(cooldownTimer)
       window.removeEventListener('focus', recheck)
       document.removeEventListener('visibilitychange', onVisible)
       channel?.removeEventListener('message', onMessage)
