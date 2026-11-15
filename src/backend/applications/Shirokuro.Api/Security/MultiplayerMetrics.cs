@@ -104,14 +104,16 @@ public static class MultiplayerMetrics
             IngressRejectionReason.GuestBody => "session-body",
             IngressRejectionReason.Host => "host",
             IngressRejectionReason.Transport => "transport",
+            IngressRejectionReason.UnknownApiRoute => "unknown-route",
+            IngressRejectionReason.MethodNotAllowed => "method-not-allowed",
             _ => throw new ArgumentOutOfRangeException(nameof(reason))
         };
         IngressRejections.Add(1, new KeyValuePair<string, object?>("reason", value));
     }
 
     /// <summary>
-    /// Exactly one decision for each guest-like signed cookie actually
-    /// validated by ASP.NET cookie authentication. Early ingress rejections,
+    /// Exactly one decision for each signed cookie validated or rejected
+    /// by ASP.NET cookie authentication. Early ingress rejections,
     /// anonymous traffic and public probes must not record false validations.
     /// No session, token, path, IP or exception is an attribute.
     /// </summary>
@@ -123,6 +125,7 @@ public static class MultiplayerMetrics
             GuestCookieValidationOutcome.Inactive => "inactive",
             GuestCookieValidationOutcome.Unavailable => "unavailable",
             GuestCookieValidationOutcome.RecoveryCutoff => "recovery-cutoff",
+            GuestCookieValidationOutcome.UnsupportedTicket => "unsupported-ticket",
             _ => throw new ArgumentOutOfRangeException(nameof(outcome))
         };
         GuestCookieAuthority.Add(1,
@@ -274,7 +277,10 @@ public static class MultiplayerMetrics
 public enum MutationOutcome { Allowed, Limited, Unavailable }
 
 /// <summary>Finite results of a real signed guest cookie validation.</summary>
-public enum GuestCookieValidationOutcome { Active, Inactive, Unavailable, RecoveryCutoff }
+public enum GuestCookieValidationOutcome
+{
+    Active, Inactive, Unavailable, RecoveryCutoff, UnsupportedTicket
+}
 
 /// <summary>Fixed ingress rejection categories, never raw input data.</summary>
 public enum IngressRejectionReason
@@ -286,7 +292,9 @@ public enum IngressRejectionReason
     LobbyMediaType,
     GuestBody,
     Host,
-    Transport
+    Transport,
+    UnknownApiRoute,
+    MethodNotAllowed
 }
 
 /// <summary>Finite technical readiness probe phase; never error text.</summary>
