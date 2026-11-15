@@ -96,3 +96,36 @@ positions/routes. Distributed session revocation (#33) and pre-match
 roster cleanup (#36) are now in place outside Development. Durable
 identity and operational hardening remain #21; actual match networking
 and visibility still depend on #3/#5/#9.
+
+## Strict guest-only cookie principals (#139)
+
+Shirokuro currently registers **one** cookie authentication scheme, and it
+issues only cryptographically generated guest identities. There is no verified
+account login provider yet. A Data Protection-signed legacy ticket with an
+arbitrary/non-guest `NameIdentifier`, missing/incorrect guest kind, ambiguous
+identity or noncanonical `guest-<32 lowercase hex>` player ID is therefore
+**not** a verified account. The cookie middleware now rejects this entire
+class **before consulting Redis**. On private APIs and the SignalR
+negotiate endpoint it yields 401/no-store, never privileged content.
+
+A signed unsupported ticket hitting `POST /api/sessions/guest` does **not**
+get silently exchanged for a fresh guest: a server-side per-request marker
+returns 401/no-store with no new cookie/session registry write. The existing
+pre-auth IP admission limit may still charge such a request; the marker is
+not a quota bypass. Anonymous users can continue to issue a guest session,
+and a legitimately revoked guest can explicitly obtain a fresh one following
+the existing recovery flow. Canonical guests with live registry records
+remain valid; during Redis outages they still return 503/no-store, not 401.
+Public `/api/health`, `/api/ready` and board preview remain identity-
+independent and skip optional Redis validation for availability, without
+ever granting protected access. Framework synthetic 405 remains public
+method rejection, never an authorization rule.
+
+A future verified account system must introduce a **separate, explicitly
+authorized identity provider/scheme and policy** with independent tests;
+a stale cookie signed under the guest scheme cannot implicitly become an
+account. Tests cover malicious/legacy ticket shapes in Development and
+Production TestServer, missing Redis authority, no replacement issuance and
+normal valid guest behavior. This change does not establish durable accounts,
+anti-Sybil defenses or PvP gameplay rules; those remain tracked under #21
+and the original game-design issues.
