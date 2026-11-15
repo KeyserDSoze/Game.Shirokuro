@@ -77,6 +77,7 @@ export default function TerrainEditor({
           <Button type="button" size="sm" variant="outline" onClick={onUndo} disabled={!canUndo} data-testid="terrain-undo">{t('terrainUndo')}</Button>
           <Button type="button" size="sm" variant="outline" onClick={onRedo} disabled={!canRedo} data-testid="terrain-redo">{t('terrainRedo')}</Button>
         </div>
+        <p data-testid="terrain-shortcut-hint" className="text-xs text-muted-foreground">{t('terrainShortcutHint')}</p>
         <p className="text-xs text-muted-foreground">{t('terrainLocalNotice')}</p>
       </CardContent>
     </Card>
