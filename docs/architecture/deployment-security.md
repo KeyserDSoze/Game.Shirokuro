@@ -2277,3 +2277,33 @@ per join. Non si promette un rollback dei comandi che hanno **già
 iniziato** una scrittura Redis o un CAS di lobby prima di
 `ApplicationStopping`: per questo servono load balancer preStop,
 grace period, gestione delle risposte incerte e HA (#21).
+
+## Sessioni guest già in fase di emissione quando inizia il drain (#149)
+
+Le barriere HTTP pre/post-auth di #146/#148 escludono i nuovi ingressi
+**prima dell'handler**, ma una chiamata già dentro POST
+`/api/sessions/guest` può attendere la conferma della SET nel registro
+guest Redis o la persistenza dell'indice di scadenza. Il middleware non
+può più fermarla. L'handler ora verifica lo stesso indicatore monotono
+`IReadinessDrainSignal` (server-owned) dopo ciascun await rilevante:
+`RegisterAsync`, `IGuestExpiryIndex.ScheduleAsync`, `SignInAsync`.
+
+Se il nodo è draining, l'handler non consegna un nuovo cookie, rimuove
+anche un eventuale header `Set-Cookie` già preparato e risponde
+503/`Cache-Control: no-store`. Tenta inoltre `RevokeAsync` del preciso
+token appena registrato; la stessa routine è usata se scadenza o
+firma del cookie falliscono. La revoca può non essere confermata a
+causa di Redis unavailable / timeout: in questo caso rimane solo un
+record server-side non divulgato con scadenza assoluta (8h), **non** un
+cookie valido che il client conosca. Una richiesta può aver consumato
+una quota limitatore o scritto un lavoro durabile prima del 503;
+non significa che quel lavoro sia stato annullato.
+
+La verifica finale dopo `SignInAsync` riduce l'ultima finestra di race,
+ma non è un protocollo atomico con rete HTTP, Redis o
+`ApplicationStopping`: dopo il controllo finale possono accadere altri
+eventi e una risposta già trasmessa non si può revocare dall'handler.
+Il drain orchestrato (ready=503, stop nuove connessioni lato
+bilanciatore, preStop, grace period), l'osservazione delle risposte
+incerte e l'HA rimangono responsabilità aperte in #21. Nessun
+comando Lua/CAS di lobby già consegnato al Redis è annullato.
