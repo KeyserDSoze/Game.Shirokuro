@@ -2194,3 +2194,30 @@ risultato member-only in-flight e un ETag che altrimenti avrebbe dato
 304. Nessuna di queste protezioni sostituisce il preStop del
 load balancer, un grace period misurato o il traffico multi-nodo reale,
 ancora aperti in #21.
+
+## Stop delle nuove ammissioni guest/lobby durante shutdown (#146)
+
+A complemento di readiness (#141), drain SignalR (#142) e roster HTTP
+(#145), `ApplicationStopping` ora impedisce l'apertura di **nuove**
+sessioni guest (`POST /api/sessions/guest`) e **nuove** lobby
+(`POST /api/lobbies`). L'ingress usa il metadata **server-owned**
+`GuestMutationRateLimit` (solo due tipi di ammissione) e il segnale
+monotono `IReadinessDrainSignal`. In entrambi gli ambienti, se il nodo
+è draining la richiesta corretta riceve `503` e `Cache-Control:
+no-store`, senza body privato, `Set-Cookie` o `Retry-After`, prima
+di validare il guest su Redis o di consumare un permesso di quota.
+
+L'ordine di sicurezza rimane: selezione routing e 404/405 del framework,
+controlli Origin/intent e body/media type, quindi drain delle nuove
+ammissioni, quindi autenticazione e limitatori. Un browser non può
+attivare il drain aggiungendo header, URL o parametri. Le GET di health,
+readiness e roster seguono le policy #141/#145; i websocket la #142.
+**Logout, revoca e mutazioni sulle stanze già esistenti non sono bloccati
+da questo nuovo controllo**, per consentire la pulizia in corso.
+
+Per un deployment reale occorrono ancora preStop del bilanciatore, un
+grace period e un protocollo per le richieste di ammissione che erano
+già entrate nel server prima dello shutdown: questa barriera agisce
+sull'arrivo della richiesta, non annulla transazioni già in-flight.
+xUnit Development/Production coprono gli endpoint, cookie guest
+firmato, quota Redis, error precedence e logout. #21 resta aperta.
