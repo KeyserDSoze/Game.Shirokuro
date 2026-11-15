@@ -10,7 +10,8 @@ import {
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
   classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
-  rosterCanHonorResumeHint, rosterResumeDelayMs,
+  rosterCanHonorResumeHint, rosterResumeDelayMs, nextRosterSyncStatus,
+  type RosterSyncStatus,
 } from './rosterSync'
 import { sessionRecheckDelayMs } from './sessionRecheck'
 
@@ -22,6 +23,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const { t } = useTranslation()
   const [session, setSession] = useState<GuestSession | null>(null)
   const [room, setRoom] = useState<LobbyRoster | null>(null)
+  const [rosterSyncStatus, setRosterSyncStatus] = useState<RosterSyncStatus>('current')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [invite, setInvite] = useState('')
@@ -68,6 +70,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     passivePollAbortRef.current?.abort()
     currentRoomRef.current = null
     setRoom(null)
+    setRosterSyncStatus('current')
     setInvite('')
   }, [])
 
@@ -251,6 +254,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     const onVisible = () => {
       if (!document.hidden) resume()
     }
+    const onOffline = () => {
+      // The previously verified roster stays visible but no longer claims
+      // to reflect current server state until a real authorized response.
+      if (active && currentRoomRef.current?.lobbyId === roomId)
+        setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'outage'))
+    }
 
     const poll = async () => {
       if (!active) return
@@ -280,6 +289,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // A member-authorized 304 is a successful no-change response.
         if (latest === null) {
           transientFailures = 0
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'verified'))
           return
         }
         const current = currentRoomRef.current!
@@ -288,11 +298,17 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           // Even HTTP 200 can carry an unusable DTO during API/proxy
           // regressions: fail closed and back off, never refresh at 15s.
           transientFailures = Math.min(3, transientFailures + 1)
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'invalid'))
           return
         }
         // Valid, including a stale but well-formed revision, means the API
         // is responsive. Do not penalize an authorized no-change snapshot.
         transientFailures = 0
+        // A lagging replica's older 200 cannot establish freshness, even
+        // though it is well-formed and must not replace the local revision.
+        if (result !== 'missing')
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous,
+            latest.revision < current.revision ? 'older' : 'verified'))
         if (result === 'updated') {
           setRoom(previous =>
             previous?.lobbyId === roomId && previous.revision < latest.revision
@@ -319,6 +335,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           // 403, 429, 5xx and offline preserve the authenticated roster.
           // Cap the counter to prevent number overflow in long outages.
           transientFailures = Math.min(3, transientFailures + 1)
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'outage'))
         }
       } finally {
         if (inFlightAbort === controller) inFlightAbort = null
@@ -340,6 +357,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
 
     window.addEventListener('online', resume)
+    window.addEventListener('offline', onOffline)
     window.addEventListener('focus', resume)
     document.addEventListener('visibilitychange', onVisible)
     schedule(LOBBY_ROSTER_POLL_INTERVAL_MS)
@@ -347,6 +365,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       active = false
       window.clearTimeout(timer)
       window.removeEventListener('online', resume)
+      window.removeEventListener('offline', onOffline)
       window.removeEventListener('focus', resume)
       document.removeEventListener('visibilitychange', onVisible)
       inFlightAbort?.abort()
@@ -477,6 +496,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     // between a confirmed user action and the next React effect (#109).
     currentRoomRef.current = next
     setRoom(next)
+    setRosterSyncStatus('current')
     setInvite(next.lobbyId)
     const own = next.participants.find(p => p.playerId === session?.playerId)
     setNewTeam(own?.teamId ?? next.teamIds[0])
@@ -632,6 +652,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                 <p data-testid="lobby-revision" className="text-xs text-muted-foreground">
                   {t('lobbyRevision', { count: room.revision })}
                 </p>
+                {rosterSyncStatus === 'stale' && (
+                  <p role="status" aria-live="polite" data-testid="lobby-roster-stale"
+                    className="text-xs text-muted-foreground">
+                    {t('lobbyRosterStale')}
+                  </p>
+                )}
                 <div data-testid="lobby-roster" aria-live="polite" className="space-y-1 text-xs">
                   {room.participants.map(player => (
                     <p key={player.playerId} className="break-words rounded-md bg-secondary p-2">
