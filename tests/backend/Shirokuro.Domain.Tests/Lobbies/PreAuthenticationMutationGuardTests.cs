@@ -207,6 +207,199 @@ public sealed class PreAuthenticationMutationGuardTests
     }
 
     [Fact]
+    public async Task DrainingJoinRejectsBeforeGuestRedisWithoutMaskingRequestGuards()
+    {
+        var cache = new CountingCache();
+        var limiter = new CountingLimiter();
+        var drain = new ManualDrainSignal();
+        using var server = Production(cache, limiter, stubReadiness: true,
+            drain: drain);
+        using var anonymous = Client(server);
+        var cookie = await Issue(anonymous, "https://game.example");
+        using var guest = Client(server, cookie: cookie);
+        using (var active = await guest.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+
+        var reads = cache.Reads;
+        Assert.True(reads > 0);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+        const string roomId = "room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var joinPath = "/api/lobbies/" + roomId + "/join";
+
+        drain.Stop();
+        cache.Unavailable = true;
+        limiter.Unavailable = true;
+        foreach (var client in new[] { anonymous, guest })
+        {
+            using var request = Mutation(HttpMethod.Post, joinPath,
+                "https://game.example");
+            request.Content = new StringContent(
+                """{"teamId":"black","expectedRevision":1}""",
+                Encoding.UTF8, "application/json");
+            using var rejected = await client.SendAsync(request);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Retry-After"));
+            Assert.False(rejected.Headers.Contains("ETag"));
+            Assert.DoesNotContain(roomId,
+                await rejected.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        }
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+
+        // Route, room ID, origin and declared body checks still happen
+        // before host drain, without revealing the real lobby or cookie.
+        using (var malformed = Mutation(HttpMethod.Post,
+                   "/api/lobbies/bad/join", "https://game.example"))
+        {
+            malformed.Content = new StringContent("{}",
+                Encoding.UTF8, "application/json");
+            using var rejected = await guest.SendAsync(malformed);
+            Assert.Equal(HttpStatusCode.NotFound, rejected.StatusCode);
+        }
+        using (var wrong = Mutation(HttpMethod.Put, joinPath,
+                   "https://game.example"))
+        using (var rejected = await guest.SendAsync(wrong))
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, rejected.StatusCode);
+        using (var hostile = Mutation(HttpMethod.Post, joinPath,
+                   "https://attacker.example"))
+        {
+            hostile.Content = new StringContent("{}",
+                Encoding.UTF8, "application/json");
+            using var rejected = await guest.SendAsync(hostile);
+            Assert.Equal(HttpStatusCode.Forbidden, rejected.StatusCode);
+        }
+        using (var badMedia = Mutation(HttpMethod.Post, joinPath,
+                   "https://game.example"))
+        {
+            badMedia.Content = new StringContent("invalid",
+                Encoding.UTF8, "text/plain");
+            using var rejected = await guest.SendAsync(badMedia);
+            Assert.Equal(HttpStatusCode.UnsupportedMediaType, rejected.StatusCode);
+        }
+        using (var tooLarge = Mutation(HttpMethod.Post, joinPath,
+                   "https://game.example"))
+        {
+            tooLarge.Content = new StringContent(new string('x', 5000),
+                Encoding.UTF8, "application/json");
+            using var rejected = await guest.SendAsync(tooLarge);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected.StatusCode);
+        }
+        Assert.Equal(reads, cache.Reads);
+        Assert.Equal(1, limiter.Calls);
+
+        using (var health = await guest.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        using (var ready = await guest.GetAsync("/api/ready"))
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+
+        // The join fence does not skip authentication on other mutations.
+        using var hero = Mutation(HttpMethod.Patch,
+            "/api/lobbies/" + roomId + "/hero", "https://game.example");
+        hero.Content = new StringContent(
+            """{"heroId":"kira","expectedRevision":1}""",
+            Encoding.UTF8, "application/json");
+        using var denied = await guest.SendAsync(hero);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+        Assert.Equal(reads + 1, cache.Reads);
+        Assert.Equal(1, cache.Writes);
+        Assert.Equal(1, limiter.Calls);
+    }
+
+    [Fact]
+    public async Task DevelopmentJoinCannotAdmitThirdGuestAfterDrainButLeaveStillWorks()
+    {
+        var drain = new ManualDrainSignal();
+        using var server = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseEnvironment("Development");
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IReadinessDrainSignal>();
+                    services.AddSingleton<IReadinessDrainSignal>(drain);
+                });
+            });
+        using var anonymous = Client(server, development: true);
+        var ownerCookie = await Issue(anonymous, "http://localhost");
+        var secondCookie = await Issue(anonymous, "http://localhost");
+        var thirdCookie = await Issue(anonymous, "http://localhost");
+        using var owner = Client(server, development: true, cookie: ownerCookie);
+        using var second = Client(server, development: true, cookie: secondCookie);
+        using var third = Client(server, development: true, cookie: thirdCookie);
+
+        using var me = await owner.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+        using var ownerJson = JsonDocument.Parse(await me.Content.ReadAsStringAsync());
+        var ownerId = ownerJson.RootElement.GetProperty("playerId").GetString()!;
+        using var create = Mutation(HttpMethod.Post, "/api/lobbies", "http://localhost");
+        create.Content = new StringContent(
+            """{"teamIds":["white","black"],"teamId":"white"}""",
+            Encoding.UTF8, "application/json");
+        using var created = await owner.SendAsync(create);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdJson = JsonDocument.Parse(
+            await created.Content.ReadAsStringAsync());
+        var roomId = createdJson.RootElement.GetProperty("lobbyId").GetString()!;
+
+        var joinPath = "/api/lobbies/" + roomId + "/join";
+        using (var join = Mutation(HttpMethod.Post, joinPath, "http://localhost"))
+        {
+            join.Content = new StringContent(
+                """{"teamId":"black","expectedRevision":1}""",
+                Encoding.UTF8, "application/json");
+            using var joined = await second.SendAsync(join);
+            Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
+        }
+
+        var lobby = server.Services.GetRequiredService<
+            Shirokuro.Api.Lobbies.IAsyncGuestLobby>();
+        var before = await lobby.PeekForMemberAsync(roomId, ownerId);
+        Assert.Equal(2, before.Revision);
+        Assert.Equal(2, before.Participants.Count);
+
+        drain.Stop();
+        using (var join = Mutation(HttpMethod.Post, joinPath, "http://localhost"))
+        {
+            join.Content = new StringContent(
+                """{"teamId":"black","expectedRevision":2}""",
+                Encoding.UTF8, "application/json");
+            using var rejected = await third.SendAsync(join);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+            Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Retry-After"));
+        }
+
+        var unchanged = await lobby.PeekForMemberAsync(roomId, ownerId);
+        Assert.Equal(before.Revision, unchanged.Revision);
+        Assert.Equal(2, unchanged.Participants.Count);
+        // Existing members must be able to leave and release capacity
+        // even though a new participant is refused by the draining node.
+        using (var leave = Mutation(HttpMethod.Delete,
+                   "/api/lobbies/" + roomId + "/membership", "http://localhost"))
+        {
+            leave.Content = new StringContent(
+                """{"expectedRevision":2}""",
+                Encoding.UTF8, "application/json");
+            using var left = await second.SendAsync(leave);
+            Assert.Equal(HttpStatusCode.NoContent, left.StatusCode);
+        }
+        var after = await lobby.PeekForMemberAsync(roomId, ownerId);
+        Assert.Equal(3, after.Revision);
+        Assert.Single(after.Participants);
+        Assert.Equal(ownerId, after.Participants[0].PlayerId);
+
+        using var logout = Mutation(HttpMethod.Delete, "/api/sessions/guest",
+            "http://localhost");
+        using var revoked = await owner.SendAsync(logout);
+        Assert.Equal(HttpStatusCode.NoContent, revoked.StatusCode);
+    }
+
+    [Fact]
     public async Task DrainingNodeRejectsOnlyNewAdmissionsBeforeGuestRedisAndQuota()
     {
         var cache = new CountingCache();
