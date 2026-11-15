@@ -121,8 +121,8 @@ public sealed class ReadinessDrainTests
     }
 
     [Theory]
-    [InlineData(Environments.Development)]
-    [InlineData(Environments.Production)]
+    [InlineData("Development")]
+    [InlineData("Production")]
     public async Task DrainingNodeNeverResolvesReadinessOrStartsRedisProbe(
         string environment)
     {
@@ -155,8 +155,8 @@ public sealed class ReadinessDrainTests
     }
 
     [Theory]
-    [InlineData(Environments.Development)]
-    [InlineData(Environments.Production)]
+    [InlineData("Development")]
+    [InlineData("Production")]
     public async Task SuccessfulOrCachedReadyCannotSurviveHostShutdown(
         string environment)
     {
@@ -184,8 +184,8 @@ public sealed class ReadinessDrainTests
     }
 
     [Theory]
-    [InlineData(Environments.Development)]
-    [InlineData(Environments.Production)]
+    [InlineData("Development")]
+    [InlineData("Production")]
     public async Task ProbeCompletingAfterShutdownCannotPublishReady(
         string environment)
     {
