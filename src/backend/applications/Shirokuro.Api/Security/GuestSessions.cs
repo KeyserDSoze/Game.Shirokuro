@@ -11,6 +11,11 @@ public static class GuestSessions
     public const string GuestKind = "guest";
     public const string SessionIdClaim = "shirokuro:session_id";
 
+    // Per-request, server-owned signal: a signed cookie contained a principal
+    // this application cannot authenticate (no verified account scheme).
+    // Prevent the public guest issuance route from silently replacing it.
+    public static readonly object UnsupportedTicketRequestMarker = new();
+
     public static string NewPlayerId()
         => "guest-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
 
