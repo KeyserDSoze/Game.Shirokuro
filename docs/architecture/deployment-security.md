@@ -2696,3 +2696,38 @@ non riguarda ancora l'osservazione delle mosse nascoste del futuro match
 (#3/#9) e non simula una rete TCP/TLS reale, bilanciatore, WebSocket tra
 nodi o Redis failover di produzione. La validazione di rollout con load
 balancer e i casi cross-node di #21 restano necessari.
+
+## Fence di revoca dopo roster asincrono SignalR — #160
+
+Per un `GetRoster(lobbyId)` guest ricevuto su WebSocket già
+autenticato il server non presume che l'autorizzazione della connessione
+sia eterna. Oltre alla verifica guest iniziale, `LobbyRosterHub`
+controlla `GuestSessionRegistry.IsActiveAsync` **dopo** l'`await`
+della lettura member-scoped e **prima** di ritornare il DTO al trasporto
+SignalR. Se il ticket è stato revocato mentre il backend Redis rispondeva,
+o se non è più verificabile per indisponibilità dell'autorità, ritorna
+solo `HubException("Lobby unavailable.")`: non il roster già letto.
+La fence di preStop viene ricontrollata dopo la seconda richiesta, così
+il drain resta fail-closed anche se inizia durante quest'ultima.
+
+**Impatto operativo:** ogni `GetRoster` guest riuscito causa due
+validazioni di sessione contro l'autorità configurata (in
+Production/Staging: **due letture Redis**), oltre all'accesso al
+roster. Monitorare la latenza del path e gli errori Redis; non
+introdurre cache positiva per aggirare la revoca server-side.
+Questo riduce una finestra ben definita, **non** è una transazione
+atomica tra revoca, lettura e network send: una revoca che accade
+dopo il controllo finale può concorrere con la serializzazione/invio.
+Per la garanzia forte di annullamento immediato anche dopo la
+verifica finale servirebbe un protocollo di fencing distribuito e/o
+interruzione delle connessioni già attive tra nodi (resta #21).
+Nessuna di queste verifiche riguarda ancora match/PvP osservazioni
+nascoste (#3/#9).
+
+La regressione xUnit simula due registry su `IDistributedCache`
+condivisa e blocca deterministicamente una lettura mentre il secondo
+registro revoca; la prova WebSocket integra `DELETE /api/sessions/guest`
+HTTP con due connessioni SignalR e una lettura ritardata. Entrambe
+isolano un preciso ordine di operazioni. TestServer in-process non
+sostituisce TCP/TLS reale, ingress LB, Redis reale tra processi o rollout
+Kubernetes di produzione.
