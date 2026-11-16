@@ -269,9 +269,26 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(protectedMember);
-        await AwaitRedisAsync(
-            _database.SortedSetRemoveAsync(_key, protectedMember),
+        // ZREM is not sufficient proof that a completed cleanup item has
+        // left the durable queue: a silently ignored delete otherwise makes
+        // the worker falsely acknowledge work that remains in every sweep.
+        // Check ABSENCE on the same Redis connector and exact encrypted
+        // member, including when another node already removed it (ZREM=false).
+        // Both operations share a single 2s deadline, with cancellation
+        // checked before the second network dispatch.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        await _database.SortedSetRemoveAsync(_key, protectedMember)
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
+        var remainingScore = await _database.SortedSetScoreAsync(
+                _key, protectedMember)
+            .WaitAsync(timeout.Token);
+        if (remainingScore is not null)
+            throw new InvalidOperationException(
+                "Guest expiry acknowledgement was not confirmed.");
+        timeout.Token.ThrowIfCancellationRequested();
     }
 
     // Cancel the caller's wait, not Redis's already-sent operation.
