@@ -185,3 +185,5 @@ Tests exercise two Production TestServers sharing a cache which ignores
 remove, corrupts the verification read or blocks it, including cross-node
 cookie replay and recovery after an unconfirmed delete. Parent #21 remains
 open for staging/multi-pod and operational failover validation.
+
+Validation: [main CI #43899998215](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43899998215) passed all three jobs on `3707e3f`: 796 standard xUnit, 21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest, 43 Playwright, 35 Python and builds. The two preStop/issuance-drain rollback tests now explicitly count the additional post-delete authority read rather than weakening deletion invariants.
