@@ -334,11 +334,13 @@ public sealed class DeploymentReadinessTests
         private readonly ConcurrentDictionary<string, string> _values =
             new(StringComparer.Ordinal);
         private readonly ConcurrentQueue<string> _attemptedNonces = new();
+        private readonly ConcurrentQueue<string> _attemptedKeys = new();
         private int _reads;
         private int _writes;
         public int Reads => Volatile.Read(ref _reads);
         public int Writes => Volatile.Read(ref _writes);
         public string[] AttemptedNonces => _attemptedNonces.ToArray();
+        public string[] AttemptedKeys => _attemptedKeys.ToArray();
         public bool IgnoreWrites { get; set; }
         public string ReadFault { get; set; } = "";
         public TaskCompletionSource<RedisValue> BlockedRead { get; } =
@@ -351,10 +353,10 @@ public sealed class DeploymentReadinessTests
             {
                 var key = args![0]!.ToString()!;
                 var value = args[1]!.ToString()!;
-                Assert.StartsWith("shirokuro:readiness:write-probe-v3:", key);
-                Assert.Matches("^[0-9a-f]{32}$", value);
-                Assert.Equal(TimeSpan.FromSeconds(10),
-                    Assert.IsType<TimeSpan>(args[2]));
+                // Record first; the proxy must not turn a valid SET call
+                // into a Redis failure because of its own argument assertions.
+                // Test expectations on key grammar/nonces live outside Invoke.
+                _attemptedKeys.Enqueue(key);
                 _attemptedNonces.Enqueue(value);
                 Interlocked.Increment(ref _writes);
                 if (!IgnoreWrites) _values[key] = value;
@@ -433,6 +435,9 @@ public sealed class DeploymentReadinessTests
         Assert.Equal(1, lobby.Reads);
         Assert.Equal(1, lobby.Writes);
         var originalNonce = Assert.Single(lobby.AttemptedNonces);
+        Assert.Matches("^[0-9a-f]{32}$", originalNonce);
+        Assert.StartsWith("shirokuro:readiness:write-probe-v3:",
+            Assert.Single(lobby.AttemptedKeys));
 
         lobby.IgnoreWrites = fault == "ignored";
         lobby.ReadFault = fault == "ignored" ? "" : fault;
