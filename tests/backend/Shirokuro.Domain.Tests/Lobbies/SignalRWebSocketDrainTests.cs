@@ -335,6 +335,141 @@ public sealed class SignalRWebSocketDrainTests
         Assert.False(rejected.Headers.Contains("Set-Cookie"));
     }
 
+
+    [Fact]
+    public async Task HttpLeaveImmediatelyRemovesRosterPermissionFromExistingWebSocket()
+    {
+        using var server = Server();
+        const string otherGuestId = "guest-dddddddddddddddddddddddddddddddd";
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        coordinator.Join(Room, otherGuestId, "black", 1);
+
+        var leaving = TicketFor(server);
+        var remaining = TicketFor(server, otherGuestId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var leavingSocket = await ConnectAndHandshakeAsync(server, leaving.Cookie,
+            timeout.Token);
+        using var remainingSocket = await ConnectAndHandshakeAsync(server, remaining.Cookie,
+            timeout.Token);
+
+        var before = await InvokeRosterAsync(leavingSocket, Room, "leave-before",
+            timeout.Token);
+        Assert.False(before.TryGetProperty("error", out _));
+        Assert.Equal(2, before.GetProperty("result")
+            .GetProperty("participants").GetArrayLength());
+
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+        using var leave = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/lobbies/" + Room + "/membership");
+        leave.Headers.TryAddWithoutValidation("Cookie", leaving.Cookie);
+        leave.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        leave.Headers.TryAddWithoutValidation(WebMutationGuard.RequestHeaderName,
+            WebMutationGuard.RequestHeaderValue);
+        leave.Content = new StringContent(
+            "{\"expectedRevision\":2}", Encoding.UTF8, "application/json");
+        using var left = await http.SendAsync(leave, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, left.StatusCode);
+        Assert.Equal("no-store", left.Headers.CacheControl?.ToString());
+
+        // Auth is still valid, but room membership is not. A connected
+        // SignalR transport must re-check membership on EVERY invocation.
+        var denied = await InvokeRosterAsync(leavingSocket, Room, "leave-after",
+            timeout.Token);
+        Assert.True(denied.TryGetProperty("error", out _));
+        Assert.False(denied.TryGetProperty("result", out _));
+        Assert.DoesNotContain(Room, denied.GetRawText());
+        Assert.DoesNotContain(otherGuestId, denied.GetRawText());
+
+        using var me = new HttpRequestMessage(HttpMethod.Get, "/api/sessions/me");
+        me.Headers.TryAddWithoutValidation("Cookie", leaving.Cookie);
+        using var stillSignedIn = await http.SendAsync(me, timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, stillSignedIn.StatusCode);
+
+        var survivor = await InvokeRosterAsync(remainingSocket, Room,
+            "leave-survivor", timeout.Token);
+        Assert.False(survivor.TryGetProperty("error", out _));
+        var view = survivor.GetProperty("result");
+        Assert.Equal(3, view.GetProperty("revision").GetInt64());
+        var member = Assert.Single(view.GetProperty("participants").EnumerateArray());
+        Assert.Equal(otherGuestId, member.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(GuestId, survivor.GetRawText());
+    }
+
+    [Fact]
+    public async Task HttpGuestLogoutRevokesExistingWebSocketButNotOtherPlayersSocket()
+    {
+        using var server = Server();
+        const string otherGuestId = "guest-dddddddddddddddddddddddddddddddd";
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        coordinator.Join(Room, otherGuestId, "black", 1);
+
+        var departing = TicketFor(server);
+        var remaining = TicketFor(server, otherGuestId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var departingSocket = await ConnectAndHandshakeAsync(server,
+            departing.Cookie, timeout.Token);
+        using var remainingSocket = await ConnectAndHandshakeAsync(server,
+            remaining.Cookie, timeout.Token);
+        var prior = await InvokeRosterAsync(departingSocket, Room,
+            "logout-before", timeout.Token);
+        Assert.False(prior.TryGetProperty("error", out _));
+
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+        using var logout = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/sessions/guest");
+        logout.Headers.TryAddWithoutValidation("Cookie", departing.Cookie);
+        logout.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        logout.Headers.TryAddWithoutValidation(WebMutationGuard.RequestHeaderName,
+            WebMutationGuard.RequestHeaderValue);
+        using var result = await http.SendAsync(logout, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, result.StatusCode);
+        Assert.Equal("no-store", result.Headers.CacheControl?.ToString());
+
+        // Real HTTP logout revokes the signed session and cleans all room
+        // memberships; an already-negotiated WebSocket has no grandfathered
+        // permission even though its original cookie was valid on connect.
+        var denied = await InvokeRosterAsync(departingSocket, Room,
+            "logout-after", timeout.Token);
+        Assert.True(denied.TryGetProperty("error", out _));
+        Assert.False(denied.TryGetProperty("result", out _));
+        Assert.DoesNotContain(Room, denied.GetRawText());
+        Assert.DoesNotContain(otherGuestId, denied.GetRawText());
+
+        using var me = new HttpRequestMessage(HttpMethod.Get, "/api/sessions/me");
+        me.Headers.TryAddWithoutValidation("Cookie", departing.Cookie);
+        using var invalid = await http.SendAsync(me, timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, invalid.StatusCode);
+        Assert.Equal("no-store", invalid.Headers.CacheControl?.ToString());
+        Assert.False(invalid.Headers.Contains("Set-Cookie"));
+
+        var survivor = await InvokeRosterAsync(remainingSocket, Room,
+            "logout-survivor", timeout.Token);
+        Assert.False(survivor.TryGetProperty("error", out _));
+        var view = survivor.GetProperty("result");
+        Assert.Equal(3, view.GetProperty("revision").GetInt64());
+        var member = Assert.Single(view.GetProperty("participants").EnumerateArray());
+        Assert.Equal(otherGuestId, member.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(GuestId, survivor.GetRawText());
+
+        using var otherMe = new HttpRequestMessage(HttpMethod.Get,
+            "/api/sessions/me");
+        otherMe.Headers.TryAddWithoutValidation("Cookie", remaining.Cookie);
+        using var valid = await http.SendAsync(otherMe, timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, valid.StatusCode);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
