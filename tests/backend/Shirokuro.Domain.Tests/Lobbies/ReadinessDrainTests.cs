@@ -13,6 +13,14 @@ using Xunit;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
 
+// Node-drain metrics use one process-wide Meter. A test-local MeterListener
+// receives measurements from OTHER xUnit classes running in parallel, too.
+// This collection must not overlap them while asserting exact event counts.
+// Do not disable parallelization across the entire assembly.
+[CollectionDefinition("ExclusiveReadinessDrainMetrics", DisableParallelization = true)]
+public sealed class ExclusiveReadinessDrainMetricsCollection { }
+
+[Collection("ExclusiveReadinessDrainMetrics")]
 public sealed class ReadinessDrainTests
 {
     private sealed class ManualDrain : IReadinessDrainSignal
