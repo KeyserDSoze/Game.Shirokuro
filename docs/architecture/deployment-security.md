@@ -2852,3 +2852,44 @@ cleanup delle membership. Un'altra suite rende indisponibile la cache
 sessioni solo prima della seconda validazione, confermando 503/no
 roster; test di successi e comandi invalidi misurano i lookup Redis.
 Non equivale a una prova di stallo rete tra due pod in produzione.
+
+## Fence preStop sul risultato delle mutazioni lobby HTTP — #164
+
+`POST /api/lobbies`, `POST /api/lobbies/{id}/join` e le due
+`PATCH /api/lobbies/{id}/hero|team` rispondono con un roster
+member-only, e create aggiunge un header `Location` con l'invito.
+Un comando partito prima di `SIGUSR1` può committare su Redis mentre
+il nodo viene ritirato dal load balancer e avere un risultato ancora
+in attesa di pubblicazione. La sola barriera di ammissione iniziale
+non copre questa race.
+
+La funzione `AuthorizedMutationRosterAsync` controlla
+`IReadinessDrainSignal.IsDraining` **subito dopo** l'await del comando
+e **prima** di consultare per la seconda volta il registry guest.
+La fase di drain restituisce HTTP `503` e `Cache-Control: no-store`,
+senza body, `Location`, ETag o `Set-Cookie`: non si attende
+ulteriormente Redis sessioni quando il drain è già rilevabile.
+Un secondo controllo **dopo** `CheckAuthorityAsync` chiude la
+finestra in cui il preStop parte durante quel secondo await. Una
+sessione guest Active non supera il drain; senza drain conserviamo
+i risultati #163 (401 per revoca, 503 per Redis non disponibile).
+
+Il comando originale può avere già modificato la lobby in Redis:
+non viene annullato, ritentato né compensato da una cancellazione
+silenziosa. I guard server-side di nuova ammissione durante drain
+restano separati dalla facoltà degli ospiti già membri di iniziare
+azioni durante la transizione. Questa protezione **nega solo la
+pubblicazione dello snapshot completato**, non è un fence atomico
+fra Redis CAS e rete. La vera chiusura di socket TCP/TLS, la rimozione
+LB/ingress e la convergenza multi-nodo richiedono ancora staging
+dedicato (#21). Non promettere revoca di byte già trasmessi.
+
+Regressione: TestServer con true cookie guest, `IAsyncGuestLobby`
+che committa in `InMemoryLobbyCoordinator` e trattiene solo la
+risposta, `IReadinessDrainSignal` manuale e cache sessioni con
+contatore delle letture. Per ognuna delle quattro route si testa
+drain dopo commit (un solo lookup auth) e drain iniziato esattamente
+durante il secondo lookup (due controlli e 503 anche con Active).
+La suite Linux esistente verifica SIGUSR1 → drain/socket abort →
+SIGTERM su processo reale; i test in-process non sostituiscono
+una prova di rete/convergenza di più pod.
