@@ -208,3 +208,34 @@ Nessun segreto o ID viene restituito in errore HTTP. Le regressioni
 xUnit Production e Redis controllato accompagnano i normali test di
 revoca cross-node; la parent #21 resta aperta per failover operativo,
 account verificati e integrazione atomica cross-store.
+
+
+## Conferma cancellazione ticket restaurato prima dell'ack — #178
+
+Un indice Redis di scadenza restaurato dopo un rollback RDB può
+contenere work item relativi a guest pre-cutover. Solo il work item
+autenticato e cifrato con Data Protection contiene il digest SHA-256
+del token originale: il browser non può scegliere la chiave. Il worker
+verifica prima il fence e ripulisce le membership delle lobby tramite
+CAS, poi può rimuovere il ticket mirato e fare ack del lavoro cifrato.
+
+Da #178 `RemoveRestoredSessionAsync` deve verificare una lettura
+`GetAsync` **nulla della stessa chiave** dopo `RemoveAsync`, entro
+un'unica deadline di **2 secondi**. Se l'adapter Redis ignora DELETE,
+la lettura è non nulla/corrotta, fallisce o rimane bloccata, il work
+item protetto non viene confermato, resta per retry e gli altri
+guest già letti nel batch possono completare la propria pulizia.
+Un secondo tentativo su chiave già assente ha successo senza creare
+alcuna sessione o prolungare una scadenza.
+
+Il logout ordinario mantiene la propria conferma di revoca (#175);
+questa è solo la cancellazione di recovery di un digest autenticato.
+Nessun cookie, player ID, digest, chiave Redis o eccezione privata è
+esposto in risposte HTTP, log o metriche. L'osservazione di assenza
+sul client Redis non garantisce un quorum tra repliche o un corretto
+restore multi-pod. Mantenere il cutoff esterno di disaster recovery
+e il lavoro operativo aperto nella parent #21.
+
+[CI applicativa #43915651694](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43915651694)
+SUCCESS 3/3 su `7de2770`: 816 xUnit, 21 Redis TLS/ACL/HA/Sentinel,
+SIGUSR1 Linux, 347 Vitest, 43 Playwright, 35 Python e build.

@@ -3249,3 +3249,31 @@ staging con più pod e load balancer reale (#21).
 [CI implementativa #43908925553](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43908925553)
 SUCCESS 3/3 su `94e31b4`: 809 xUnit standard, 21 Redis,
 SIGUSR1, 347 Vitest, 43 Playwright, 35 Python, build.
+
+
+## Recovery guest: conferma di cancellazione prima dell'ack — #178
+
+Dopo un RDB rollback, Redis può contenere nuovamente un ticket
+revocato. Il cutoff esterno
+`Security:GuestSessions:AcceptIssuedAfterUtc` rimane essenziale per
+rifiutare i vecchi cookie; la pulizia dell'indice cifrato è una misura
+complementare e non sostituisce quel controllo operativo.
+
+Il worker `GuestSessionExpiryWorker` valida l'entry autenticata
+Data Protection, installa il fence contro le azioni in-flight,
+ripulisce le lobby e, solo per il work item pre-cutover con digest,
+chiama `GuestSessionRegistry.RemoveRestoredSessionAsync`. La rimozione
+fa `REMOVE → GET` della **medesima chiave SHA-256**, con un solo
+timeout di 2s: soltanto un valore assente permette l'ack del lavoro
+persistente. DELETE silenziosamente ignorato, GET non nullo,
+eccezione, timeout o cancellazione non sono una conferma e il lavoro
+resta ritentabile. Il worker continua con altri item indipendenti
+nello stesso batch; chiavi già assenti sono idempotenti.
+
+I test xUnit con cache deterministica simulano lost DELETE, GET
+corrotto, eccezione e lettura bloccata, ripresa, retry e ack
+selettivo del peer sano. Non sono introdotti nuovi endpoint,
+identità, dati privati in risposte/log/metriche o regole PvP.
+La CI mantiene Redis reale TLS/ACL/HA/Sentinel, ma la verifica non
+certifica linearizzabilità cross-replica, restore operator o
+deploy ingress multi-pod: parent #21 aperta.
