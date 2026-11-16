@@ -252,3 +252,26 @@ interno. Un CAS conflittuale non produce un ulteriore roundtrip,
 e resta l'errore di revisione già previsto.
 Questo non altera le regole delle squadre, eroi o attività
 in partita né garantisce quorum Redis multi-replica (#21).
+
+
+## Conferma della rimozione dell'ultima membership — #183
+
+Quando l'ultimo partecipante lascia una stanza PvP, una risposta
+positiva del CAS Redis non è più sufficiente per dichiarare l'uscita
+completata: il server rilegge con un secondo Lua **di sola lettura**
+che la stanza sia assente e, per room quotate, siano assenti entrambi
+gli indici globale e del creatore. Un DELETE apparentemente riuscito
+ma non persistito non produce falso HTTP 204. L'API restituisce
+**503/no-store** senza roster, invito o dati del guest.
+
+La cancellazione e la conferma utilizzano un **unico budget di 2s**;
+un timeout o readback errato non ritenta una mutazione ambigua.
+Un CAS conflittuale conserva invece la semantica di revisione
+esistente, senza una verifica ulteriore. La cancellazione di un
+guest revocato è soggetta al fence già esistente e non altera
+le regole di team/eroe o di visibilità PvP.
+
+Se la stanza è già stata eliminata ma un indice quota è rimasto,
+la verifica non dichiara successo: l'indice residuale è soggetto
+alla propria TTL/bonifica operativa (#21). Questo non certifica
+un quorum Redis cross-replica o un deployment multi-pod reale.

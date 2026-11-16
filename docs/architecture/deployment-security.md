@@ -3446,3 +3446,67 @@ CI Redis TLS/ACL/HA/Sentinel ed E2E browser rimasti obbligatori.
 L'osservazione sul singolo connettore non dimostra un quorum
 cross-replica, un deploy multi-pod/staging reale o atomicità tra
 sessioni, lobby e ingress; parent #21 ancora aperta.
+
+
+## Verifica di cancellazione stanza e indici Redis dopo CAS — #183
+
+I follow-up #181 e #182 verificano la persistenza della creazione e
+dell'aggiornamento delle lobby PvP. La #183 completa la conferma
+della **rimozione dell'ultima membership** e dell'eliminazione della
+stanza in `RedisLobbySnapshotStore.DeleteIfCurrentAsync`.
+Questo percorso è utilizzato sia da un utente autenticato che lascia
+la stanza per ultimo, sia dal cleanup server-side dopo revoca o
+scadenza della sessione guest.
+
+Il primo Lua confronta lo snapshot corrente, controlla il fence
+di revoca quando necessario ed esegue `DEL` della room e, per
+room con quota, `ZREM` da entrambi gli indici globale e creator.
+Un risultato Lua pari a 1 non prova da solo che l'intera rimozione
+sia stata persistita: un adapter/failover può dichiarare il comando
+riuscito quando solo parte della cancellazione è osservabile.
+
+**Solo su DELETE=1**, un secondo Lua **read-only** sullo stesso
+connettore/cluster hash slot conferma `GET room = nil`, più
+`ZSCORE global = nil` e `ZSCORE creator = nil` per la stessa
+chiave stanza se `QuotaTracked` è vero. Per room legacy senza
+quota si conferma solo la scomparsa del record. Il risultato verso
+.NET è un solo flag numerico, senza roster, playerId, cookie,
+inviti o altre informazioni sensibili. Non modifica scadenze né
+indice, e non ha side effect di ripristino.
+
+DELETE e verifica condividono **un'unica deadline di 2 secondi**,
+con cancellation check fra i dispatch. Se il Lua restituisce 0
+(revisione non corrente), non viene inviato alcun readback; se
+restituisce -1, resta il rifiuto del guest già revocato.
+Se lo snapshot o uno degli indici permane, oppure il readback
+fallisce, stalla o viene cancellato, l'operazione **non comunica
+successo**: usa l'eccezione opaca
+`LobbyMutationUnavailableException` già gestita dall'API con
+**503/no-store senza Set-Cookie o roster**, o propaga
+errore/timeout in modo fail-closed. Nessun retry automatico di un
+DELETE con esito incerto. La successiva valutazione del worker
+rimane idempotente e non deve ackare prematuramente il lavoro
+che ha appena fallito.
+
+14 nuovi test xUnit deterministici con `IDatabase DispatchProxy`
+iniettano DELETE ignorato, room persistente, ZREM globale/creator
+ignorato, readback falsato/fallito/bloccato, cancellation fra Lua,
+pre-cancel, CAS=0/fence=-1, stato legacy non quotato e
+ritentabilità in scenario recuperato. Un TestServer Production con
+cookie guest firmato richiede 503/no-store senza leak quando il
+DELETE viene ignorato, quindi 204 dopo il ripristino. Le suite
+Redis TLS/ACL/HA/Sentinel reali, smoke Linux, Vitest e Playwright
+restano obbligatorie.
+
+**Limiti:** un orfano di solo indice (dopo DEL riuscito ma ZREM
+perso) può mantenere occupata una quota fino alla scadenza
+dell'indice o a una bonifica operativa; questa verifica rileva il
+problema ma non promette ripristino automatico di dati già persi.
+La conferma sul connettore non dimostra quorum replica,
+linearizzabilità fra repliche né staging multi-pod reale:
+parent #21 ancora aperta.
+
+[CI implementativa #43957013734](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43957013734)
+**SUCCESS 3/3** sull'HEAD codice `0a8d47d`: 885 xUnit standard,
+21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest,
+43 Playwright, 35 Python e builds.
