@@ -3112,3 +3112,28 @@ sul commit docs-only della #168, dopo una CI 3/3 verde con la
 medesima logica runtime. La risoluzione resta subordinata a CI verde
 sull'HEAD finale e non sostituisce i test reali di rolling restart
 e ingress multi-pod della parent #21.
+
+
+## Revoca sessione tra SignalR negotiate e WebSocket upgrade — #170
+
+Un risultato positivo di `POST /hubs/lobbies/negotiate?negotiateVersion=1`
+crea un **opaque connection token locale al nodo**, non un titolo di
+accesso persistente. Anche il successivo WebSocket `GET /hubs/lobbies?id=...`
+deve superare nuovamente l'autenticazione del cookie guest e la verifica
+server-side del ticket: il token negoziato non è una credenziale.
+
+La regressione xUnit TestServer della #170 crea Alice e Bob con sessioni
+firmate e un roster pre-match. Alice ottiene negotiate 200 e poi invoca
+il vero `DELETE /api/sessions/guest` **prima dell'upgrade**: vecchio
+cookie + connection token già assegnato non devono completare il
+WebSocket. `GET /api/sessions/me` risponde 401/no-store senza Set-Cookie.
+La connessione negoziata di Bob resta valida e legge soltanto il proprio
+roster (Alice rimossa). Ci sono timeout bounded; nessun token/cookie viene
+stampato. Questa prova non abilita endpoint pubblici aggiuntivi e non
+modifica alcuna regola PvP.
+
+La suite è in-process TestServer/Development: dimostra il confine auth
+HTTP→WebSocket, **non** un redirect/upgrade WSS affidabile su due nodi,
+né rotazione cookie, failure/reconnect, aggiornamento hash LB o ingress
+sticky di staging. La #168 copre separatamente il percorso TLS Nginx;
+la #21 resta aperta per deployment multi-pod reale.
