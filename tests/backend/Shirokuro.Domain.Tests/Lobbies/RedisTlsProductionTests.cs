@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -230,6 +232,255 @@ public sealed class RedisTlsProductionTests
                 .ToArray();
             Assert.Single(participants);
             Assert.Equal(bob, participants[0].GetProperty("playerId").GetString());
+        }
+    }
+
+
+    private const char SignalRRecordSeparator = '\u001e';
+
+    private static async Task SendSignalRJsonAsync(
+        WebSocket socket, string json, CancellationToken cancellationToken)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json + SignalRRecordSeparator);
+        await socket.SendAsync(new ArraySegment<byte>(bytes),
+            WebSocketMessageType.Text, endOfMessage: true, cancellationToken);
+    }
+
+    private static async Task<JsonElement> ReceiveSignalRJsonAsync(
+        WebSocket socket, Func<JsonElement, bool> predicate,
+        CancellationToken cancellationToken)
+    {
+        var bytes = new byte[8192];
+        var remaining = new StringBuilder();
+        while (true)
+        {
+            var received = await socket.ReceiveAsync(
+                new ArraySegment<byte>(bytes), cancellationToken);
+            Assert.Equal(WebSocketMessageType.Text, received.MessageType);
+            remaining.Append(Encoding.UTF8.GetString(bytes, 0, received.Count));
+            var fragment = remaining.ToString();
+            var separator = fragment.IndexOf(SignalRRecordSeparator);
+            while (separator >= 0)
+            {
+                var frame = fragment[..separator];
+                fragment = fragment[(separator + 1)..];
+                if (frame.Length > 0)
+                {
+                    using var parsed = JsonDocument.Parse(frame);
+                    if (predicate(parsed.RootElement))
+                        return parsed.RootElement.Clone();
+                }
+                separator = fragment.IndexOf(SignalRRecordSeparator);
+            }
+            remaining.Clear();
+            remaining.Append(fragment);
+            Assert.True(remaining.Length < 65536, "Oversized SignalR JSON frame.");
+        }
+    }
+
+    private static async Task<WebSocket> ConnectTlsProductionHubAsync(
+        WebApplicationFactory<Program> server, string cookie,
+        CancellationToken cancellationToken)
+    {
+        var webSockets = server.Server.CreateWebSocketClient();
+        webSockets.ConfigureRequest = request =>
+        {
+            request.Headers["Cookie"] = cookie;
+            // Browser-equivalent, verified same-origin WSS upgrade: no
+            // X-Forwarded-Proto, spoofed user ID or debug auth override.
+            request.Headers["Origin"] = "https://game.example";
+        };
+        var socket = await webSockets.ConnectAsync(
+            new Uri("wss://game.example/hubs/lobbies"), cancellationToken);
+        try
+        {
+            await SendSignalRJsonAsync(socket,
+                "{\"protocol\":\"json\",\"version\":1}", cancellationToken);
+            var handshake = await ReceiveSignalRJsonAsync(socket,
+                message => !message.TryGetProperty("type", out _),
+                cancellationToken);
+            Assert.Equal("{}", handshake.GetRawText());
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<JsonElement> InvokeTlsRosterAsync(
+        WebSocket socket, string room, string invocation,
+        CancellationToken cancellationToken)
+    {
+        await SendSignalRJsonAsync(socket, JsonSerializer.Serialize(new
+        {
+            type = 1, invocationId = invocation,
+            target = "GetRoster", arguments = new[] { room }
+        }), cancellationToken);
+        return await ReceiveSignalRJsonAsync(socket,
+            message => message.TryGetProperty("type", out var type) &&
+                type.GetInt32() == 3 &&
+                message.TryGetProperty("invocationId", out var id) &&
+                id.GetString() == invocation,
+            cancellationToken);
+    }
+
+    private static void AssertOpaqueRosterDenial(
+        JsonElement completion, string room, string alice, string bob)
+    {
+        Assert.True(completion.TryGetProperty("error", out var error));
+        Assert.False(string.IsNullOrWhiteSpace(error.GetString()));
+        Assert.False(completion.TryGetProperty("result", out _));
+        var json = completion.GetRawText();
+        Assert.DoesNotContain(room, json, StringComparison.Ordinal);
+        Assert.DoesNotContain(alice, json, StringComparison.Ordinal);
+        Assert.DoesNotContain(bob, json, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", json, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CrossNodeProductionTlsRealSignalRWebSocketsHonorJoinAndRemoteLogout()
+    {
+        // This case executes under the actual TLS Redis CI filter. Standard
+        // no-Redis xUnit runs intentionally skip external service setup.
+        if (Connection is null) return;
+        Assert.True(ConfigurationOptions.Parse(Connection).Ssl);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        using var first = Server();
+        using var second = Server();
+        using var visitorA = Client(first);
+        using var visitorB = Client(second);
+        var (alice, aliceCookie) = await Login(visitorA);
+        var (bob, bobCookie) = await Login(visitorB);
+        Assert.NotEqual(alice, bob);
+
+        using var aliceA = Client(first, aliceCookie);
+        using var aliceB = Client(second, aliceCookie);
+        using var bobB = Client(second, bobCookie);
+        using var bobA = Client(first, bobCookie);
+
+        string room;
+        using (var create = Mutation(HttpMethod.Post, "/api/lobbies",
+                   new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+        using (var created = await aliceA.SendAsync(create, timeout.Token))
+        {
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            using var json = JsonDocument.Parse(
+                await created.Content.ReadAsStringAsync(timeout.Token));
+            room = json.RootElement.GetProperty("lobbyId").GetString()!;
+        }
+
+        // Three actual authenticated SignalR JSON/WebSocket transports:
+        // Alice's ticket issued by A works on both A and B (shared
+        // persistent DP ring + session authority); Bob connects on B.
+        using var socketAliceA = await ConnectTlsProductionHubAsync(
+            first, aliceCookie, timeout.Token);
+        using var socketAliceB = await ConnectTlsProductionHubAsync(
+            second, aliceCookie, timeout.Token);
+        using var socketBobB = await ConnectTlsProductionHubAsync(
+            second, bobCookie, timeout.Token);
+
+        var outsider = await InvokeTlsRosterAsync(socketBobB, room,
+            "before-join", timeout.Token);
+        // Missing membership and missing room must be indistinguishable on
+        // this same authenticated WebSocket, before any join occurs.
+        var missing = await InvokeTlsRosterAsync(socketBobB,
+            "room-00000000000000000000000000000000",
+            "missing-room", timeout.Token);
+        AssertOpaqueRosterDenial(outsider, room, alice, bob);
+        AssertOpaqueRosterDenial(missing, room, alice, bob);
+        Assert.Equal(missing.GetProperty("error").GetString(),
+            outsider.GetProperty("error").GetString());
+
+        var aliceBefore = await InvokeTlsRosterAsync(socketAliceA,
+            room, "alice-before", timeout.Token);
+        Assert.False(aliceBefore.TryGetProperty("error", out _));
+        Assert.Equal(alice, Assert.Single(aliceBefore.GetProperty("result")
+            .GetProperty("participants").EnumerateArray())
+            .GetProperty("playerId").GetString());
+
+        // Bob's previously denied socket becomes authorized after a real
+        // cross-node Redis Lua admission (not a cached positive/negative
+        // authorization decision in a HubCallerContext mock).
+        using (var join = Mutation(HttpMethod.Post,
+            "/api/lobbies/" + room + "/join",
+            new { teamId = "black", expectedRevision = 1L }))
+        using (var joined = await bobB.SendAsync(join, timeout.Token))
+            Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
+
+        foreach (var (socket, invocation) in new[]
+        {
+            (socketAliceA, "alice-on-A"),
+            (socketAliceB, "alice-on-B"),
+            (socketBobB, "bob-on-B")
+        })
+        {
+            var completed = await InvokeTlsRosterAsync(socket, room, invocation,
+                timeout.Token);
+            Assert.False(completed.TryGetProperty("error", out _));
+            var roster = completed.GetProperty("result");
+            Assert.Equal(room, roster.GetProperty("lobbyId").GetString());
+            Assert.Equal(2, roster.GetProperty("revision").GetInt64());
+            var members = roster.GetProperty("participants").EnumerateArray()
+                .Select(member => member.GetProperty("playerId").GetString()).ToArray();
+            Assert.Equal(2, members.Length);
+            Assert.Contains(alice, members);
+            Assert.Contains(bob, members);
+        }
+
+        // Logout on node B revokes Alice's Redis TLS ticket and fences stale
+        // writes. Both already-open sockets must re-authorize, including the
+        // socket served by independent node A.
+        using (var logout = Mutation(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var revoked = await aliceB.SendAsync(logout, timeout.Token))
+        {
+            Assert.Equal(HttpStatusCode.NoContent, revoked.StatusCode);
+            Assert.True(revoked.Headers.CacheControl?.NoStore == true);
+        }
+
+        AssertOpaqueRosterDenial(
+            await InvokeTlsRosterAsync(socketAliceA, room,
+                "alice-after-on-A", timeout.Token), room, alice, bob);
+        AssertOpaqueRosterDenial(
+            await InvokeTlsRosterAsync(socketAliceB, room,
+                "alice-after-on-B", timeout.Token), room, alice, bob);
+
+        using (var meA = await aliceA.GetAsync("/api/sessions/me", timeout.Token))
+        using (var meB = await aliceB.GetAsync("/api/sessions/me", timeout.Token))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, meA.StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, meB.StatusCode);
+            Assert.False(meA.Headers.Contains("Set-Cookie"));
+            Assert.False(meB.Headers.Contains("Set-Cookie"));
+        }
+
+        var survivor = await InvokeTlsRosterAsync(socketBobB,
+            room, "bob-survives", timeout.Token);
+        Assert.False(survivor.TryGetProperty("error", out _));
+        var surviving = survivor.GetProperty("result");
+        Assert.Equal(3, surviving.GetProperty("revision").GetInt64());
+        Assert.Equal(bob, Assert.Single(surviving.GetProperty("participants")
+            .EnumerateArray()).GetProperty("playerId").GetString());
+        Assert.DoesNotContain(alice, survivor.GetRawText(), StringComparison.Ordinal);
+        using (var validA = await bobA.GetAsync("/api/sessions/me", timeout.Token))
+        using (var validB = await bobB.GetAsync("/api/sessions/me", timeout.Token))
+        {
+            Assert.Equal(HttpStatusCode.OK, validA.StatusCode);
+            Assert.Equal(HttpStatusCode.OK, validB.StatusCode);
+        }
+
+        // An old cookie cannot negotiate a *new* SignalR connection on
+        // either node after revocation; no location or replacement cookie.
+        foreach (var client in new[] { aliceA, aliceB })
+        {
+            using var rejected = await client.PostAsync(
+                "/hubs/lobbies/negotiate?negotiateVersion=1",
+                content: null, timeout.Token);
+            Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+            Assert.True(rejected.Headers.CacheControl?.NoStore == true);
+            Assert.False(rejected.Headers.Contains("Set-Cookie"));
+            Assert.False(rejected.Headers.Contains("Location"));
         }
     }
 
