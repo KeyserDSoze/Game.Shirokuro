@@ -3082,3 +3082,33 @@ dimostra affinity durante refresh, reconnect automatico, backend
 down, scaling, sessioni account persistenti, due pod su host
 diversi, WAF o certificati esterni. Nessuna configurazione Nginx
 di test va copiata come deployment completo. Parent #21 aperta.
+
+## Verifica SIGUSR1 del child smoke e ordine callback — #169
+
+La callback Linux di `HostLifetimeReadinessDrainSignal.BeginPreStopDrain`
+pubblica subito `IsDraining`, poi invoca
+`CancellationTokenSource.Cancel` per notificare gli iscritti,
+fra cui `LobbyConnectionDrainRegistry.BeginDraining` che esegue
+`HubCallerContext.Abort()` sui socket. La cancellazione del token
+è osservabile **prima** che tutte le callback siano terminate;
+non è corretto dedurre da `Task.Delay(…, PreStopStarted)` che il
+registro di connessioni abbia già tentato tutti gli abort.
+
+Lo smoke Linux isolato `Shirokuro.PreStopSignalSmoke` prima verifica
+immediatamente che il preStop sia attivo e che `ApplicationStopping`
+**non** sia stato cancellato. Poi esegue una attesa asincrona
+condizionale e **bounded (massimo 500 × 10 ms)** soltanto fino a
+`registry.IsDraining` e `socket.AbortCount > 0`; il controllo
+finale esige esattamente **uno** `Abort()`, registry drenato e
+processo ancora vivo. Se il callback non termina, abortisce due volte
+o arriva SIGTERM troppo presto, il test fallisce. Il secondo SIGUSR1
+e il SIGTERM conclusivo mantengono la verifica dell'abort singolo.
+L'applicazione **non** ha ricevuto nuovi endpoint di drain o
+meccanismi di bypass: è esclusivamente una correzione delle assunzioni
+di sincronizzazione del test in un vero processo OS.
+
+La race è stata osservata nel workflow [#43876479160](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43876479160)
+sul commit docs-only della #168, dopo una CI 3/3 verde con la
+medesima logica runtime. La risoluzione resta subordinata a CI verde
+sull'HEAD finale e non sostituisce i test reali di rolling restart
+e ingress multi-pod della parent #21.
