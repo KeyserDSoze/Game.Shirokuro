@@ -934,6 +934,9 @@ static async Task<IResult> ServeGuestRosterAsync(
             var authority = await context.RequestServices
                 .GetRequiredService<GuestSessionRegistry>()
                 .CheckAuthorityAsync(user, context.RequestAborted);
+            MultiplayerMetrics.RecordRosterPostReadAuthority(
+                heartbeat ? RosterPostReadSurface.HttpRefresh
+                          : RosterPostReadSurface.HttpPeek, authority);
             if (authority != GuestSessionAuthorityStatus.Active)
                 return Results.StatusCode(
                     authority == GuestSessionAuthorityStatus.Inactive
