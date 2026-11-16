@@ -476,7 +476,7 @@ public sealed class RedisTlsProductionTests
         {
             using var rejected = await client.PostAsync(
                 "/hubs/lobbies/negotiate?negotiateVersion=1",
-                content: null, timeout.Token);
+                null, timeout.Token);
             Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
             Assert.True(rejected.Headers.CacheControl?.NoStore == true);
             Assert.False(rejected.Headers.Contains("Set-Cookie"));
