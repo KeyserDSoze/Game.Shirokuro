@@ -74,6 +74,13 @@ public sealed class DistributedGuestRateLimitTests
             var replies = await Task.WhenAll(tasks);
             Assert.Equal(12, replies.Count(x => x.Allowed));
             Assert.Equal(36, replies.Count(x => !x.Allowed));
+            var bucketKey = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            Assert.Equal("12", (string?)await db.HashGetAsync(bucketKey, "count"));
+            Assert.Equal(13, await db.HashLengthAsync(bucketKey));
+            var receiptFields = await db.HashKeysAsync(bucketKey);
+            Assert.Equal(12, receiptFields.Count(field =>
+                field.ToString().StartsWith("proof:", StringComparison.Ordinal)));
             Assert.All(replies, x => Assert.InRange(x.RetryAfterMilliseconds, 1, 60000));
             var blocked = await two.AcquireAsync(policy, ip);
             Assert.False(blocked.Allowed);
@@ -235,6 +242,48 @@ public sealed class DistributedGuestRateLimitTests
         }
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public async Task MissingOrExtraProofFieldsCannotConsumeAnotherPermit(int proofs)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::1");
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            Assert.True(await db.HashSetAsync(key, "count", "3"));
+            for (var index = 0; index < proofs; index++)
+                Assert.True(await db.HashSetAsync(key,
+                    "proof:" + index.ToString("x32"), "1"));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(35)));
+            var initialTtl = await db.KeyTimeToLiveAsync(key);
+
+            var failure = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                new RedisGuestMutationLimiter(b.GetDatabase())
+                    .AcquireAsync(policy, ip));
+            Assert.Equal("Invalid distributed limit result.", failure.Message);
+            Assert.Equal("3", (string?)await db.HashGetAsync(key, "count"));
+            Assert.Equal(proofs + 1, await db.HashLengthAsync(key));
+            var remainingTtl = await db.KeyTimeToLiveAsync(key);
+            Assert.True(remainingTtl > TimeSpan.Zero &&
+                        remainingTtl <= initialTtl);
+
+            // The operator must repair a corrupt bucket explicitly.
+            Assert.True(await db.KeyDeleteAsync(key));
+            Assert.True((await new RedisGuestMutationLimiter(b.GetDatabase())
+                .AcquireAsync(policy, ip)).Allowed);
+            Assert.Equal("1", (string?)await db.HashGetAsync(key, "count"));
+            Assert.Equal(2, await db.HashLengthAsync(key));
+        }
+    }
+
     [Fact]
     public async Task HealthyRedisQuotaIncrementsAcrossClientsWithoutSlidingTtl()
     {
@@ -249,6 +298,11 @@ public sealed class DistributedGuestRateLimitTests
             var db = a.GetDatabase();
             var key = RedisGuestMutationLimiter.Key(policy, ip);
             Assert.True(await db.HashSetAsync(key, "count", "7"));
+            // Preserve the v2 invariant: a real seven-permit bucket has
+            // seven independent receipts, not merely a fabricated counter.
+            for (var index = 0; index < 7; index++)
+                Assert.True(await db.HashSetAsync(key,
+                    "proof:" + index.ToString("x32"), "1"));
             Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30)));
             var beforeTtl = await db.KeyTimeToLiveAsync(key);
             Assert.True((await new RedisGuestMutationLimiter(db)
