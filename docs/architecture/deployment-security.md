@@ -2496,3 +2496,35 @@ presenza di un contatore abort; un termination forzato può anche
 perdere le metriche non ancora esportate. La prova reale di SIGUSR1
 e del time budget/grace period rimane nel parent #21. Gli xUnit non
 certificano l'osservazione dell'evento OTLP da un collector reale.
+
+## Prova CI di segnale Linux reale, senza toccare i processi CI (#154)
+
+La #154 aggiunge una prova di livello **processo/OS** al job backend
+Linux della CI, complementare agli xUnit TestServer #151–#153.
+Una piccola applicazione `.NET 10` separata in
+`tests/backend/Shirokuro.PreStopSignalSmoke` importa **le classi reali**
+`HostLifetimeReadinessDrainSignal` e `LobbyConnectionDrainRegistry`
+dell'API; non avvia la Production API completa e non richiede Redis,
+Data Protection, account o ingress esterno.
+
+Il job compila il fixture, avvia un unico **PID figlio** tramite
+`dotnet <fixture.dll>`, aspetta un marker scritto soltanto dopo
+la registrazione dell'handler POSIX e del contesto SignalR test, invia
+**SIGUSR1 reale** soltanto a quel PID e aspetta un secondo marker che
+richiede: `IsDraining=true`, `ApplicationStopping=false`,
+`AbortCount=1`. Verifica che il processo sia ancora vivo,
+invia SIGUSR1 di nuovo e poi il normale SIGTERM: il fixture attende
+lo stop dell'host e verifica `AbortCount=1` senza un secondo abort.
+Il test non invia mai segnali al runner, a xUnit, ai Redis CI o
+all'API reale. Usa timeout brevi, `trap` di cleanup e cancella
+il log tecnico temporaneo: nessun token, cookie, player ID o stanza.
+
+È una prova reale del callback Linux `PosixSignalRegistration`,
+della cooperazione fra lifetime .NET/registro SignalR e dello
+shutdown ordinario dopo preStop. **Non** prova il comportamento di
+Kubernetes `preStop`, di TLS/proxy/LB, di WebSocket TCP effettivi
+o della riconnessione browser, e non misura RTO/RPO né garantisce
+rollback di un CAS Redis già avviato. Quelle prove devono essere
+eseguite in uno staging multi-nodo secondo #21. Il test di processo
+è aggiuntivo: restano obbligatori gli xUnit .NET10, la matrice Redis
+TLS/ACL/HA, Vitest, Playwright e artwork.
