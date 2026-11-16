@@ -74,6 +74,21 @@ public sealed class RedisLobbySnapshotStore(
         return 1
         """;
 
+    // A positive DELETE Lua result is not enough to acknowledge a final
+    // membership removal or durable cleanup. Confirm the room AND both quota
+    // index memberships are absent, on this same Redis connector/slot.
+    // Read-only, returns only a numeric flag; never leaks private roster.
+    private const string ConfirmLobbyDeleteScript = """
+        if redis.call('GET', KEYS[1]) then return 0 end
+        if ARGV[1] == '1' then
+            if redis.call('ZSCORE', KEYS[2], KEYS[1]) or
+               redis.call('ZSCORE', KEYS[3], KEYS[1]) then
+                return 0
+            end
+        end
+        return 1
+        """;
+
     // All quota checks and the room insertion share the same Redis Lua
     // execution, even when N independent API processes create concurrently.
     // Scores use Redis's own clock and PEXPIRETIME, not per-node clocks.
@@ -438,19 +453,43 @@ public sealed class RedisLobbySnapshotStore(
     {
         ArgumentNullException.ThrowIfNull(expected);
         ValidateExpected(expected);
-        var result = (long)await AwaitRedisAsync(() =>
-            database.ScriptEvaluateAsync(
+        var roomKey = RoomKey(expected.Snapshot.State.Definition.LobbyId);
+        var globalKey = GlobalIndexKey;
+        var creatorKey = CreatorIndexKey(expected.Snapshot.CreatorId);
+
+        // The Lua may have completed on Redis even if its response was
+        // lost. Never retry an uncertain mutation; after a positive result,
+        // verify room/index ABSENCE before declaring a completed logout or
+        // allowing the recovery worker to acknowledge its expiry work.
+        // The delete and read-only check share the same 2s deadline.
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var result = (long)await database.ScriptEvaluateAsync(
                 DeleteIfCurrentScript,
-                [RoomKey(expected.Snapshot.State.Definition.LobbyId), GlobalIndexKey,
-                 CreatorIndexKey(expected.Snapshot.CreatorId),
+                [roomKey, globalKey, creatorKey,
                  RevokedGuestKey(trustedActor ?? "administrative")],
                 [expected.RawBytes, expected.Snapshot.QuotaTracked ? 1 : 0,
-                 trustedActor is null ? 0 : 1]), cancellationToken);
+                 trustedActor is null ? 0 : 1])
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
-        return result == 1;
+        if (result == 0)
+            return false; // Actual CAS/version conflict: no delete to verify.
+
+        var confirmed = (long)await database.ScriptEvaluateAsync(
+                ConfirmLobbyDeleteScript,
+                [roomKey, globalKey, creatorKey],
+                [expected.Snapshot.QuotaTracked ? 1 : 0])
+            .WaitAsync(timeout.Token);
+        if (confirmed != 1)
+            throw new LobbyMutationUnavailableException();
+        timeout.Token.ThrowIfCancellationRequested();
+        return true;
     }
 
     private static void ValidateExpected(Stored expected)
