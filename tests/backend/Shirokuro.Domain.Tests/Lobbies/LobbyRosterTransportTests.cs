@@ -632,6 +632,49 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task ThrowingPreStopObserverCannotBlockSignalRSocketDrain()
+    {
+        using var metrics = new MultiplayerMetricCapture();
+        using var host = new StoppingHostLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(signal, host);
+        var socket = new FakeHubContext(Principal("alice"),
+            connectionId: "faulty-prestop-observer");
+        var hub = new LobbyRosterHub(new LobbyRosterReader(
+            new InMemoryLobbyCoordinator()), drain: signal,
+            connections: tracker) { Context = socket };
+        await hub.OnConnectedAsync();
+        Assert.Equal(0, socket.AbortCount);
+
+        // Registration occurs AFTER the registry subscriber; in .NET
+        // CancellationTokenSource invokes callbacks synchronously and
+        // can throw an AggregateException from any failing subscriber.
+        // That exception must not escape a real OS SIGUSR1 callback.
+        using var faulty = signal.PreStopStarted.Register(
+            () => throw new InvalidOperationException(
+                "Test-only broken preStop subscriber"));
+        signal.BeginPreStopDrain();
+
+        Assert.True(signal.IsDraining);
+        Assert.True(tracker.IsDraining);
+        Assert.False(host.ApplicationStopping.IsCancellationRequested);
+        Assert.Equal(1, socket.AbortCount);
+        var attempts = metrics.For(
+            MultiplayerMetrics.SignalRDrainAbortAttemptsName);
+        Assert.Single(attempts, item => item.Value == 1 &&
+            item.Tags.Count == 1 &&
+            item.Tags.TryGetValue("reason", out var reason) &&
+            reason == "prestop");
+
+        signal.BeginPreStopDrain();
+        host.StopApplication();
+        Assert.Equal(1, socket.AbortCount);
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(RoomA))).Message);
+    }
+
+    [Fact]
     public async Task PreStopSocketMetricsCountOnlyRegistryAbortAttempts()
     {
         using var capture = new MultiplayerMetricCapture();
