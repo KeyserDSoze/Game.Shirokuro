@@ -169,6 +169,11 @@ public sealed class MultiplayerMetricsExportTests
         var meter = provider.GetRequiredService<MeterProvider>();
 
         MultiplayerMetrics.RecordReadinessProbe(true);
+        MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.PreStop);
+        MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.HostShutdown);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(SignalRDrainAbortReason.PreStop);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(SignalRDrainAbortReason.HostShutdown);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(SignalRDrainAbortReason.LateConnection);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.MutationOrigin);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Host);
         MultiplayerMetrics.RecordIngressRejection(IngressRejectionReason.Transport);
@@ -214,6 +219,11 @@ public sealed class MultiplayerMetricsExportTests
             .Select(call => Encoding.UTF8.GetString(call.Body)));
         Assert.Contains(MultiplayerMetrics.ReadinessDurationSecondsName, payload);
         Assert.Contains(MultiplayerMetrics.ReadinessProbesName, payload);
+        Assert.Contains(MultiplayerMetrics.NodeDrainTransitionsName, payload);
+        Assert.Contains(MultiplayerMetrics.SignalRDrainAbortAttemptsName, payload);
+        Assert.Contains("prestop", payload);
+        Assert.Contains("host-shutdown", payload);
+        Assert.Contains("late-connection", payload);
         Assert.Contains(MultiplayerMetrics.IngressRejectionsName, payload);
         Assert.Contains(MultiplayerMetrics.GuestCookieAuthorityName, payload);
         Assert.Contains("recovery-cutoff", payload);
