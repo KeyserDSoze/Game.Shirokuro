@@ -76,3 +76,12 @@ public sealed class LobbySnapshotUnavailableException()
 /// </summary>
 public sealed class LobbyCreationUnavailableException()
     : Exception("Lobby creation was not confirmed.");
+
+
+/// <summary>
+/// A positive Redis compare-and-swap reply without a confirmed persisted
+/// snapshot and matching quota indices is shared-storage uncertainty,
+/// not a gameplay revision conflict. Never attach private Redis data.
+/// </summary>
+public sealed class LobbyMutationUnavailableException()
+    : Exception("Lobby mutation was not confirmed.");

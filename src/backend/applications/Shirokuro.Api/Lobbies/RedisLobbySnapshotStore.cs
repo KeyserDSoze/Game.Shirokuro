@@ -120,6 +120,23 @@ public sealed class RedisLobbySnapshotStore(
         return 1
         """;
 
+    // Read-only exact post-CAS check. Never return private roster bytes,
+    // modify the TTL or claim a room whose quota indices were lost.
+    private const string ConfirmLobbyCasScript = """
+        local raw = redis.call('GET', KEYS[1])
+        if not raw or raw ~= ARGV[1] then return 0 end
+        local deadline = redis.call('PEXPIRETIME', KEYS[1])
+        if deadline <= 0 then return 0 end
+        if ARGV[2] == '1' then
+            local global = redis.call('ZSCORE', KEYS[2], KEYS[1])
+            local creator = redis.call('ZSCORE', KEYS[3], KEYS[1])
+            if not global or not creator or
+               tonumber(global) ~= deadline or
+               tonumber(creator) ~= deadline then return 0 end
+        end
+        return 1
+        """;
+
     // The administrative index is persisted data. A single corrupt ZSET
     // member can be enormous even when the scan is limited to 257 entries.
     // Strip oversized values inside Redis before returning any bytes.
@@ -380,20 +397,39 @@ public sealed class RedisLobbySnapshotStore(
         if (ttl <= TimeSpan.Zero)
             return false;
         var bytes = RedisLobbySnapshotCodec.Encode(updated);
-        var result = (long)await AwaitRedisAsync(() =>
-            database.ScriptEvaluateAsync(
+        var roomKey = RoomKey(newState.Definition.LobbyId);
+        var globalKey = GlobalIndexKey;
+        var creatorKey = CreatorIndexKey(updated.CreatorId);
+        // Mutation and read-only verification share the SAME bounded wait;
+        // a falsely acknowledged CAS cannot publish an invented roster.
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var result = (long)await database.ScriptEvaluateAsync(
                 CompareExchangeScript,
-                [RoomKey(newState.Definition.LobbyId), GlobalIndexKey,
-                 CreatorIndexKey(updated.CreatorId),
+                [roomKey, globalKey, creatorKey,
                  RevokedGuestKey(trustedActor ?? "administrative")],
                 [expected.RawBytes, bytes, DeadlineMilliseconds(updated),
                  IndexTtlMilliseconds(), updated.QuotaTracked ? 1 : 0,
-                 trustedActor is null ? 0 : 1]), cancellationToken);
+                 trustedActor is null ? 0 : 1])
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
-        return result == 1;
+        if (result == 0)
+            return false;
+        var confirmed = (long)await database.ScriptEvaluateAsync(
+                ConfirmLobbyCasScript,
+                [roomKey, globalKey, creatorKey],
+                [bytes, updated.QuotaTracked ? 1 : 0])
+            .WaitAsync(timeout.Token);
+        if (confirmed != 1)
+            throw new LobbyMutationUnavailableException();
+        timeout.Token.ThrowIfCancellationRequested();
+        return true;
     }
 
     public async Task<bool> DeleteIfCurrentAsync(

@@ -186,6 +186,10 @@ public static class GuestLobbyEndpoints
         {
             return Results.Conflict(new { code = "lobby_state_conflict" });
         }
+        catch (LobbyMutationUnavailableException)
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
         catch (LobbyCreationUnavailableException)
         {
             // A lost/unverified Redis room or quota index must not become

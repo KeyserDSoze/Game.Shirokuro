@@ -975,7 +975,7 @@ static async Task<IResult> ServeGuestRosterAsync(
     }
     catch (Exception error) when (
         error is LobbySnapshotUnavailableException or LobbyReadContentionException or
-        RedisException)
+        LobbyMutationUnavailableException or RedisException)
     {
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }

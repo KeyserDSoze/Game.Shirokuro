@@ -111,6 +111,10 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
             // Indistinguishable responses to hidden/absent lobbies and non-members.
             throw new HubException("Lobby unavailable.");
         }
+        catch (LobbyMutationUnavailableException)
+        {
+            throw new HubException("Lobby unavailable.");
+        }
         catch (LobbySnapshotUnavailableException)
         {
             // Corrupted/incompatible authoritative Redis room data must
