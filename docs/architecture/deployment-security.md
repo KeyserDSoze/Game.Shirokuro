@@ -2528,3 +2528,44 @@ rollback di un CAS Redis già avviato. Quelle prove devono essere
 eseguite in uno staging multi-nodo secondo #21. Il test di processo
 è aggiuntivo: restano obbligatori gli xUnit .NET10, la matrice Redis
 TLS/ACL/HA, Vitest, Playwright e artwork.
+
+## Correttezza degli abort SignalR concorrenti (#155)
+
+Il preStop #152 e i contatori #153 non bastavano per garantire che
+`Abort()` fosse chiamato **una volta per trasporto** quando una
+connessione passa dal controllo iniziale di `TryTrack` e viene
+aggiunta al registro mentre, in parallelo, parte un drain:
+il callback preStop/`ApplicationStopping` poteva abortire il contesto
+già inserito e il controllo post-inserimento poteva ripetere l'abort.
+`LobbyRosterHub.OnConnectedAsync` poteva aggiungere un terzo abort
+dopo il rifiuto da `TryTrack`. Oltre al rumore nei log di SignalR, il
+counter `shirokuro.signalr.drain_abort_attempts` sovracontava la
+stessa connessione.
+
+Ogni entrata in `LobbyConnectionDrainRegistry` ha ora uno stato
+**locale atomico** con CAS `Active → AbortAttempted` oppure
+`Active → Disconnected`. Un solo percorso vince e può chiamare
+`HubCallerContext.Abort()` e incrementare il contatore. Se
+`Untrack` ha già osservato il disconnect, un vecchio snapshot del
+registro non deve abortire quel contesto; una chiamata abort già
+in corso prima di `Untrack` non può essere annullata.
+`OnConnectedAsync` mantiene `Context.Abort()` per un drain
+rilevato **prima** di coinvolgere il registro, ma non lo ripete dopo
+un `TryTrack` fallito: il registro ha già eseguito il suo tentativo
+best-effort.
+
+Tre test xUnit con gate `TaskCompletionSource` (senza sleep o
+segnali OS al runner) forzano il controllo **dopo l'inserimento**
+a completare *dopo* (1) preStop, (2) shutdown host attraversando
+`OnConnectedAsync`, (3) una disconnessione già osservata seguita
+da preStop. Verificano rispettivamente un solo abort, un solo abort
+anche con la doppia callback Hub/registro, e nessun abort di un
+contesto già disconnesso. Restano in vigore le barriere auth,
+privacy dei roster, liveness/readiness e il smoke Linux reale
+SIGUSR1→SIGTERM della #154.
+
+Questo non prova né garantisce che `Abort()` faccia terminare
+istantaneamente una connessione TCP esterna: il bilanciatore e le
+sessioni browser devono ancora essere testati in staging (#21).
+Il meccanismo non trasferisce connessioni, non modifica le regole
+PvP né annulla operazioni Redis CAS già iniziate.
