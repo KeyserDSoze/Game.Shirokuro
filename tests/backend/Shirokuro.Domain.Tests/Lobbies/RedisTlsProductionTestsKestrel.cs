@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -491,13 +492,41 @@ public sealed class RedisTlsProductionTestsKestrel
                 using var clean = await edge.SendAsync(spoof, timeout.Token);
                 Assert.Equal(HttpStatusCode.OK, clean.StatusCode);
             }
-            using (var hostileHost = new HttpRequestMessage(
-                       HttpMethod.Get, "/api/ready"))
+            // HttpClient also uses an overridden Host for TLS SNI, so
+            // sending Host=attacker.example would fail certificate name
+            // validation before it reached the nginx or ASP.NET Host gate.
+            // Authenticate with a normal, CA-validated localhost SNI, then
+            // deliberately send a distinct hostile HTTP/1.1 Host header.
+            // Never install a permissive certificate-validation callback.
+            using (var tcp = new TcpClient(AddressFamily.InterNetwork))
             {
-                hostileHost.Headers.Host = "attacker.example";
-                using var blocked = await edge.SendAsync(hostileHost, timeout.Token);
-                Assert.Equal(HttpStatusCode.BadRequest, blocked.StatusCode);
-                Assert.True(blocked.Headers.CacheControl?.NoStore == true);
+                await tcp.ConnectAsync(IPAddress.Loopback, edgePort, timeout.Token);
+                await using var tls = new SslStream(tcp.GetStream());
+                await tls.AuthenticateAsClientAsync(
+                    new SslClientAuthenticationOptions { TargetHost = "localhost" },
+                    timeout.Token);
+                var request = Encoding.ASCII.GetBytes(
+                    "GET /api/ready HTTP/1.1\\r\\n" +
+                    "Host: attacker.example\\r\\n" +
+                    "Connection: close\\r\\n\\r\\n");
+                await tls.WriteAsync(request, timeout.Token);
+                using var reader = new StreamReader(
+                    tls, Encoding.ASCII, detectEncodingFromByteOrderMarks: false,
+                    bufferSize: 1024, leaveOpen: true);
+                var responseLine = await reader.ReadLineAsync(timeout.Token);
+                Assert.True(responseLine is not null &&
+                            responseLine.StartsWith("HTTP/1.1 400", StringComparison.Ordinal),
+                    "A hostile Host must be rejected despite valid TLS SNI.");
+                var noStore = false;
+                for (var n = 0; n < 40; n++)
+                {
+                    var header = await reader.ReadLineAsync(timeout.Token);
+                    if (string.IsNullOrEmpty(header))
+                        break;
+                    if (header.StartsWith("Cache-Control:", StringComparison.OrdinalIgnoreCase))
+                        noStore = header.Contains("no-store", StringComparison.OrdinalIgnoreCase);
+                }
+                Assert.True(noStore, "Rejected Host responses must not be cached.");
             }
             using (var hostileOrigin = Mutation(
                        HttpMethod.Post, edge, "/api/sessions/guest"))
