@@ -421,7 +421,13 @@ public sealed class DeploymentReadinessTests
         using var metrics = new MultiplayerMetricCapture();
 
         using (var ready = await client.GetAsync("/api/ready"))
+        {
+            Assert.True(ready.StatusCode == HttpStatusCode.OK,
+                $"First probe returned {ready.StatusCode}: lobby writes={lobby.Writes}, " +
+                $"lobby reads={lobby.Reads}, session writes={sessions.Writes}, " +
+                $"session reads={sessions.Reads}, attempted={lobby.AttemptedNonces.Length}");
             await AssertStatus(ready, HttpStatusCode.OK, "ready");
+        }
         Assert.Equal(1, sessions.Reads);
         Assert.Equal(1, sessions.Writes);
         Assert.Equal(1, lobby.Reads);
