@@ -40,10 +40,21 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
     public const long WindowMilliseconds = 60_000;
     public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
 
+    // An admission carries a random receipt in the SAME atomic Redis hash
+    // as its fixed-window count. Unlike a last-writer marker, unique receipt
+    // fields survive other nodes' concurrent increments until TTL.
+    // V2 avoids interpreting pre-existing v1 string counters as hashes.
     private const string Script = """
-        local count = redis.call('GET', KEYS[1])
+        local kind = redis.call('TYPE', KEYS[1]).ok
+        if kind ~= 'none' and kind ~= 'hash' then return {-1, 0} end
+        local count = nil
+        if kind == 'hash' then
+            count = redis.call('HGET', KEYS[1], 'count')
+            if not count then return {-1, 0} end
+        end
         if not count then
-            redis.call('PSETEX', KEYS[1], ARGV[1], 1)
+            redis.call('HSET', KEYS[1], 'count', '1', ARGV[3], '1')
+            redis.call('PEXPIRE', KEYS[1], ARGV[1])
             return {1, tonumber(ARGV[1])}
         end
         local ttl = redis.call('PTTL', KEYS[1])
@@ -61,7 +72,8 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         if current >= tonumber(ARGV[2]) then
             return {0, ttl}
         end
-        redis.call('INCR', KEYS[1])
+        redis.call('HINCRBY', KEYS[1], 'count', 1)
+        redis.call('HSET', KEYS[1], ARGV[3], '1')
         return {1, ttl}
         """;
 
@@ -72,17 +84,20 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         ArgumentNullException.ThrowIfNull(policy);
         cancellationToken.ThrowIfCancellationRequested();
         var key = Key(policy, trustedRemoteIp);
-        // A single Lua script serializes every participating API/node's
-        // check and increment. The bounded wait honours HTTP disconnects.
-        // Abandoning a client wait does NOT necessarily cancel a Lua script
-        // already accepted by Redis; do not retry, or assume quota was unused.
-        // No local permits/fallback are ever granted on an unknown result.
+        var receipt = "proof:" + Convert.ToHexStringLower(
+            RandomNumberGenerator.GetBytes(16));
+
+        // A Lua 1 is only an acknowledgement; a lost mutation must not
+        // admit extra guests/rooms. Read back the unique receipt on the same
+        // Redis connection before returning a permit. A single 2s deadline
+        // includes BOTH operations, without retrying a possibly applied Lua.
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
         timeout.CancelAfter(CommandTimeout);
         var redisResult = await database.ScriptEvaluateAsync(
-                Script, [key], [WindowMilliseconds, policy.PermitLimit])
+                Script, [key], [WindowMilliseconds, policy.PermitLimit, receipt])
             .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
         var fields = (RedisResult[])redisResult!;
         if (fields.Length != 2)
             throw new InvalidDataException("Invalid distributed limit result.");
@@ -90,6 +105,15 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         var remaining = (long)fields[1];
         if (status is not (0 or 1) || remaining < 0 || remaining > WindowMilliseconds)
             throw new InvalidDataException("Invalid distributed limit result.");
+
+        if (status == 1)
+        {
+            var confirmed = await database.HashGetAsync(key, receipt)
+                .WaitAsync(timeout.Token);
+            if (!string.Equals((string?)confirmed, "1", StringComparison.Ordinal))
+                throw new InvalidDataException("Distributed permit not confirmed.");
+        }
+        timeout.Token.ThrowIfCancellationRequested();
         return new GuestMutationDecision(status == 1, remaining);
     }
 
@@ -109,6 +133,6 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         var digest = Convert.ToHexStringLower(SHA256.HashData(address));
         var scope = policy.Kind == GuestMutationKind.SessionIssuance
             ? "sessions" : "rooms";
-        return "shirokuro:ratelimit:v1:" + scope + ":" + digest;
+        return "shirokuro:ratelimit:v2:" + scope + ":" + digest;
     }
 }
