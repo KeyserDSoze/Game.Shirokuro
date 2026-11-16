@@ -258,6 +258,21 @@ forwarding, Host/HTTPS validation and routing checks this metadata.
 It uses `RedisGuestMutationLimiter` with a single-key Redis Lua
 check/increment: a fixed 60-second TTL starting on the first request
 is never extended by later successful or rejected requests.
+Since #184, the versioned `v2` Redis bucket is a hash containing a
+validated `count` and one cryptographically random, request-specific
+`proof:` field per admitted action. Each positive Lua reply must be
+confirmed by `HGET` of **that exact receipt** on the same Redis
+connection before a permit is granted. Concurrent nodes leave each
+other's receipts intact; a lost write, missing/altered read, timeout or
+cancellation fails closed with 503/no-store. The script and read-back
+share one 2-second deadline; no automatic retry/reimbursement is made
+when a command might already have consumed quota. Denied 429 requests
+create no receipt and do not perform the read-back. Receipts hold no
+guest token, IP, invite or room ID and expire with the bucket.
+The v2 namespace intentionally differs from v1 string counters; a
+**rolling mixed-version rollout would have independent quotas** and
+must be avoided or externally gated. Real deployment coordination,
+failover/edge anti-abuse and anti-Sybil policy remain part of #21.
 Limits are shared by all application nodes through the same Redis
 connection used for guest session and room state (#33–#36).
 Redis unavailable means HTTP **503** without issuing a cookie or
