@@ -222,6 +222,49 @@ public sealed class GuestSessionCacheTimeoutTests
         Assert.False(cache.PendingGet.Task.IsCompleted);
     }
 
+
+    [Theory]
+    [InlineData("ignored-delete")]
+    [InlineData("corrupt-readback")]
+    [InlineData("stalled-readback")]
+    public async Task RecoveryDeleteRequiresConfirmedAbsenceForSameDigest(string fault)
+    {
+        var cache = new StalledCache();
+        var registry = new GuestSessionRegistry(TimeProvider.System, cache);
+        var digest = new string('d', 64);
+        var key = "guest-session:" + digest;
+        cache.Set(key, [0x12, 0x34], new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+        });
+        cache.IgnoreRemove = fault == "ignored-delete";
+        cache.CorruptGetAfterRemove = fault == "corrupt-readback";
+        cache.BlockGetAfterRemove = fault == "stalled-readback";
+
+        var pending = registry.RemoveRestoredSessionAsync(digest);
+        if (fault == "stalled-readback")
+            await AssertCanceledSoon(pending);
+        else
+            await Assert.ThrowsAsync<InvalidOperationException>(() => pending);
+        Assert.Equal(1, cache.RemoveCalls);
+        Assert.Equal(1, cache.GetCalls);
+        if (fault == "ignored-delete")
+            Assert.NotNull(cache.Get(key));
+        if (fault == "stalled-readback")
+            Assert.False(cache.PendingGet.Task.IsCompleted);
+
+        // A later worker pass can confirm the same key without inventing a
+        // new session or requiring a pre-existing record after a prior delete.
+        cache.IgnoreRemove = false;
+        cache.CorruptGetAfterRemove = false;
+        cache.BlockGetAfterRemove = false;
+        await registry.RemoveRestoredSessionAsync(digest);
+        await registry.RemoveRestoredSessionAsync(digest); // Idempotent absence.
+        Assert.Null(cache.Get(key));
+        Assert.Equal(3, cache.RemoveCalls);
+        Assert.Equal(3, cache.GetCalls);
+    }
+
     private static WebApplicationFactory<Program> Production(StalledCache cache) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {

@@ -166,9 +166,24 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
                 c is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new ArgumentException("Invalid trusted session digest.",
                 nameof(trustedTokenDigest));
-        await AwaitCacheAsync(
-            sharedCache.RemoveAsync(KeyPrefix + trustedTokenDigest,
-                cancellationToken), cancellationToken);
+        // This maintenance call precedes acknowledgement of an encrypted
+        // recovery work item. A cache adapter may claim DELETE succeeded
+        // without removing the ticket restored by an RDB rollback. Confirm
+        // ABSENCE before allowing the worker to acknowledge durable work.
+        // A missing key on retry is already a confirmed success.
+        var key = KeyPrefix + trustedTokenDigest;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        await sharedCache.RemoveAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
+        var remaining = await sharedCache.GetAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
+        if (remaining is not null)
+            throw new InvalidOperationException(
+                "Guest recovery storage did not confirm ticket deletion.");
+        timeout.Token.ThrowIfCancellationRequested();
     }
 
     /// <summary>Development-only revocation. Shared revocation is async.</summary>

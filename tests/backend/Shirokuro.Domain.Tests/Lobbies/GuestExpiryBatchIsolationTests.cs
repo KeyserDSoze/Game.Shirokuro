@@ -82,21 +82,45 @@ public sealed class GuestExpiryBatchIsolationTests
 
     private sealed class RemovalFaultCache : IDistributedCache
     {
+        // Fake persistence: an acknowledged REMOVE may not have deleted the
+        // actual restored session record. GET verifies the same digest key.
+        private readonly Dictionary<string, byte[]> _entries = new();
         public bool FailRemove { get; set; }
+        public bool IgnoreRemove { get; set; }
+        public bool CorruptRead { get; set; }
+        public bool FailRead { get; set; }
+        public bool BlockRead { get; set; }
+        public TaskCompletionSource<byte[]?> PendingRead { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public List<string> RemovedKeys { get; } = [];
-        public byte[]? Get(string key) => throw new NotSupportedException();
-        public Task<byte[]?> GetAsync(string key, CancellationToken token = default) =>
-            throw new NotSupportedException();
+        public List<string> ReadKeys { get; } = [];
+
+        public void Seed(string key) => _entries[key] = [1, 2, 3];
+        public bool ContainsKey(string key) => _entries.ContainsKey(key);
+        public byte[]? Get(string key) =>
+            _entries.TryGetValue(key, out var value) ? value : null;
+        public Task<byte[]?> GetAsync(string key, CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            ReadKeys.Add(key);
+            if (FailRead)
+                return Task.FromException<byte[]?>(
+                    new IOException("private-redis-restore-cache-failure"));
+            if (BlockRead) return PendingRead.Task;
+            if (CorruptRead) return Task.FromResult<byte[]?>([0xff]);
+            return Task.FromResult(Get(key));
+        }
         public void Refresh(string key) => throw new NotSupportedException();
         public Task RefreshAsync(string key, CancellationToken token = default) =>
             throw new NotSupportedException();
-        public void Remove(string key) => throw new NotSupportedException();
+        public void Remove(string key) => _entries.Remove(key);
         public Task RemoveAsync(string key, CancellationToken token = default)
         {
             token.ThrowIfCancellationRequested();
             if (FailRemove)
                 throw new IOException("private-redis-removal-failure");
             RemovedKeys.Add(key);
+            if (!IgnoreRemove) Remove(key);
             return Task.CompletedTask;
         }
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
@@ -267,6 +291,73 @@ public sealed class GuestExpiryBatchIsolationTests
         await worker.SweepOnceAsync();
         Assert.Equal(3, cache.RemovedKeys.Count);
         Assert.All(cache.RemovedKeys, x => Assert.Equal("guest-session:" + digest, x));
+    }
+
+
+    [Theory]
+    [InlineData("ignored-delete")]
+    [InlineData("corrupt-readback")]
+    [InlineData("failed-readback")]
+    [InlineData("stalled-readback")]
+    public async Task UnconfirmedRestoredTicketDeletionNeverAcknowledgesEncryptedWork(
+        string fault)
+    {
+        var clock = new ManualClock();
+        var recovered = GuestSessions.NewPlayerId();
+        var healthy = GuestSessions.NewPlayerId();
+        var digest = new string('b', 64);
+        var key = "guest-session:" + digest;
+        var index = new Index
+        {
+            RecoveryPlayerId = recovered,
+            RecoveryTokenDigest = digest
+        };
+        await index.ScheduleRevokedAsync(recovered);
+        await index.ScheduleRevokedAsync(healthy);
+        var cache = new RemovalFaultCache();
+        cache.Seed(key);
+        cache.IgnoreRemove = fault == "ignored-delete";
+        cache.CorruptRead = fault == "corrupt-readback";
+        cache.FailRead = fault == "failed-readback";
+        cache.BlockRead = fault == "stalled-readback";
+        var lobby = new SelectiveLobby();
+        var fence = new Fence();
+        using var worker = new GuestSessionExpiryWorker(
+            new GuestSessionRegistry(clock, cache),
+            new InMemoryLobbyCoordinator(clock), clock, lobby, index, fence);
+
+        // Successful guest work in the same batch must still advance.
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await worker.SweepOnceAsync()
+                .WaitAsync(TimeSpan.FromSeconds(8)));
+        Assert.Equal("Guest expiry maintenance has retryable items.", failure.Message);
+        Assert.DoesNotContain(recovered, failure.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("redis", failure.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(recovered, Assert.Single(index.Remaining).PlayerId);
+        Assert.Equal(1, index.AckCount);
+        Assert.Equal([recovered, healthy], lobby.Calls);
+        Assert.Equal([recovered, healthy], fence.Calls);
+        Assert.Equal([key], cache.RemovedKeys);
+        Assert.Equal([key], cache.ReadKeys);
+        if (fault == "ignored-delete")
+            Assert.True(cache.ContainsKey(key)); // Actual stale ticket survives.
+        if (fault == "stalled-readback")
+            Assert.False(cache.PendingRead.Task.IsCompleted);
+
+        cache.IgnoreRemove = false;
+        cache.CorruptRead = false;
+        cache.FailRead = false;
+        cache.BlockRead = false;
+
+        // The same durable item is retried until absence is confirmed.
+        Assert.Equal(1, await worker.SweepOnceAsync());
+        Assert.False(cache.ContainsKey(key));
+        Assert.Equal([key, key], cache.RemovedKeys);
+        Assert.Equal([key, key], cache.ReadKeys);
+        Assert.Empty(index.Remaining);
+        Assert.Equal(2, index.AckCount);
+        Assert.Equal([recovered, healthy, recovered], lobby.Calls);
+        Assert.Equal([recovered, healthy, recovered], fence.Calls);
     }
 
     [Fact]
