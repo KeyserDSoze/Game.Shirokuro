@@ -9,6 +9,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Readiness;
 using Shirokuro.Api.Security;
 using Shirokuro.Application.Lobbies;
 using Xunit;
@@ -22,6 +23,13 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 public sealed class LobbyMutationRevocationRaceTests
 {
     private const string Room = "room-cccccccccccccccccccccccccccccccc";
+
+    private sealed class ManualDrain : IReadinessDrainSignal
+    {
+        private int _started;
+        public bool IsDraining => Volatile.Read(ref _started) != 0;
+        public void Start() => Interlocked.Exchange(ref _started, 1);
+    }
 
     private sealed class CompletedButHeldLobby(
         GuestLobbyCommands commands, LobbyRosterReader reader,
@@ -85,9 +93,11 @@ public sealed class LobbyMutationRevocationRaceTests
         private int _gets;
         public int Reads => Volatile.Read(ref _gets);
         public bool FailReads { get; set; }
+        public Action<int>? OnRead { get; set; }
         public byte[]? Get(string key)
         {
-            Interlocked.Increment(ref _gets);
+            var current = Interlocked.Increment(ref _gets);
+            OnRead?.Invoke(current);
             if (FailReads)
                 throw new IOException("private redis/session connection detail");
             return _data.TryGetValue(key, out var result) ? result : null;
@@ -122,7 +132,7 @@ public sealed class LobbyMutationRevocationRaceTests
     }
 
     private static WebApplicationFactory<Program> Server(
-        FailingSessionCache? cache = null) =>
+        FailingSessionCache? cache = null, ManualDrain? drain = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
             {
@@ -134,6 +144,11 @@ public sealed class LobbyMutationRevocationRaceTests
                 {
                     services.RemoveAll<IDistributedCache>();
                     services.AddSingleton<IDistributedCache>(cache);
+                }
+                if (drain is not null)
+                {
+                    services.RemoveAll<IReadinessDrainSignal>();
+                    services.AddSingleton<IReadinessDrainSignal>(drain);
                 }
             }));
 
@@ -380,6 +395,114 @@ public sealed class LobbyMutationRevocationRaceTests
         Assert.Equal(1, cache.Reads); // Failed before post-mutation roster check.
         Assert.False(response.Headers.Contains("Location"));
         Assert.True(response.Headers.CacheControl?.NoStore == true);
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("hero")]
+    [InlineData("team")]
+    public async Task PreStopAfterCommittedMutationDeniesRosterWithoutAnotherGuestRedisLookup(
+        string operation)
+    {
+        var cache = new FailingSessionCache();
+        var drain = new ManualDrain();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server(cache, drain);
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        PrepareRoom(coordinator, operation, actorIdentity.PlayerId, survivorIdentity.PlayerId);
+        var paused = server.Services.GetRequiredService<CompletedButHeldLobby>();
+
+        using var request = Operation(operation);
+        var inFlight = actor.SendAsync(request, timeout.Token);
+        await paused.Committed.Task.WaitAsync(timeout.Token);
+        Assert.Equal(1, cache.Reads); // The issuing guest passed cookie auth.
+        drain.Start(); // preStop happens after the command already committed.
+        paused.Release.TrySetResult(true);
+
+        using var denied = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+        Assert.True(denied.Headers.CacheControl?.NoStore == true);
+        Assert.False(denied.Headers.Contains("Location"));
+        Assert.False(denied.Headers.Contains("ETag"));
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
+        var body = await denied.Content.ReadAsStringAsync(timeout.Token);
+        Assert.DoesNotContain(Room, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(actorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, cache.Reads); // Drain short-circuits the post-read Redis lookup.
+
+        // Drain does not undo an earlier legitimate command or remove a
+        // different guest's membership. Verify state directly, since
+        // member-only HTTP GETs are intentionally 503 while draining.
+        var reader = server.Services.GetRequiredService<LobbyRosterReader>();
+        var committedRoom = operation == "create" ? paused.CreatedRoomId! : Room;
+        var committed = reader.ForMember(committedRoom, actorIdentity.PlayerId);
+        Assert.Contains(committed.Participants,
+            member => member.PlayerId == actorIdentity.PlayerId);
+        var survivorRoom = reader.ForMember(Room, survivorIdentity.PlayerId);
+        Assert.Contains(survivorRoom.Participants,
+            member => member.PlayerId == survivorIdentity.PlayerId);
+        if (operation == "create")
+            Assert.DoesNotContain(survivorRoom.Participants,
+                member => member.PlayerId == actorIdentity.PlayerId);
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("hero")]
+    [InlineData("team")]
+    public async Task PreStopDuringFinalGuestCheckOverridesActiveSession(
+        string operation)
+    {
+        var cache = new FailingSessionCache();
+        var drain = new ManualDrain();
+        // This callback executes at the exact second registry lookup,
+        // after the initial signed cookie was authenticated and the lobby
+        // command was released. The result itself remains Active.
+        cache.OnRead = count =>
+        {
+            if (count == 2) drain.Start();
+        };
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server(cache, drain);
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        PrepareRoom(server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
+            operation, actorIdentity.PlayerId, survivorIdentity.PlayerId);
+        var paused = server.Services.GetRequiredService<CompletedButHeldLobby>();
+
+        using var request = Operation(operation);
+        var inFlight = actor.SendAsync(request, timeout.Token);
+        await paused.Committed.Task.WaitAsync(timeout.Token);
+        Assert.False(drain.IsDraining);
+        Assert.Equal(1, cache.Reads);
+        paused.Release.TrySetResult(true);
+
+        using var denied = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+        Assert.True(drain.IsDraining);
+        Assert.Equal(2, cache.Reads);
+        Assert.True(denied.Headers.CacheControl?.NoStore == true);
+        Assert.False(denied.Headers.Contains("Location"));
+        Assert.False(denied.Headers.Contains("ETag"));
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
+        var body = await denied.Content.ReadAsStringAsync(timeout.Token);
+        Assert.DoesNotContain(Room, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(actorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("room-", body, StringComparison.OrdinalIgnoreCase);
     }
 
 }
