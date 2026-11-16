@@ -43,13 +43,34 @@ catch (OperationCanceledException) when (signal.PreStopStarted.IsCancellationReq
 {
 }
 
+// CancellationTokenSource.Cancel publishes its cancellation before all
+// registered callbacks have necessarily finished. The Task.Delay above may
+// resume before LobbyConnectionDrainRegistry's synchronous callback has
+// aborted the tracked transport; checking AbortCount immediately is a
+// scheduling race, not a valid post-drain assertion. Require the signal to
+// have started drain and the host to still be alive right away.
+if (!signal.IsDraining || lifetime.ApplicationStopping.IsCancellationRequested)
+    throw new InvalidOperationException(
+        "PreStop must start drain without stopping the host.");
+
+// Then give the live socket registry a bounded opportunity to finish its
+// already-dispatched cancellation callback. A missing Abort still fails
+// (no blind sleep or swallowed failure), and SIGTERM must not arrive early.
+for (var attempt = 0;
+     attempt < 500 &&
+     (!registry.IsDraining || socket.AbortCount == 0) &&
+     !lifetime.ApplicationStopping.IsCancellationRequested;
+     attempt++)
+{
+    await Task.Delay(TimeSpan.FromMilliseconds(10));
+}
 if (!signal.IsDraining ||
     lifetime.ApplicationStopping.IsCancellationRequested ||
     socket.AbortCount != 1 ||
     !registry.IsDraining)
 {
     throw new InvalidOperationException(
-        "PreStop must abort the tracked socket while the host remains alive.");
+        "PreStop must abort the tracked socket exactly once while the host remains alive.");
 }
 Console.WriteLine("SHIROKURO_SIGNAL_DRAINED");
 Console.Out.Flush();
