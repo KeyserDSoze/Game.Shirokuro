@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Text.Json;
@@ -33,15 +34,19 @@ public sealed class DeploymentReadinessTests
     {
         private int _reads;
         private int _writes;
-        private byte[]? _stored;
+        private readonly ConcurrentDictionary<string, byte[]> _stored = new(
+            StringComparer.Ordinal);
         public int Reads => Volatile.Read(ref _reads);
         public int Writes => Volatile.Read(ref _writes);
+        public int StoredKeyCount => _stored.Count;
         public bool Fail { get; set; }
         public bool FailWrites { get; set; }
+        public bool IgnoreWrites { get; set; }
         public TaskCompletionSource<bool>? ReadStarted { get; set; }
         public Task? ReadBarrier { get; set; }
 
-        public byte[]? Get(string key) => _stored;
+        public byte[]? Get(string key) =>
+            _stored.TryGetValue(key, out var value) ? value.ToArray() : null;
         public async Task<byte[]?> GetAsync(string key,
             CancellationToken token = default)
         {
@@ -52,16 +57,20 @@ public sealed class DeploymentReadinessTests
                 await barrier.WaitAsync(token);
             if (Fail)
                 throw new IOException("sensitive guest-session Redis error");
-            return _stored;
+            return Get(key);
         }
         public void Refresh(string key) { }
         public Task RefreshAsync(string key, CancellationToken token = default) =>
             Task.CompletedTask;
-        public void Remove(string key) { }
-        public Task RemoveAsync(string key, CancellationToken token = default) =>
-            Task.CompletedTask;
+        public void Remove(string key) => _stored.TryRemove(key, out _);
+        public Task RemoveAsync(string key, CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
+            Remove(key);
+            return Task.CompletedTask;
+        }
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options) =>
-            _stored = value.ToArray();
+            _stored[key] = value.ToArray();
         public Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options,
             CancellationToken token = default)
         {
@@ -71,7 +80,8 @@ public sealed class DeploymentReadinessTests
                 throw new IOException("sensitive guest-session write Redis error");
             Assert.True(options.AbsoluteExpirationRelativeToNow is { } expiry &&
                 expiry > TimeSpan.Zero && expiry <= TimeSpan.FromSeconds(10));
-            _stored = value.ToArray();
+            if (!IgnoreWrites)
+                _stored[key] = value.ToArray();
             return Task.CompletedTask;
         }
     }
@@ -249,6 +259,69 @@ public sealed class DeploymentReadinessTests
             Assert.DoesNotContain("sensitive", tag, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("guest-", tag, StringComparison.OrdinalIgnoreCase);
         }));
+    }
+
+    [Fact]
+    public async Task StaleSessionProbeValueCannotHideSilentlyIgnoredCacheWrite()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var clock = new ManualClock();
+        var store = new ToggleSessionStore();
+        using var server = Production(redis, store, clock);
+        using var client = Client(server);
+
+        // First healthy probe leaves a previous successful value in the cache.
+        using (var healthy = await client.GetAsync("/api/ready"))
+            await AssertStatus(healthy, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, store.StoredKeyCount);
+
+        // A broken cache adapter completes SET without saving the new value.
+        // A static byte [1] probe would mistakenly read yesterday's value
+        // and report 200. A per-probe nonce must fail closed instead.
+        store.IgnoreWrites = true;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var stale = await client.GetAsync("/api/ready"))
+            await AssertStatus(stale, HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(2, store.Writes);
+        Assert.Equal(2, store.Reads);
+
+        // The failure must not terminate liveness or poison future recovery.
+        using (var health = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        store.IgnoreWrites = false;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(3, store.Writes);
+        Assert.Equal(3, store.Reads);
+        Assert.Equal(1, store.StoredKeyCount);
+    }
+
+    [Fact]
+    public async Task IndependentProductionInstancesDoNotShareReadinessCacheProbeKeys()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var store = new ToggleSessionStore();
+        using var first = Production(redis, store, new ManualClock());
+        using var second = Production(redis, store, new ManualClock());
+        using var alice = Client(first);
+        using var bob = Client(second);
+
+        var responses = await Task.WhenAll(
+            alice.GetAsync("/api/ready"), bob.GetAsync("/api/ready"));
+        foreach (var response in responses)
+        {
+            using (response)
+                await AssertStatus(response, HttpStatusCode.OK, "ready");
+        }
+
+        // Different process instances must not overwrite the same probe key
+        // when they share a Redis-backed session namespace.
+        Assert.Equal(2, store.StoredKeyCount);
+        Assert.Equal(2, store.Writes);
+        Assert.Equal(2, store.Reads);
     }
 
     [Fact]

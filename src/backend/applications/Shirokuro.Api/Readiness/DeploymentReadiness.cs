@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
 using Shirokuro.Api.Security;
@@ -62,9 +63,13 @@ public sealed class RedisDeploymentReadiness(
 {
     public static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(2);
     public static readonly TimeSpan CachedFor = TimeSpan.FromSeconds(3);
-    private const string CacheProbeKey = "readiness-write-probe-v2";
-    private const string LobbyProbeKey = "shirokuro:readiness:write-probe-v2";
-    private static readonly byte[] ProbeValue = [1];
+    // A fixed, shared probe key lets independent nodes overwrite one
+    // another's test. Give each readiness service its own short-lived key;
+    // neither key contains session or lobby information.
+    private readonly string _cacheProbeKey = "readiness-write-probe-v3:" +
+        Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+    private readonly string _lobbyProbeKey = "shirokuro:readiness:write-probe-v3:" +
+        Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
     private static readonly TimeSpan ProbeTtl = TimeSpan.FromSeconds(10);
     // A public readiness burst shares a single bounded probe, rather than
     // allocating one queued semaphore waiter per HTTP request.
@@ -116,11 +121,14 @@ public sealed class RedisDeploymentReadiness(
         {
             // PING/GET alone would incorrectly report read-only replicas
             // ready. Both independent Production connectors must be writable.
-            // These fixed technical keys contain no user data or identifiers.
+            // A fresh nonce prevents an old cache result from certifying a
+            // silently ignored SET; other nodes use distinct probe keys.
+            // The nonce is technical only and is never logged or returned.
+            var nonce = RandomNumberGenerator.GetBytes(16);
             Task<bool> lobbyWrite = redis.GetDatabase().StringSetAsync(
-                LobbyProbeKey, "1", expiry: ProbeTtl);
+                _lobbyProbeKey, "1", expiry: ProbeTtl);
             Task cacheWrite = guestSessions.SetAsync(
-                CacheProbeKey, ProbeValue,
+                _cacheProbeKey, nonce,
                 new DistributedCacheEntryOptions
                 {
                     AbsoluteExpirationRelativeToNow = ProbeTtl
@@ -131,8 +139,8 @@ public sealed class RedisDeploymentReadiness(
 
             stage = ReadinessProbeStage.SessionRead;
             var observed = await guestSessions.GetAsync(
-                CacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
-            if (observed is null || !observed.AsSpan().SequenceEqual(ProbeValue))
+                _cacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
+            if (observed is null || !observed.AsSpan().SequenceEqual(nonce))
                 throw new InvalidOperationException("Session probe write unreadable.");
 
             // The configured, shared encrypted key ring must be usable too.
