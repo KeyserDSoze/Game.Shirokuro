@@ -40,41 +40,63 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
     public const long WindowMilliseconds = 60_000;
     public static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
 
-    // An admission carries a random receipt in the SAME atomic Redis hash
-    // as its fixed-window count. Unlike a last-writer marker, unique receipt
-    // fields survive other nodes' concurrent increments until TTL.
-    // V2 avoids interpreting pre-existing v1 string counters as hashes.
+    // The count and one receipt per successful admission share a Redis
+    // hash and a single fixed TTL. A positive Lua reply is only provisional:
+    // a read-only Lua verification must certify the full bucket invariant,
+    // not just the receipt's presence (#185).
     private const string Script = """
         local kind = redis.call('TYPE', KEYS[1]).ok
-        if kind ~= 'none' and kind ~= 'hash' then return {-1, 0} end
+        if kind ~= 'none' and kind ~= 'hash' then return {-1, 0, 0} end
         local count = nil
         if kind == 'hash' then
             count = redis.call('HGET', KEYS[1], 'count')
-            if not count then return {-1, 0} end
+            if not count then return {-1, 0, 0} end
         end
         if not count then
             redis.call('HSET', KEYS[1], 'count', '1', ARGV[3], '1')
             redis.call('PEXPIRE', KEYS[1], ARGV[1])
-            return {1, tonumber(ARGV[1])}
+            return {1, tonumber(ARGV[1]), 1}
         end
         local ttl = redis.call('PTTL', KEYS[1])
-        -- Corrupt persisted counters/TTLs must never grant permits.
-        -- Do not reset, renew or increment a suspicious quota bucket.
+        -- Validate persisted shape BEFORE any write. The receipt cardinality
+        -- must equal the admissions count. A malformed bucket is not
+        -- rewritten, replenished, nor silently converted to a new window.
         if ttl < 1 or ttl > tonumber(ARGV[1]) or
            #count > #ARGV[2] or
            not string.match(count, '^[1-9][0-9]*$') then
-            return {-1, 0}
+            return {-1, 0, 0}
         end
         local current = tonumber(count)
-        if not current or current > tonumber(ARGV[2]) then
-            return {-1, 0}
+        if not current or current > tonumber(ARGV[2]) or
+           redis.call('HLEN', KEYS[1]) ~= current + 1 then
+            return {-1, 0, 0}
         end
         if current >= tonumber(ARGV[2]) then
-            return {0, ttl}
+            return {0, ttl, 0}
         end
         redis.call('HINCRBY', KEYS[1], 'count', 1)
         redis.call('HSET', KEYS[1], ARGV[3], '1')
-        return {1, ttl}
+        return {1, ttl, current + 1}
+        """;
+
+    // Second, read-only Lua operation on the SAME Redis connector.
+    // Check the unique receipt AND counter, receipt cardinality and TTL
+    // in one atomic read. Count >= issuedOrdinal accommodates unrelated
+    // concurrent admissions between the two scripts; never accept a
+    // counter that moved backwards or exceeded the server's policy limit.
+    private const string ConfirmPermitScript = """
+        if redis.call('TYPE', KEYS[1]).ok ~= 'hash' then return 0 end
+        local count = redis.call('HGET', KEYS[1], 'count')
+        if not count or #count > #ARGV[3] or
+           not string.match(count, '^[1-9][0-9]*$') then return 0 end
+        local current = tonumber(count)
+        if not current or current < tonumber(ARGV[2]) or
+           current > tonumber(ARGV[3]) then return 0 end
+        if redis.call('HLEN', KEYS[1]) ~= current + 1 then return 0 end
+        local ttl = redis.call('PTTL', KEYS[1])
+        if ttl < 1 or ttl > tonumber(ARGV[4]) then return 0 end
+        if redis.call('HGET', KEYS[1], ARGV[1]) ~= '1' then return 0 end
+        return 1
         """;
 
     public async Task<GuestMutationDecision> AcquireAsync(
@@ -87,10 +109,9 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
         var receipt = "proof:" + Convert.ToHexStringLower(
             RandomNumberGenerator.GetBytes(16));
 
-        // A Lua 1 is only an acknowledgement; a lost mutation must not
-        // admit extra guests/rooms. Read back the unique receipt on the same
-        // Redis connection before returning a permit. A single 2s deadline
-        // includes BOTH operations, without retrying a possibly applied Lua.
+        // Both Lua calls share ONE deadline of 2 seconds. A command that
+        // completed after client cancellation may still have consumed quota;
+        // never retry it or assume the permit was not charged.
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
         timeout.CancelAfter(CommandTimeout);
@@ -99,18 +120,26 @@ public sealed class RedisGuestMutationLimiter(IDatabase database) : IGuestMutati
             .WaitAsync(timeout.Token);
         timeout.Token.ThrowIfCancellationRequested();
         var fields = (RedisResult[])redisResult!;
-        if (fields.Length != 2)
+        if (fields.Length != 3)
             throw new InvalidDataException("Invalid distributed limit result.");
         var status = (long)fields[0];
         var remaining = (long)fields[1];
-        if (status is not (0 or 1) || remaining < 0 || remaining > WindowMilliseconds)
+        var issuedOrdinal = (long)fields[2];
+        if (status is not (0 or 1) || remaining < 0 ||
+            remaining > WindowMilliseconds ||
+            (status == 0 && issuedOrdinal != 0) ||
+            (status == 1 && (issuedOrdinal < 1 ||
+                             issuedOrdinal > policy.PermitLimit)))
             throw new InvalidDataException("Invalid distributed limit result.");
 
         if (status == 1)
         {
-            var confirmed = await database.HashGetAsync(key, receipt)
+            var confirmed = (long)await database.ScriptEvaluateAsync(
+                    ConfirmPermitScript, [key],
+                    [receipt, issuedOrdinal, policy.PermitLimit,
+                     WindowMilliseconds])
                 .WaitAsync(timeout.Token);
-            if (!string.Equals((string?)confirmed, "1", StringComparison.Ordinal))
+            if (confirmed != 1)
                 throw new InvalidDataException("Distributed permit not confirmed.");
         }
         timeout.Token.ThrowIfCancellationRequested();
