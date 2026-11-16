@@ -501,7 +501,7 @@ public sealed class PreAuthenticationMutationGuardTests
         using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(15));
         await AssertPostAuthDrainResponseAsync(result);
         Assert.Equal(1, cache.Writes);
-        Assert.Equal(1, cache.Reads); // Targeted registry rollback lookup.
+        Assert.Equal(2, cache.Reads); // Revocation lookup plus post-delete confirmation.
         Assert.Equal(1, cache.Removes);
         Assert.Equal(0, cache.StoredGuestKeys);
         Assert.Equal(0, server.Services.GetRequiredService<
@@ -532,7 +532,7 @@ public sealed class PreAuthenticationMutationGuardTests
         index.ResumeSchedule.SetResult(true);
         using var result = await inFlight.WaitAsync(TimeSpan.FromSeconds(15));
         await AssertPostAuthDrainResponseAsync(result);
-        Assert.Equal(1, cache.Reads);
+        Assert.Equal(2, cache.Reads); // Revocation lookup plus post-delete confirmation.
         Assert.Equal(1, cache.Removes);
         Assert.Equal(0, cache.StoredGuestKeys);
         Assert.Equal(0, server.Services.GetRequiredService<
