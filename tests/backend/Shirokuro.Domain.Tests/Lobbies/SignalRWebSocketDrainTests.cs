@@ -34,19 +34,24 @@ public sealed class SignalRWebSocketDrainTests
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.UseEnvironment(Environments.Development));
 
-    private static string CookieFor(WebApplicationFactory<Program> server)
+    private static (string Cookie, ClaimsPrincipal Principal) TicketFor(
+        WebApplicationFactory<Program> server, string playerId = GuestId)
     {
         var sessions = server.Services.GetRequiredService<GuestSessionRegistry>();
-        var token = sessions.Register(GuestId,
+        var token = sessions.Register(playerId,
             TimeProvider.System.GetUtcNow().AddHours(1));
-        var principal = GuestSessions.CreatePrincipal(GuestId, token);
+        var principal = GuestSessions.CreatePrincipal(playerId, token);
         var options = server.Services
             .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
             .Get(CookieAuthenticationDefaults.AuthenticationScheme);
         var ticket = new AuthenticationTicket(principal,
             CookieAuthenticationDefaults.AuthenticationScheme);
-        return options.Cookie.Name + "=" + options.TicketDataFormat.Protect(ticket);
+        return (options.Cookie.Name + "=" + options.TicketDataFormat.Protect(ticket),
+            principal);
     }
+
+    private static string CookieFor(WebApplicationFactory<Program> server) =>
+        TicketFor(server).Cookie;
 
     private static WebSocketClient SocketClient(
         WebApplicationFactory<Program> server, string cookie)
@@ -101,6 +106,49 @@ public sealed class SignalRWebSocketDrainTests
             text.Append(accumulated);
             Assert.True(text.Length < 65536, "SignalR response frame is oversized.");
         }
+    }
+
+    private static async Task<WebSocket> ConnectAndHandshakeAsync(
+        WebApplicationFactory<Program> server, string cookie,
+        CancellationToken cancellationToken)
+    {
+        var socket = await SocketClient(server, cookie).ConnectAsync(
+            new Uri("ws://localhost/hubs/lobbies"), cancellationToken);
+        try
+        {
+            await SendJsonAsync(socket, "{\"protocol\":\"json\",\"version\":1}",
+                cancellationToken);
+            var handshake = await ReadSignalRMessageAsync(socket,
+                message => message.ValueKind == JsonValueKind.Object &&
+                           !message.TryGetProperty("type", out _),
+                cancellationToken);
+            Assert.Equal("{}", handshake.GetRawText());
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<JsonElement> InvokeRosterAsync(
+        WebSocket socket, string roomId, string invocationId,
+        CancellationToken cancellationToken)
+    {
+        await SendJsonAsync(socket, JsonSerializer.Serialize(new
+        {
+            type = 1,
+            invocationId,
+            target = "GetRoster",
+            arguments = new[] { roomId }
+        }), cancellationToken);
+        return await ReadSignalRMessageAsync(socket,
+            message => message.TryGetProperty("type", out var type) &&
+                       type.GetInt32() == 3 &&
+                       message.TryGetProperty("invocationId", out var id) &&
+                       id.GetString() == invocationId,
+            cancellationToken);
     }
 
     [Fact]
@@ -199,6 +247,92 @@ public sealed class SignalRWebSocketDrainTests
         using (var health = await http.GetAsync("/api/health"))
             Assert.Equal(HttpStatusCode.OK, health.StatusCode);
         Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task AuthenticatedNonMemberGetsSameOpaqueErrorAsUnknownRoomOnRealWebSocket()
+    {
+        using var server = Server();
+        const string foreignGuest = "guest-ffffffffffffffffffffffffffffffff";
+        const string foreignRoom = "room-ffffffffffffffffffffffffffffffff";
+        const string missingRoom = "room-00000000000000000000000000000000";
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        coordinator.Create(foreignRoom, ["white", "black"]);
+        coordinator.Join(foreignRoom, foreignGuest, "black", 0);
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var socket = await ConnectAndHandshakeAsync(server, CookieFor(server),
+            timeout.Token);
+
+        var foreign = await InvokeRosterAsync(socket, foreignRoom, "foreign",
+            timeout.Token);
+        var missing = await InvokeRosterAsync(socket, missingRoom, "missing",
+            timeout.Token);
+        Assert.True(foreign.TryGetProperty("error", out var deniedError));
+        Assert.True(missing.TryGetProperty("error", out var missingError));
+        Assert.Equal(missingError.GetString(), deniedError.GetString());
+        Assert.False(foreign.TryGetProperty("result", out _));
+        Assert.False(missing.TryGetProperty("result", out _));
+        Assert.DoesNotContain(foreignRoom, foreign.GetRawText());
+        Assert.DoesNotContain(foreignGuest, foreign.GetRawText());
+        Assert.DoesNotContain(missingRoom, missing.GetRawText());
+
+        // A denial does not poison the authenticated connection: only its
+        // member-authorized roster can still be returned on this socket.
+        var owned = await InvokeRosterAsync(socket, Room, "owned", timeout.Token);
+        Assert.False(owned.TryGetProperty("error", out _));
+        Assert.Equal(Room, owned.GetProperty("result")
+            .GetProperty("lobbyId").GetString());
+        var member = Assert.Single(owned.GetProperty("result")
+            .GetProperty("participants").EnumerateArray());
+        Assert.Equal(GuestId, member.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(foreignGuest, owned.GetRawText());
+    }
+
+    [Fact]
+    public async Task GuestRevocationBlocksNextInvocationOnAlreadyAuthenticatedWebSocket()
+    {
+        using var server = Server();
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        var ticket = TicketFor(server);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var socket = await ConnectAndHandshakeAsync(server, ticket.Cookie,
+            timeout.Token);
+
+        var before = await InvokeRosterAsync(socket, Room, "before-revoke",
+            timeout.Token);
+        Assert.False(before.TryGetProperty("error", out _));
+        Assert.Equal(Room, before.GetProperty("result")
+            .GetProperty("lobbyId").GetString());
+
+        // The cookie was valid when the transport connected. A subsequent
+        // Hub invocation must recheck the server-side guest registry.
+        var sessions = server.Services.GetRequiredService<GuestSessionRegistry>();
+        Assert.True(sessions.Revoke(ticket.Principal));
+        var after = await InvokeRosterAsync(socket, Room, "after-revoke",
+            timeout.Token);
+        Assert.True(after.TryGetProperty("error", out var error));
+        Assert.False(string.IsNullOrWhiteSpace(error.GetString()));
+        Assert.False(after.TryGetProperty("result", out _));
+        Assert.DoesNotContain(Room, after.GetRawText());
+        Assert.DoesNotContain(GuestId, after.GetRawText());
+
+        // The same revoked ticket is also invalid on the HTTP auth boundary.
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/sessions/me");
+        request.Headers.TryAddWithoutValidation("Cookie", ticket.Cookie);
+        using var rejected = await http.SendAsync(request, timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+        Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+        Assert.False(rejected.Headers.Contains("Set-Cookie"));
     }
 
     [Theory]
