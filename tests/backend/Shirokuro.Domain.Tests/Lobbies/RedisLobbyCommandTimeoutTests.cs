@@ -63,15 +63,18 @@ public sealed class RedisLobbyCommandTimeoutTests
         public int ConflictsBeforeSuccess { get; set; } = int.MaxValue;
         private int _reads;
         private int _casCalls;
+        private int _confirmCalls;
         public int Reads => Volatile.Read(ref _reads);
         public int CasCalls => Volatile.Read(ref _casCalls);
+        public int ConfirmCalls => Volatile.Read(ref _confirmCalls);
 
         protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
             return method?.Name switch
             {
                 "ScriptEvaluateAsync" => IsBoundedRead(args)
-                    ? ReadSnapshot() : CompareExchange(),
+                    ? ReadSnapshot()
+                    : IsCasConfirmation(args) ? Confirm() : CompareExchange(),
                 _ => throw new InvalidOperationException(
                     "Unexpected Redis operation in contention fixture.")
             };
@@ -80,6 +83,17 @@ public sealed class RedisLobbyCommandTimeoutTests
         private static bool IsBoundedRead(object?[]? args)
             => Assert.IsType<string>(args![0]).Contains(
                 "if #raw > tonumber(ARGV[1])", StringComparison.Ordinal);
+
+        private static bool IsCasConfirmation(object?[]? args)
+            => Assert.IsType<string>(args![0]).Contains(
+                "raw ~= ARGV[1]", StringComparison.Ordinal);
+
+        private Task<RedisResult> Confirm()
+        {
+            Interlocked.Increment(ref _confirmCalls);
+            return Task.FromResult(RedisResult.Create(
+                (RedisValue)1, ResultType.Integer));
+        }
 
         private Task<RedisResult> ReadSnapshot()
         {
@@ -137,6 +151,7 @@ public sealed class RedisLobbyCommandTimeoutTests
 
         Assert.Equal(32, controller.Reads);
         Assert.Equal(32, controller.CasCalls);
+        Assert.Equal(shouldSucceed ? 1 : 0, controller.ConfirmCalls);
     }
 
     [Theory]
@@ -180,6 +195,7 @@ public sealed class RedisLobbyCommandTimeoutTests
 
         Assert.Equal(32, controller.Reads);
         Assert.Equal(32, controller.CasCalls);
+        Assert.Equal(shouldSucceed ? 1 : 0, controller.ConfirmCalls);
     }
 
     [Fact]
