@@ -66,3 +66,13 @@ public sealed class LobbyJoinContentionException()
 /// </summary>
 public sealed class LobbySnapshotUnavailableException()
     : Exception("Persisted lobby snapshot unavailable.");
+
+
+/// <summary>
+/// The Redis bounded-create Lua returned success but the exact new room
+/// snapshot and both quota index entries could not be confirmed. This is
+/// transient shared-storage uncertainty, NOT a gameplay/revision conflict.
+/// Never attach raw bytes, keys, member IDs or Redis exception details.
+/// </summary>
+public sealed class LobbyCreationUnavailableException()
+    : Exception("Lobby creation was not confirmed.");

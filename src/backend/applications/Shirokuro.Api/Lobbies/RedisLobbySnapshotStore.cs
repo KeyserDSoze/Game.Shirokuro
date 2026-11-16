@@ -282,8 +282,7 @@ public sealed class RedisLobbySnapshotStore(
                 [roomKey, globalKey, creatorKey], [bytes])
             .WaitAsync(timeout.Token);
         if (confirmed != 1)
-            throw new InvalidOperationException(
-                "Redis lobby creation was not confirmed.");
+            throw new LobbyCreationUnavailableException();
         timeout.Token.ThrowIfCancellationRequested();
         return true;
     }

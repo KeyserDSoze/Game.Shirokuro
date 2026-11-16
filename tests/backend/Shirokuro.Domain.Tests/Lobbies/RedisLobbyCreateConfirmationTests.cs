@@ -151,7 +151,8 @@ public sealed class RedisLobbyCreateConfirmationTests
         }
         else if (mode != "throw-confirm")
         {
-            Assert.Equal("Redis lobby creation was not confirmed.", failed.Message);
+            Assert.IsType<LobbyCreationUnavailableException>(failed);
+            Assert.Equal("Lobby creation was not confirmed.", failed.Message);
             Assert.DoesNotContain(room.CreatorId!, failed.ToString(),
                 StringComparison.Ordinal);
         }
