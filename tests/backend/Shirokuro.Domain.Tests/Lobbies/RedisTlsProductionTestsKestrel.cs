@@ -264,6 +264,66 @@ public sealed class RedisTlsProductionTestsKestrel
                  id.GetString() == invocation, token);
     }
 
+    private static async Task<(string Token, string Upstream)> NegotiateThroughEdgeAsync(
+        HttpClient client, CancellationToken token)
+    {
+        using var request = Mutation(HttpMethod.Post, client,
+            "/hubs/lobbies/negotiate?negotiateVersion=1");
+        using var response = await client.SendAsync(request, token);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True(response.Headers.TryGetValues("X-Shirokuro-CI-Upstream",
+            out var upstreamValues), "The edge must identify a test upstream.");
+        var upstream = Assert.Single(upstreamValues!);
+        using var json = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(token));
+        // The connection token is private. Never include it, the negotiated
+        // JSON, or a request URL containing it in xUnit failure messages.
+        Assert.True(json.RootElement.TryGetProperty("connectionToken",
+            out var connectionToken), "SignalR must issue an opaque connection token.");
+        var value = connectionToken.GetString();
+        Assert.False(string.IsNullOrEmpty(value),
+            "Negotiated SignalR connection token must be nonempty.");
+        return (value!, upstream);
+    }
+
+    private static async Task<ClientWebSocket> NegotiatedWssAsync(
+        int port, string cookie, string connectionToken,
+        CancellationToken cancellationToken)
+    {
+        var socket = new ClientWebSocket();
+        socket.Options.SetRequestHeader("Cookie", cookie);
+        socket.Options.SetRequestHeader("Origin", $"https://localhost:{port}");
+        try
+        {
+            // The connection token is scoped to one SignalR server process.
+            // This is a real negotiated WSS upgrade (unlike #167), and
+            // must route to the same upstream as the negotiate response.
+            await socket.ConnectAsync(new Uri(
+                $"wss://localhost:{port}/hubs/lobbies?id=" +
+                Uri.EscapeDataString(connectionToken)), cancellationToken);
+            await SendFrameAsync(socket,
+                "{\"protocol\":\"json\",\"version\":1}", cancellationToken);
+            var handshake = await ReceiveFrameAsync(socket,
+                frame => !frame.TryGetProperty("type", out _),
+                cancellationToken);
+            Assert.Equal("{}", handshake.GetRawText());
+            return socket;
+        }
+        catch (OperationCanceledException)
+        {
+            socket.Dispose();
+            throw;
+        }
+        catch
+        {
+            socket.Dispose();
+            // WebSocket exceptions can include the private ?id=... URL.
+            // Deliberately suppress the original exception/stack details.
+            throw new InvalidOperationException(
+                "Negotiated SignalR WSS upgrade did not complete at the sticky upstream.");
+        }
+    }
+
     private static void AssertOpaque(
         JsonElement completion, string room, string alice, string bob)
     {
