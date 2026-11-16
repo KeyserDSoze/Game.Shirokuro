@@ -182,6 +182,89 @@ public sealed class ReadinessDrainTests
     }
 
     [Fact]
+    public void FailingPreStopObserverDoesNotEscapeOrSuppressLaterObservers()
+    {
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        using var metrics = new MultiplayerMetricCapture();
+        var successfulCalls = 0;
+        using var healthy = signal.PreStopStarted.Register(
+            () => Interlocked.Increment(ref successfulCalls));
+        using var failing = signal.PreStopStarted.Register(
+            () => throw new InvalidOperationException(
+                "Deterministic test-only callback failure"));
+
+        // CancellationToken callbacks may fail, but the node must still
+        // be draining, deliver the notification to healthy subscribers
+        // and continue to accept the normal SIGTERM host lifecycle.
+        signal.BeginPreStopDrain();
+        Assert.True(signal.IsDraining);
+        Assert.True(signal.PreStopStarted.IsCancellationRequested);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        Assert.Equal(1, successfulCalls);
+
+        signal.BeginPreStopDrain();
+        lifetime.StopApplication();
+        Assert.True(signal.IsDraining);
+        Assert.Equal(1, successfulCalls);
+        Assert.Single(metrics.For(MultiplayerMetrics.NodeDrainTransitionsName));
+    }
+
+    [Fact]
+    public void PreStopAfterNotifierDisposeCannotThrowOrResetDrain()
+    {
+        using var lifetime = new FakeLifetime();
+        var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var token = signal.PreStopStarted;
+        Assert.False(token.IsCancellationRequested);
+
+        signal.Dispose();
+        signal.Dispose(); // Explicitly idempotent lifecycle cleanup.
+        Assert.Equal(token, signal.PreStopStarted);
+
+        // A previously-dispatched SIGUSR1 can race with host disposal.
+        // The OS callback cannot allow ObjectDisposedException to escape.
+        signal.BeginPreStopDrain();
+        Assert.True(signal.IsDraining);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task DisposeDuringSynchronousPreStopNotificationIsSafe()
+    {
+        using var lifetime = new FakeLifetime();
+        var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var callbackStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var blocker = signal.PreStopStarted.Register(() =>
+        {
+            callbackStarted.TrySetResult(true);
+            release.Task.GetAwaiter().GetResult();
+        });
+
+        var transition = Task.Run(signal.BeginPreStopDrain);
+        await callbackStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            // CTS.Dispose must not race unsafely with Cancel() while one
+            // synchronous callback is already executing on another thread.
+            var dispose = Task.Run(signal.Dispose);
+            await dispose.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(signal.IsDraining);
+        }
+        finally
+        {
+            release.TrySetResult(true);
+        }
+        await transition.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(signal.PreStopStarted.IsCancellationRequested);
+        lifetime.StopApplication();
+        Assert.True(signal.IsDraining);
+    }
+
+    [Fact]
     public void PreStopTransitionNotifiesSubscribersExactlyOnce()
     {
         using var lifetime = new FakeLifetime();
