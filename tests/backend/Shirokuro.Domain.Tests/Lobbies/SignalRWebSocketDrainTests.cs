@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Shirokuro.Api.Lobbies;
@@ -149,6 +150,145 @@ public sealed class SignalRWebSocketDrainTests
                        message.TryGetProperty("invocationId", out var id) &&
                        id.GetString() == invocationId,
             cancellationToken);
+    }
+
+    private sealed class PausedRosterLobby(
+        LobbyRosterReader reader, InMemoryLobbyCoordinator coordinator)
+        : IAsyncGuestLobby
+    {
+        public TaskCompletionSource<bool> ReadStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleaseRead { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<LobbyRosterView> ForMemberAsync(string roomId,
+            string trustedPlayerId, CancellationToken cancellationToken = default)
+        {
+            // Emulate a Redis read that was member-authorized before logout
+            // but whose already-captured snapshot is delivered afterwards.
+            var view = reader.ForMember(roomId, trustedPlayerId);
+            if (trustedPlayerId == GuestId)
+            {
+                ReadStarted.TrySetResult(true);
+                await ReleaseRead.Task.WaitAsync(cancellationToken);
+            }
+            return view;
+        }
+
+        public Task<LobbyRosterView> PeekForMemberAsync(string roomId,
+            string trustedPlayerId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(reader.PeekForMember(roomId, trustedPlayerId));
+
+        public Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(coordinator.RemovePlayerFromAllRooms(trustedPlayerId));
+
+        public Task<LobbyRosterView> CreateAsync(string trustedPlayerId,
+            IReadOnlyList<string>? teamIds, string? initialTeam,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> JoinAsync(string roomId, string trustedPlayerId,
+            string? teamId, long? expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> ChooseHeroAsync(string roomId,
+            string trustedPlayerId, string? heroId, long expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<LobbyRosterView> ChangeTeamAsync(string roomId,
+            string trustedPlayerId, string? teamId, long expectedRevision,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task LeaveAsync(string roomId, string trustedPlayerId,
+            long expectedRevision, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task InFlightRealWebSocketRosterCannotPublishAfterConcurrentHttpLogout()
+    {
+        using var server = Server().WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAsyncGuestLobby>();
+                services.AddSingleton<PausedRosterLobby>();
+                services.AddSingleton<IAsyncGuestLobby>(services =>
+                    services.GetRequiredService<PausedRosterLobby>());
+            }));
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        var pausing = server.Services.GetRequiredService<PausedRosterLobby>();
+        const string otherGuestId = "guest-dddddddddddddddddddddddddddddddd";
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        coordinator.Join(Room, otherGuestId, "black", 1);
+
+        var departing = TicketFor(server);
+        var remaining = TicketFor(server, otherGuestId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var departingSocket = await ConnectAndHandshakeAsync(server,
+            departing.Cookie, timeout.Token);
+        using var remainingSocket = await ConnectAndHandshakeAsync(server,
+            remaining.Cookie, timeout.Token);
+
+        // Start the real SignalR invocation but deliberately withhold its
+        // server-side roster result. A revocation AFTER the initial guest
+        // check is the concurrency edge that used to leak this snapshot.
+        await SendJsonAsync(departingSocket, JsonSerializer.Serialize(new
+        {
+            type = 1,
+            invocationId = "in-flight-logout",
+            target = "GetRoster",
+            arguments = new[] { Room }
+        }), timeout.Token);
+        await pausing.ReadStarted.Task.WaitAsync(timeout.Token);
+
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+        using var logout = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/sessions/guest");
+        logout.Headers.TryAddWithoutValidation("Cookie", departing.Cookie);
+        logout.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        logout.Headers.TryAddWithoutValidation(WebMutationGuard.RequestHeaderName,
+            WebMutationGuard.RequestHeaderValue);
+        using var result = await http.SendAsync(logout, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, result.StatusCode);
+        Assert.True(result.Headers.CacheControl?.NoStore == true);
+
+        // The previously authorized roster has already been captured by
+        // the paused storage adapter. Release it only AFTER HTTP revocation
+        // succeeded, so the new post-read guest check must reject it.
+        pausing.ReleaseRead.SetResult(true);
+        var completed = await ReadSignalRMessageAsync(departingSocket,
+            message => message.TryGetProperty("type", out var type) &&
+                       type.GetInt32() == 3 &&
+                       message.TryGetProperty("invocationId", out var id) &&
+                       id.GetString() == "in-flight-logout",
+            timeout.Token);
+        Assert.True(completed.TryGetProperty("error", out var error));
+        Assert.False(string.IsNullOrWhiteSpace(error.GetString()));
+        Assert.False(completed.TryGetProperty("result", out _));
+        Assert.DoesNotContain(Room, completed.GetRawText());
+        Assert.DoesNotContain(otherGuestId, completed.GetRawText());
+        Assert.DoesNotContain(GuestId, completed.GetRawText());
+
+        using var me = new HttpRequestMessage(HttpMethod.Get, "/api/sessions/me");
+        me.Headers.TryAddWithoutValidation("Cookie", departing.Cookie);
+        using var revoked = await http.SendAsync(me, timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+
+        var survivor = await InvokeRosterAsync(remainingSocket, Room,
+            "surviving-member", timeout.Token);
+        Assert.False(survivor.TryGetProperty("error", out _));
+        var roster = survivor.GetProperty("result");
+        Assert.Equal(3, roster.GetProperty("revision").GetInt64());
+        var participant = Assert.Single(roster.GetProperty("participants")
+            .EnumerateArray());
+        Assert.Equal(otherGuestId,
+            participant.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(GuestId, survivor.GetRawText());
     }
 
     [Fact]
