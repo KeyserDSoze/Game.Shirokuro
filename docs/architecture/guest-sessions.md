@@ -277,3 +277,28 @@ staging reale: #21 resta aperta.
 [CI codice #43919216201](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43919216201)
 SUCCESS 3/3 su `57b9ef6`: 831 xUnit, 21 Redis TLS/ACL/HA/Sentinel,
 SIGUSR1, 347 Vitest, 43 Playwright, 35 Python e build.
+
+
+## Conferma ack del lavoro di scadenza guest — #180
+
+Dopo la pulizia delle membership e di eventuali ticket restaurati,
+la rimozione del lavoro cifrato dalla coda Redis viene verificata:
+un `ZREM` completato non è da solo prova di persistenza della
+rimozione. Lo stesso `key/member` viene letto con `ZSCORE`
+sotto **un solo deadline di 2 secondi**. L'ack è valido soltanto se
+il membro non esiste più; una rimozione ignorata, una lettura non
+nulla/corrotta, un errore o un blocco lasciano il lavoro disponibile
+per la prossima sweep. Il retry non cancella altri membri, e
+l'assenza già confermata dopo un primo tentativo o da altro nodo
+è idempotente.
+
+Il membro è sempre il ciphertext Data Protection fornito dalla coda,
+mai un ID o una chiave selezionata dal browser; nessun segreto viene
+aggiunto a risposte HTTP, log o dimensioni delle metriche.
+Sette nuovi xUnit validano i fault dell'ack e cancellation, e
+non sostituiscono i test Redis reali e le verifiche del rollout
+operativo multi-pod ancora sotto #21.
+
+[CI codice #43927171180](https://github.com/KeyserDSo/Game.Shirokuro/actions/runs/43927171180)
+SUCCESS 3/3: 838 xUnit, 21 Redis, SIGUSR1, 347 Vitest,
+43 Playwright, 35 Python, build.

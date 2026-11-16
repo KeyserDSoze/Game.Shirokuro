@@ -3308,3 +3308,40 @@ senza leak di identificativi. La CI mantiene Redis reale con
 TLS/ACL/HA/Sentinel, Linux preStop, Vitest e Playwright.
 Il test non dimostra linearizzabilità cross-replica, Redis Cluster
 o un ingress multi-pod operativo, ancora sotto #21.
+
+
+## Conferma dell'ack dell'indice di scadenza Redis — #180
+
+La rimozione dei work item di scadenza guest cifrati viene effettuata
+solo dopo il completamento della pulizia lobby (fence e CAS) e,
+per i ticket pre-cutover, della rimozione mirata confermata (#178).
+Se il Redis adapter dichiarava concluso `SortedSetRemoveAsync` senza
+eliminare il membro, il worker poteva erroneamente contabilizzare
+l'ack; lo stesso item sarebbe riapparso in ogni scansione successiva
+del bounded batch e avrebbe prodotto lavoro inutile.
+
+Da #180, `RedisGuestExpiryIndex.AcknowledgeAsync` esegue
+`SortedSetRemoveAsync → SortedSetScoreAsync` sulla **stessa chiave
+namespace e lo stesso membro opaco autenticato**, con un unico
+deadline di **2 secondi**. Soltanto `ZSCORE = null` (elemento
+assente) conferma l'ack. Un ritorno `ZREM = false` non implica
+errore se un altro nodo ha già rimosso lo stesso membro; una risposta
+`ZREM = true` non prova successo se la lettura trova ancora il
+membro. Score non nullo, errore o timeout fanno fallire l'ack senza
+ritentativi interni di mutazioni incerte. Il worker conserva
+l'elemento per sweep idempotenti futuri, elaborando comunque
+gli altri item nello stesso batch e senza registrare
+identificativi o ciphertext nelle metriche/log.
+
+Test xUnit deterministici con `IDatabase DispatchProxy` coprono
+rimozione ignorata, score residuo, errore e lettura bloccata,
+recovery/idempotenza e cancellazione prima del readback; la suite
+Redis TLS/ACL/HA/Sentinel viene ripetuta integralmente. Nessun
+cambiamento a cookie guest, gameplay o visibilità PvP. Questa
+conferma è osservata dal connettore Redis, non dimostra quorum
+cross-replica, ingress multipod o failover reale (#21).
+
+[CI implementativa #43927171180](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43927171180)
+SUCCESS 3/3 sul codice `64a7d18`: 838 xUnit standard,
+21 Redis TLS/ACL/HA/Sentinel, smoke Linux SIGUSR1,
+347 Vitest, 43 Playwright, 35 Python e build.
