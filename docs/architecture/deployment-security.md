@@ -2731,3 +2731,43 @@ HTTP con due connessioni SignalR e una lettura ritardata. Entrambe
 isolano un preciso ordine di operazioni. TestServer in-process non
 sostituisce TCP/TLS reale, ingress LB, Redis reale tra processi o rollout
 Kubernetes di produzione.
+
+## Autorizzazione guest HTTP dopo lettura roster in-flight — #161
+
+Le route `GET /api/lobbies/{id}/roster` e
+`GET /api/lobbies/{id}/roster/peek` conservano il loro controllo
+member-scoped dello snapshot e la fence `IReadinessDrainSignal`.
+Il principal HTTP è verificato dall'autenticazione cookie **prima**
+di invocare il backend della lobby; una lettura Redis può restare
+in volo mentre `DELETE /api/sessions/guest` invalida il ticket su
+un altro nodo. #161 richiede quindi una seconda chiamata
+`GuestSessionRegistry.CheckAuthorityAsync` immediatamente
+**dopo** il risultato `IAsyncGuestLobby` e prima di restituire
+il DTO, creare un ETag o considerare `If-None-Match`.
+La fence di shutdown è ricontrollata dopo il secondo await.
+
+Una sessione confermata inattiva/revocata ritorna HTTP **401**;
+se l'autorità non è raggiungibile ritorna HTTP **503**, senza
+trattare la mancanza di Redis come logout definitivo. Entrambi i
+risultati hanno `Cache-Control: no-store`, nessun ETag e nessun
+roster privato. Il 304 richiede ancora autenticazione **corrente**,
+membership autorizzata e validatore canonico. Nessuna nuova route
+pubblica o privilegio di read è introdotto.
+
+**Impatto operativo:** per ogni lettura guest HTTP riuscita servono
+due validazioni dell'autorità sessioni (l'autenticazione iniziale
+e il controllo post-roster), che in Production/Staging significano
+**due richieste Redis** anziché una, oltre alla lettura della lobby.
+Monitorare la latenza e non introdurre cache positive della sessione:
+invaliderebbero la revoca. Questo risolve la race delimitata fra
+autenticazione iniziale e ritorno del backend, **non** realizza
+un'operazione atomica fra revoca e invio HTTP; una revoca subito
+dopo la verifica finale può ancora concorrere con la scrittura
+del body. Lo staging multi-nodo con ingress/LB/TCP/TLS rimane #21.
+
+I test xUnit differenziano revoca certa (401) e indisponibilità
+della cache condivisa (503), con `TaskCompletionSource` bounded;
+ulteriori integrazioni eseguono un vero logout HTTP parallelo a
+una lettura trattenuta e verificano che l'altro guest mantenga
+il roster ristretto al proprio membership. TestServer non simula
+un vero bilanciatore o traffico cross-pod.
