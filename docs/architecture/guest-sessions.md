@@ -129,3 +129,34 @@ Production TestServer, missing Redis authority, no replacement issuance and
 normal valid guest behavior. This change does not establish durable accounts,
 anti-Sybil defenses or PvP gameplay rules; those remain tracked under #21
 and the original game-design issues.
+
+
+## Verified shared guest ticket write — #174
+
+Outside Development, a completed `IDistributedCache.SetAsync` is not enough
+to publish an authentication ticket. The guest registry now reads **the same
+server-generated, SHA-256-token-keyed record** back and uses
+`CryptographicOperations.FixedTimeEquals` to verify that the precise
+serialized expiry/player digest was persisted. The write and confirmation
+share **one two-second deadline**, rather than two independent timeouts.
+The random session ID, derived Redis key and sealed player digest are never
+logged or returned in error responses. A null, stale/mismatched, unavailable
+or timed-out read results in **503/no-store without Set-Cookie** and without
+adding a local registered-session entry. An unconfirmed late SET, if any,
+remains a cryptographically unguessable orphan with its original absolute
+expiry, not a usable client cookie. There is no automatic retry.
+
+The Production/Staging boundary does not change the Development-only local
+registry, the eight-hour absolute session limit, CSRF/Origin/Host checks,
+Redis authority validation on each HTTP request/Hub invocation, remote
+revocation, or encrypted guest expiry maintenance. No new account provider
+or match rule is introduced.
+
+xUnit in #174 covers a cache silently discarding SET, corrupting the
+confirmation GET, or never completing that GET, followed by successful
+recovery with a valid signed cookie. The original mutation/roster tests
+continue to assert no *unauthorized* Redis reads: they now distinguish the
+mandatory registration confirmation from subsequent auth reads. The
+full runner verifies actual Redis TLS/ACL/HA/Sentinel and Linux lifecycle,
+but it is not a staging ingress across physical pods or LB failover; #21
+remains open for those operational prerequisites.
