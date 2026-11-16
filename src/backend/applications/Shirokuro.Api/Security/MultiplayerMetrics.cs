@@ -17,6 +17,9 @@ public static class MultiplayerMetrics
     public const string IngressRejectionsName = "shirokuro.ingress.rejections";
     public const string GuestCookieAuthorityName = "shirokuro.session.cookie_authority";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
+    public const string NodeDrainTransitionsName = "shirokuro.node.drain.transitions";
+    public const string SignalRDrainAbortAttemptsName =
+        "shirokuro.signalr.drain_abort_attempts";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
     public const string RedisReplicationObservationsName =
@@ -42,6 +45,12 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> ReadinessProbes = Meter.CreateCounter<long>(
         ReadinessProbesName, unit: "{probe}",
         description: "Executed node-readiness probes, excluding cache hits.");
+    private static readonly Counter<long> NodeDrainTransitions =
+        Meter.CreateCounter<long>(NodeDrainTransitionsName, unit: "{transition}",
+            description: "First server-owned transition into drain on a node, not readiness probe count.");
+    private static readonly Counter<long> SignalRDrainAbortAttempts =
+        Meter.CreateCounter<long>(SignalRDrainAbortAttemptsName, unit: "{attempt}",
+            description: "SignalR transport abort attempts made by the local connection registry, not confirmed network closes.");
     private static readonly Histogram<double> ReadinessDurationSeconds =
         Meter.CreateHistogram<double>(ReadinessDurationSecondsName, unit: "s",
             description: "Elapsed time of executed Redis/Data Protection readiness probes only.");
@@ -135,6 +144,42 @@ public static class MultiplayerMetrics
     public static void RecordReadinessProbe(bool ready) =>
         ReadinessProbes.Add(1, new KeyValuePair<string, object?>(
             "outcome", ready ? "ready" : "unavailable"));
+
+    /// <summary>
+    /// Exactly one *first* lifecycle transition per node. Callers enforce
+    /// the one-shot state with Interlocked; the enum is the only tag input.
+    /// SIGTERM after SIGUSR1 must not emit a second transition.
+    /// </summary>
+    public static void RecordNodeDrain(NodeDrainCause cause)
+    {
+        var label = cause switch
+        {
+            NodeDrainCause.PreStop => "prestop",
+            NodeDrainCause.HostShutdown => "host-shutdown",
+            _ => throw new ArgumentOutOfRangeException(nameof(cause))
+        };
+        NodeDrainTransitions.Add(1,
+            new KeyValuePair<string, object?>("cause", label));
+    }
+
+    /// <summary>
+    /// Only a local LobbyConnectionDrainRegistry Abort() attempt is counted:
+    /// no socket-closure guarantee, player ID, room, IP, cookie or connection
+    /// ID ever enters this instrument. Calls after the preStop snapshot
+    /// are classified as 'late-connection' regardless of the node cause.
+    /// </summary>
+    public static void RecordSignalRDrainAbortAttempt(SignalRDrainAbortReason reason)
+    {
+        var label = reason switch
+        {
+            SignalRDrainAbortReason.PreStop => "prestop",
+            SignalRDrainAbortReason.HostShutdown => "host-shutdown",
+            SignalRDrainAbortReason.LateConnection => "late-connection",
+            _ => throw new ArgumentOutOfRangeException(nameof(reason))
+        };
+        SignalRDrainAbortAttempts.Add(1,
+            new KeyValuePair<string, object?>("reason", label));
+    }
 
     /// <summary>
     /// Record one real Production readiness probe, not every HTTP waiter or
@@ -275,6 +320,9 @@ public static class MultiplayerMetrics
 }
 
 public enum MutationOutcome { Allowed, Limited, Unavailable }
+
+public enum NodeDrainCause { PreStop, HostShutdown }
+public enum SignalRDrainAbortReason { PreStop, HostShutdown, LateConnection }
 
 /// <summary>Finite results of a real signed guest cookie validation.</summary>
 public enum GuestCookieValidationOutcome
