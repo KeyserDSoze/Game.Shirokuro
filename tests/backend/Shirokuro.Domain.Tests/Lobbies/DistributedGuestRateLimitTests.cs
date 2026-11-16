@@ -173,8 +173,8 @@ public sealed class DistributedGuestRateLimitTests
                 Guid.NewGuid().ToString("N")[..4] + "::1");
             var key = RedisGuestMutationLimiter.Key(policy, ip);
             var db = a.GetDatabase();
-            Assert.True(await db.StringSetAsync(
-                key, damagedCount, TimeSpan.FromSeconds(35)));
+            Assert.True(await db.HashSetAsync(key, "count", damagedCount));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(35)));
             var one = new RedisGuestMutationLimiter(db);
             var two = new RedisGuestMutationLimiter(b.GetDatabase());
             foreach (var limiter in new[] { one, two })
@@ -185,14 +185,14 @@ public sealed class DistributedGuestRateLimitTests
                 Assert.DoesNotContain(damagedCount, error.Message);
                 Assert.Null(error.InnerException);
             }
-            Assert.Equal(damagedCount, (string?)await db.StringGetAsync(key));
+            Assert.Equal(damagedCount, (string?)await db.HashGetAsync(key, "count"));
             var ttl = await db.KeyTimeToLiveAsync(key);
             Assert.True(ttl > TimeSpan.Zero && ttl <= TimeSpan.FromSeconds(35));
 
             // Recovery is explicit repair, never an automatic quota reset.
             Assert.True(await db.KeyDeleteAsync(key));
             Assert.True((await two.AcquireAsync(policy, ip)).Allowed);
-            Assert.Equal("1", (string?)await db.StringGetAsync(key));
+            Assert.Equal("1", (string?)await db.HashGetAsync(key, "count"));
         }
     }
 
@@ -213,18 +213,16 @@ public sealed class DistributedGuestRateLimitTests
                 Guid.NewGuid().ToString("N")[..4] + "::1");
             var db = a.GetDatabase();
             var key = RedisGuestMutationLimiter.Key(policy, ip);
+            Assert.True(await db.HashSetAsync(key, "count", "1"));
             if (extendedTtl)
-                Assert.True(await db.StringSetAsync(
-                    key, "1", TimeSpan.FromMinutes(2)));
-            else
-                Assert.True(await db.StringSetAsync(key, "1"));
+                Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromMinutes(2)));
 
             var ex = await Assert.ThrowsAsync<InvalidDataException>(() =>
                 new RedisGuestMutationLimiter(b.GetDatabase())
                     .AcquireAsync(policy, ip));
             Assert.Equal("Invalid distributed limit result.", ex.Message);
             Assert.Null(ex.InnerException);
-            Assert.Equal("1", (string?)await db.StringGetAsync(key));
+            Assert.Equal("1", (string?)await db.HashGetAsync(key, "count"));
             var remaining = await db.KeyTimeToLiveAsync(key);
             if (extendedTtl)
                 Assert.True(remaining > TimeSpan.FromSeconds(60));
@@ -250,13 +248,14 @@ public sealed class DistributedGuestRateLimitTests
                 Guid.NewGuid().ToString("N")[..4] + "::1");
             var db = a.GetDatabase();
             var key = RedisGuestMutationLimiter.Key(policy, ip);
-            Assert.True(await db.StringSetAsync(key, "7", TimeSpan.FromSeconds(30)));
+            Assert.True(await db.HashSetAsync(key, "count", "7"));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30)));
             var beforeTtl = await db.KeyTimeToLiveAsync(key);
             Assert.True((await new RedisGuestMutationLimiter(db)
                 .AcquireAsync(policy, ip)).Allowed);
             Assert.False((await new RedisGuestMutationLimiter(b.GetDatabase())
                 .AcquireAsync(policy, ip)).Allowed);
-            Assert.Equal("8", (string?)await db.StringGetAsync(key));
+            Assert.Equal("8", (string?)await db.HashGetAsync(key, "count"));
             var afterTtl = await db.KeyTimeToLiveAsync(key);
             Assert.True(afterTtl > TimeSpan.Zero);
             Assert.True(afterTtl <= beforeTtl);
@@ -282,8 +281,8 @@ public sealed class DistributedGuestRateLimitTests
                 GuestMutationKind.SessionIssuance);
             var db = b.GetDatabase();
             var key = RedisGuestMutationLimiter.Key(policy, ip);
-            Assert.True(await db.StringSetAsync(key, "-900",
-                TimeSpan.FromSeconds(35)));
+            Assert.True(await db.HashSetAsync(key, "count", "-900"));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(35)));
 
             Task<HttpContext> Issue() => server.Server.SendAsync(context =>
             {
@@ -301,7 +300,7 @@ public sealed class DistributedGuestRateLimitTests
             Assert.Equal("no-store",
                 denied.Response.Headers.CacheControl.ToString());
             Assert.False(denied.Response.Headers.ContainsKey("Set-Cookie"));
-            Assert.Equal("-900", (string?)await db.StringGetAsync(key));
+            Assert.Equal("-900", (string?)await db.HashGetAsync(key, "count"));
 
             Assert.True(await db.KeyDeleteAsync(key));
             var recovered = await Issue();
