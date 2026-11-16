@@ -29,6 +29,8 @@ public sealed class GuestSessionCacheTimeoutTests
         public int TotalCalls => GetCalls + SetCalls + RemoveCalls;
         public bool BlockGet { get; set; }
         public bool FailGet { get; set; }
+        public bool CorruptGet { get; set; }
+        public bool IgnoreSet { get; set; }
         public bool BlockSet { get; set; }
         public bool BlockRemove { get; set; }
 
@@ -49,7 +51,8 @@ public sealed class GuestSessionCacheTimeoutTests
             if (FailGet)
                 return Task.FromException<byte[]?>(
                     new IOException("sensitive private Redis connection detail"));
-            return BlockGet ? PendingGet.Task : Task.FromResult(Get(key));
+            return BlockGet ? PendingGet.Task :
+                Task.FromResult(CorruptGet ? new byte[] { 0xff } : Get(key));
         }
 
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
@@ -60,7 +63,7 @@ public sealed class GuestSessionCacheTimeoutTests
         {
             Interlocked.Increment(ref _sets);
             if (BlockSet) return PendingSet.Task;
-            Set(key, value, options);
+            if (!IgnoreSet) Set(key, value, options);
             return Task.CompletedTask;
         }
 
@@ -271,6 +274,60 @@ public sealed class GuestSessionCacheTimeoutTests
         Assert.Equal(0, server.Services
             .GetRequiredService<GuestSessionRegistry>().StoredSessionCount);
         Assert.Equal(1, cache.SetCalls);
+    }
+
+    [Theory]
+    [InlineData("ignored-set")]
+    [InlineData("corrupt-readback")]
+    [InlineData("stalled-readback")]
+    public async Task ProductionGuestIssuanceRequiresConfirmedSharedTicket(
+        string cacheFault)
+    {
+        var cache = new StalledCache
+        {
+            IgnoreSet = cacheFault == "ignored-set",
+            CorruptGet = cacheFault == "corrupt-readback",
+            BlockGet = cacheFault == "stalled-readback"
+        };
+        using var server = Production(cache);
+        using var client = Client(server);
+
+        // The server must not leak a new cookie or locally acknowledge an
+        // identity if Redis silently drops a write, returns mismatched data,
+        // or never completes the read-back after a successful SET.
+        using (var request = Mutate(HttpMethod.Post, "/api/sessions/guest"))
+        using (var denied = await client.SendAsync(request).WaitAsync(TestDeadline))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+        }
+        Assert.Equal(0, server.Services.GetRequiredService<GuestSessionRegistry>()
+            .StoredSessionCount);
+        Assert.Equal(1, cache.SetCalls);
+        Assert.Equal(1, cache.GetCalls);
+        if (cacheFault == "stalled-readback")
+            Assert.False(cache.PendingGet.Task.IsCompleted);
+
+        // Recover the same API without recycling the process. Exactly one
+        // newly verified ticket is issued and accepted by the shared store.
+        cache.IgnoreSet = false;
+        cache.CorruptGet = false;
+        cache.BlockGet = false;
+        using (var request = Mutate(HttpMethod.Post, "/api/sessions/guest"))
+        using (var issued = await client.SendAsync(request).WaitAsync(TestDeadline))
+        {
+            Assert.Equal(HttpStatusCode.OK, issued.StatusCode);
+            var cookie = Assert.Single(issued.Headers.GetValues("Set-Cookie"))
+                .Split(';')[0];
+            using var member = Client(server, cookie);
+            using var me = await member.GetAsync("/api/sessions/me");
+            Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+        }
+        Assert.Equal(1, server.Services.GetRequiredService<GuestSessionRegistry>()
+            .StoredSessionCount);
+        Assert.Equal(2, cache.SetCalls);
+        Assert.Equal(3, cache.GetCalls); // retry read-back + authenticated GET
     }
 
     [Fact]

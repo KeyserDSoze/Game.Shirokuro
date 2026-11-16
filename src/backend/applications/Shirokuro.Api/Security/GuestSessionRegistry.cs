@@ -62,16 +62,30 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
 
         ValidateRegistration(trustedPlayerId, expiresUtc);
         var token = NewToken();
-        // An uncertain Redis write never issues a guest cookie or local
-        // tracking entry. A delayed server-side SET can leave only an orphan
-        // ticket with an absolute TTL, not an authorized browser session.
-        await AwaitCacheAsync(sharedCache.SetAsync(
-            SharedKey(token), Encode(trustedPlayerId, expiresUtc),
-            new DistributedCacheEntryOptions { AbsoluteExpiration = expiresUtc },
-            cancellationToken), cancellationToken);
+        // A completed SET alone cannot prove that a cache adapter actually
+        // persisted the ticket. Verify the precise, freshly generated record
+        // with a GET before giving the caller a cookie. One shared deadline
+        // bounds BOTH operations, including an adapter ignoring cancellation.
+        // An uncertain/delayed SET leaves at most an unguessable orphan key
+        // with an absolute TTL, never a client-authorized session.
+        var key = SharedKey(token);
+        var expected = Encode(trustedPlayerId, expiresUtc);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        await sharedCache.SetAsync(key, expected,
+                new DistributedCacheEntryOptions { AbsoluteExpiration = expiresUtc },
+                timeout.Token).WaitAsync(timeout.Token);
+        var confirmed = await sharedCache.GetAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
+        if (confirmed is null ||
+            !CryptographicOperations.FixedTimeEquals(confirmed, expected))
+            throw new InvalidOperationException(
+                "Guest session storage did not confirm registration.");
+        timeout.Token.ThrowIfCancellationRequested();
 
-        // Do not issue local session state until the shared store accepted
-        // the ticket. The worker still knows which identities originated here.
+        // Do not issue local session state until shared authority confirms
+        // the exact stored ticket. The worker still tracks local issuances.
         lock (_gate)
         {
             PruneExpiredCore();
