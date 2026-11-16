@@ -103,6 +103,23 @@ public sealed class RedisLobbySnapshotStore(
         return 1
         """;
 
+    // Only acknowledge a newly created bounded room after the same Redis
+    // connection confirms the exact snapshot and BOTH quota memberships.
+    // The Lua reply never returns roster bytes, keys or player identities.
+    // Read-only: a verification attempt does not refresh activity/TTL.
+    private const string ConfirmBoundedCreateScript = """
+        local raw = redis.call('GET', KEYS[1])
+        if not raw or #raw ~= #ARGV[1] or raw ~= ARGV[1] then return 0 end
+        local deadline = redis.call('PEXPIRETIME', KEYS[1])
+        if deadline <= 0 then return 0 end
+        local global = redis.call('ZSCORE', KEYS[2], KEYS[1])
+        local creator = redis.call('ZSCORE', KEYS[3], KEYS[1])
+        if not global or not creator then return 0 end
+        if tonumber(global) ~= deadline or
+           tonumber(creator) ~= deadline then return 0 end
+        return 1
+        """;
+
     // The administrative index is persisted data. A single corrupt ZSET
     // member can be enormous even when the scan is limited to 257 entries.
     // Strip oversized values inside Redis before returning any bytes.
@@ -230,21 +247,45 @@ public sealed class RedisLobbySnapshotStore(
 
         var bounded = snapshot with { QuotaTracked = true };
         var ttl = DeadlineMilliseconds(bounded);
-        var result = (long)await AwaitRedisAsync(() =>
-            database.ScriptEvaluateAsync(
-                BoundedCreateScript,
-                [RoomKey(bounded.State.Definition.LobbyId), GlobalIndexKey,
-                 CreatorIndexKey(bounded.CreatorId!), RevokedGuestKey(bounded.CreatorId!)],
-                [RedisLobbySnapshotCodec.Encode(bounded), ttl,
-                 maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()]),
+        var roomKey = RoomKey(bounded.State.Definition.LobbyId);
+        var globalKey = GlobalIndexKey;
+        var creatorKey = CreatorIndexKey(bounded.CreatorId!);
+        var bytes = RedisLobbySnapshotCodec.Encode(bounded);
+
+        // A successful Lua reply alone cannot certify that a failover or a
+        // silently ignored adapter persisted all three quota-bearing keys.
+        // If this was a NEW room, read back the exact bytes, both ZSET
+        // memberships AND matching Redis absolute expiry in a separate,
+        // read-only Lua script. The whole create+check has a single deadline.
+        // An uncertain result must never be retried with a new room ID.
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var result = (long)await database.ScriptEvaluateAsync(
+                BoundedCreateScript,
+                [roomKey, globalKey, creatorKey, RevokedGuestKey(bounded.CreatorId!)],
+                [bytes, ttl, maxRooms, maxRoomsPerCreator, IndexTtlMilliseconds()])
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
         if (result == -3)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result is -1 or -2)
             throw new LobbyCapacityException();
         if (result is not (0 or 1))
             throw new InvalidOperationException("Unexpected Redis lobby result.");
-        return result == 1;
+        if (result == 0)
+            return false; // Collision: the new room was not created.
+
+        var confirmed = (long)await database.ScriptEvaluateAsync(
+                ConfirmBoundedCreateScript,
+                [roomKey, globalKey, creatorKey], [bytes])
+            .WaitAsync(timeout.Token);
+        if (confirmed != 1)
+            throw new InvalidOperationException(
+                "Redis lobby creation was not confirmed.");
+        timeout.Token.ThrowIfCancellationRequested();
+        return true;
     }
 
     /// <summary>
