@@ -2669,3 +2669,30 @@ ma non dimostrano Redis distribuito in failover, reale rete TCP/TLS,
 load balancer/proxy, reconnect del browser o matrice futura delle
 osservazioni PvP (bloccata dalla #3/#9). Gli aspetti operativi sono
 ancora tracciati nella parent #21.
+
+## Prove logout e leave HTTP con WebSocket già connessi — #159
+
+A valle delle verifiche #157/#158, la #159 esegue l'intero flusso di
+**perdita dei permessi** senza fermarsi a una revoca diretta di fixture:
+due guest con cookie autentici e due WebSocket SignalR JSON TestServer
+accedono inizialmente alla stessa stanza. Il primo invia un autentico
+`DELETE /api/lobbies/{room}/membership` con Origin/intent CSRF e revision
+corretta; il server risponde 204/no-store. Sul WebSocket **già aperto**
+`GetRoster` deve fallire con completion opaca e nessun roster del secondo
+partecipante. Il guest uscito rimane correttamente autenticato su HTTP,
+mentre il secondo socket vede il solo membro rimasto a revision incrementata.
+
+Nel caso distinto il primo guest effettua il vero
+`DELETE /api/sessions/guest`, anch'esso protetto dal guard CSRF.
+Il backend revoca il ticket e rimuove le sue membership; la connessione
+SignalR già negoziata non può più leggere il roster e lo stesso ticket
+su `GET /api/sessions/me` restituisce 401/no-store. Il secondo
+guest non subisce revoca e riceve una vista aggiornata filtrata a server.
+I test usano timeout bounded e non tracciano in metriche cookie, room ID
+o altri identificativi.
+
+Questa verifica rafforza la sicurezza del **trasporto pre-match**:
+non riguarda ancora l'osservazione delle mosse nascoste del futuro match
+(#3/#9) e non simula una rete TCP/TLS reale, bilanciatore, WebSocket tra
+nodi o Redis failover di produzione. La validazione di rollout con load
+balancer e i casi cross-node di #21 restano necessari.
