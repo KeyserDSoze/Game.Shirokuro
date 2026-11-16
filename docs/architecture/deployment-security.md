@@ -2971,3 +2971,61 @@ load balancer, header forward di un proxy di ingress, sticky sessions,
 ingress WSS/HTTPS esterno, certificati/rinnovi di dominio reali,
 network partition o pod Kubernetes. La parent #21 rimane aperta
 per uno staging end-to-end con edge e processi/pod su nodi reali.
+
+## Reverse proxy reale TLS→TLS, WebSocket e bilanciamento CI — #167
+
+Dopo due host TestServer con Redis TLS (#165) e due processi
+Kestrel HTTPS/WSS su socket reali (#166), il test di integrazione
+`RedisTlsProductionTestsKestrel.RealNginxTlsEdgeBalancesProductionKestrelHttpAndPrivateWss`
+aggiunge un vero **Nginx Docker** davanti a entrambi i processi.
+Esegue il solo scenario opt-in `SHIROKURO_TEST_REDIS_TLS` nel job CI
+già dotato di Docker e CA/certificato di durata effimera.
+
+Nginx ascolta soltanto su `127.0.0.1` e una porta effimera
+(`--network host` Linux; nessuna publish/expose di porta pubblica).
+Termina TLS con il certificato `localhost` e inoltra a un
+`upstream` round-robin di due Kestrel **via TLS con validazione
+esplicita del certificato**, `proxy_ssl_verify on`,
+`proxy_ssl_name localhost` e root CA del runner in
+`proxy_ssl_trusted_certificate`. I client usano il normale trust
+OS senza callback bypass. Un `X-Shirokuro-CI-Upstream` presente
+**solo nella configurazione temporanea di test** prova che entrambi
+gli upstream rispondono a richieste HTTPS senza cookie affinity.
+
+L'edge inoltra il `Host` originale al server, che lo valida
+contro una allowlist esatta; non inoltra né si fida di
+`X-Forwarded-Host` e sostituisce interamente `X-Forwarded-For`
+e `X-Forwarded-Proto`. Il backend permette soltanto l'IP
+esatto del trusted proxy (`127.0.0.1` nel test loopback).
+L'Origin resta configurato **esplicitamente** sull'API per la
+porta esterna, non è dedotto dagli header Host o forwarded.
+Un `SslStream` certificato-verificato con SNI `localhost`
+ma `Host: attacker.example` verifica 400/no-store senza
+confondere TLS e Host. Le mutazioni da Origin ostile sono 403
+senza cookie e i tentativi di XFF/XFP/XFH spoof non sostituiscono
+gli header imposti dall'edge.
+
+Gli upgrade WebSocket HTTP/1.1 con `Upgrade/Connection` passano
+attraverso Nginx: Bob non membro riceve una completion SignalR
+opaca, entra nella room via HTTP e quindi può leggere il roster;
+due socket Alice e uno Bob vedono soltanto i due membri. Logout
+Alice via edge revoca i due socket già aperti e HTTP cookie su
+**entrambi** gli upstream, mentre Bob conserva la propria vista.
+Il test non stampa body roster, ID o credenziali nei log Docker.
+
+**Attenzione al negotiate SignalR:** il test apre WSS direttamente
+tramite il percorso WebSocket-only, senza avvalersi di
+`/hubs/lobbies/negotiate` per ottenere un connection ID locale.
+Il bilanciamento senza affinità delle richieste **negotiate +
+WebSocket upgrade** non è certificato né promesso: senza un
+backplane/connection manager condiviso o sticky routing si può
+atterrare su due processi diversi. Abilitare una strategia di
+affinità esplicita sull'ingress o usare client WebSocket-only
+che supportino skip-negotiation, e convalidare il comportamento
+con la vera configurazione di staging prima del rollout.
+
+Questo è un test CI con Docker e Kestrel sullo **stesso host**,
+non un deployment Kubernetes multi-pod, un LB/cloud ingress,
+terminazione TLS di dominio esterno, failover proxy o fault
+injection di rete. Non chiudere la parent #21 sulla sola base
+di questa prova.
