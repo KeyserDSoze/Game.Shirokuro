@@ -725,7 +725,7 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
-    public async Task PreStopBeforeRegistryConstructionRejectsLateSocket()
+    public void PreStopBeforeRegistryConstructionRejectsLateSocket()
     {
         using var host = new StoppingHostLifetime();
         using var drain = new HostLifetimeReadinessDrainSignal(host);
@@ -743,7 +743,6 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(1, context.AbortCount);
         host.StopApplication();
         Assert.Equal(1, context.AbortCount);
-        await Task.CompletedTask;
     }
 
     [Fact]
