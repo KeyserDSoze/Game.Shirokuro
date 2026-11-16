@@ -435,7 +435,9 @@ public sealed class SignalRWebSocketDrainTests
             WebMutationGuard.RequestHeaderValue);
         using var result = await http.SendAsync(logout, timeout.Token);
         Assert.Equal(HttpStatusCode.NoContent, result.StatusCode);
-        Assert.Equal("no-store", result.Headers.CacheControl?.ToString());
+        // Cookie SignOut may add no-cache. Both directives are valid;
+        // require the privacy-critical no-store directive, not exact text.
+        Assert.True(result.Headers.CacheControl?.NoStore == true);
 
         // Real HTTP logout revokes the signed session and cleans all room
         // memberships; an already-negotiated WebSocket has no grandfathered
