@@ -1,0 +1,419 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Json;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.Json;
+using Xunit;
+
+namespace Shirokuro.Domain.Tests.Lobbies;
+
+/// <summary>
+/// Two *separate OS processes* running the production API on Kestrel
+/// HTTPS/WSS sockets, using the CI runner's real certificate-validated Redis
+/// TLS service. This still does not simulate an ingress/load balancer.
+/// </summary>
+[Collection("Production Redis TLS integration")]
+public sealed class RedisTlsProductionTestsKestrel
+{
+    private const char RecordSeparator = '\u001e';
+
+    private sealed class ChildProcess : IAsyncDisposable
+    {
+        private readonly Process _process;
+        private readonly Task _stdout;
+        private readonly Task _stderr;
+
+        public ChildProcess(Process process)
+        {
+            _process = process;
+            // Drain without printing request URLs, guest IDs, cookies,
+            // configuration strings, paths or exception details into CI.
+            _stdout = process.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
+            _stderr = process.StandardError.BaseStream.CopyToAsync(Stream.Null);
+        }
+
+        public bool HasExited => _process.HasExited;
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (!_process.HasExited)
+                    _process.Kill(entireProcessTree: true);
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                await _process.WaitForExitAsync(deadline.Token);
+                await Task.WhenAll(_stdout, _stderr).WaitAsync(deadline.Token);
+            }
+            finally
+            {
+                _process.Dispose();
+            }
+        }
+    }
+
+    private static string ApiAssembly()
+    {
+        for (var parent = new DirectoryInfo(AppContext.BaseDirectory);
+             parent is not null; parent = parent.Parent)
+        {
+            if (!File.Exists(Path.Combine(parent.FullName, "Shirokuro.slnx")))
+                continue;
+            var dll = Path.Combine(parent.FullName, "src", "backend",
+                "applications", "Shirokuro.Api", "bin", "Release", "net10.0",
+                "Shirokuro.Api.dll");
+            if (File.Exists(dll) && File.Exists(Path.ChangeExtension(dll, ".runtimeconfig.json")))
+                return dll;
+            break;
+        }
+        throw new InvalidOperationException(
+            "Release API host has not been built for the isolated Kestrel test.");
+    }
+
+    private static int ReserveUnusedLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private static ChildProcess StartKestrel(
+        int port, string apiAssembly, string serverPfx, string password,
+        (string Folder, string Pfx, string Password) keyRing, string redis)
+    {
+        var process = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = Path.GetDirectoryName(apiAssembly)!,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        process.ArgumentList.Add(apiAssembly);
+        process.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
+        process.Environment["DOTNET_ENVIRONMENT"] = "Production";
+        process.Environment["ASPNETCORE_URLS"] = $"https://localhost:{port}";
+        process.Environment["Kestrel__Certificates__Default__Path"] = serverPfx;
+        process.Environment["Kestrel__Certificates__Default__Password"] = password;
+        process.Environment["AllowedHosts"] = $"localhost:{port}";
+        process.Environment["Security__AllowedOrigins__0"] = $"https://localhost:{port}";
+        process.Environment["Security__GuestSessions__RedisConnectionString"] = redis;
+        process.Environment["Security__DataProtection__KeysDirectory"] = keyRing.Folder;
+        process.Environment["Security__DataProtection__CertificatePath"] = keyRing.Pfx;
+        process.Environment["Security__DataProtection__CertificatePassword"] =
+            keyRing.Password;
+        var started = Process.Start(process)
+            ?? throw new InvalidOperationException("Unable to start isolated API process.");
+        return new ChildProcess(started);
+    }
+
+    private static HttpClient Http(int port, string? cookie = null)
+    {
+        // Deliberately use normal operating-system CA/hostname verification:
+        // no custom HttpClientHandler callback and no insecure TLS bypass.
+        var client = new HttpClient(new HttpClientHandler
+        {
+            AllowAutoRedirect = false, UseCookies = false, UseProxy = false
+        })
+        {
+            BaseAddress = new Uri($"https://localhost:{port}"),
+            Timeout = TimeSpan.FromSeconds(12)
+        };
+        if (cookie is not null)
+            client.DefaultRequestHeaders.TryAddWithoutValidation("Cookie", cookie);
+        return client;
+    }
+
+    private static async Task ReadyAsync(
+        HttpClient client, ChildProcess child, CancellationToken token)
+    {
+        for (var attempt = 0; attempt < 80; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.False(child.HasExited, "Production Kestrel child exited before readiness.");
+            try
+            {
+                using var response = await client.GetAsync("/api/ready", token);
+                if (response.StatusCode == HttpStatusCode.OK)
+                {
+                    Assert.True(response.Headers.CacheControl?.NoStore == true);
+                    return;
+                }
+            }
+            catch (HttpRequestException) { } // Not listening yet.
+            catch (TaskCanceledException) when (!token.IsCancellationRequested) { }
+            await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+        }
+        Assert.Fail("Production Kestrel child did not become ready.");
+    }
+
+    private static HttpRequestMessage Mutation(
+        HttpMethod method, HttpClient client, string path, object? body = null)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.TryAddWithoutValidation("Origin",
+            client.BaseAddress!.GetLeftPart(UriPartial.Authority));
+        request.Headers.TryAddWithoutValidation("X-Shirokuro-Request", "1");
+        if (body is not null)
+            request.Content = JsonContent.Create(body);
+        return request;
+    }
+
+    private static async Task<(string Id, string Cookie)> LoginAsync(
+        HttpClient visitor, CancellationToken token)
+    {
+        using var request = Mutation(HttpMethod.Post, visitor, "/api/sessions/guest");
+        using var response = await visitor.SendAsync(request, token);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var cookie = Assert.Single(response.Headers.GetValues("Set-Cookie")).Split(';')[0];
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        return (json.RootElement.GetProperty("playerId").GetString()!, cookie);
+    }
+
+    private static async Task SendFrameAsync(
+        WebSocket socket, string json, CancellationToken token)
+    {
+        var payload = Encoding.UTF8.GetBytes(json + RecordSeparator);
+        await socket.SendAsync(new ArraySegment<byte>(payload),
+            WebSocketMessageType.Text, true, token);
+    }
+
+    private static async Task<JsonElement> ReceiveFrameAsync(
+        WebSocket socket, Func<JsonElement, bool> predicate, CancellationToken token)
+    {
+        var buffer = new byte[8192];
+        var pending = new StringBuilder();
+        while (true)
+        {
+            var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), token);
+            Assert.Equal(WebSocketMessageType.Text, result.MessageType);
+            pending.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+            var text = pending.ToString();
+            var separator = text.IndexOf(RecordSeparator);
+            while (separator >= 0)
+            {
+                var frame = text[..separator];
+                text = text[(separator + 1)..];
+                if (frame.Length > 0)
+                {
+                    using var json = JsonDocument.Parse(frame);
+                    if (predicate(json.RootElement))
+                        return json.RootElement.Clone();
+                }
+                separator = text.IndexOf(RecordSeparator);
+            }
+            pending.Clear();
+            pending.Append(text);
+            Assert.True(pending.Length < 65536, "SignalR frame exceeded size limit.");
+        }
+    }
+
+    private static async Task<ClientWebSocket> WebSocketAsync(
+        int port, string cookie, CancellationToken token)
+    {
+        var socket = new ClientWebSocket();
+        socket.Options.SetRequestHeader("Cookie", cookie);
+        socket.Options.SetRequestHeader("Origin", $"https://localhost:{port}");
+        try
+        {
+            // WSS connects over a real TCP socket and validates the runner's
+            // temporary CA and localhost SAN. No TLS validation callbacks.
+            await socket.ConnectAsync(
+                new Uri($"wss://localhost:{port}/hubs/lobbies"), token);
+            await SendFrameAsync(socket,
+                "{\"protocol\":\"json\",\"version\":1}", token);
+            var handshake = await ReceiveFrameAsync(socket,
+                m => !m.TryGetProperty("type", out _), token);
+            Assert.Equal("{}", handshake.GetRawText());
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<JsonElement> RosterAsync(
+        WebSocket socket, string room, string invocation, CancellationToken token)
+    {
+        await SendFrameAsync(socket, JsonSerializer.Serialize(new
+        {
+            type = 1, invocationId = invocation,
+            target = "GetRoster", arguments = new[] { room }
+        }), token);
+        return await ReceiveFrameAsync(socket,
+            m => m.TryGetProperty("type", out var type) && type.GetInt32() == 3 &&
+                 m.TryGetProperty("invocationId", out var id) &&
+                 id.GetString() == invocation, token);
+    }
+
+    private static void AssertOpaque(
+        JsonElement completion, string room, string alice, string bob)
+    {
+        Assert.True(completion.TryGetProperty("error", out var error));
+        Assert.False(string.IsNullOrWhiteSpace(error.GetString()));
+        Assert.False(completion.TryGetProperty("result", out _));
+        Assert.DoesNotContain(room, completion.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain(alice, completion.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain(bob, completion.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", completion.GetRawText(),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task TwoRealProductionKestrelProcessesShareTlsGuestSessionsAndWssRevocation()
+    {
+        var redis = Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_TLS");
+        if (string.IsNullOrWhiteSpace(redis))
+            return; // Only the dedicated ephemeral TLS CI suite runs this fixture.
+        var certDirectory = Environment.GetEnvironmentVariable("SHIROKURO_TLS_CERT_DIR");
+        Assert.False(string.IsNullOrWhiteSpace(certDirectory));
+        var certificate = Path.Combine(certDirectory!, "server.crt");
+        var privateKey = Path.Combine(certDirectory!, "server.key");
+        Assert.True(File.Exists(certificate));
+        Assert.True(File.Exists(privateKey));
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(100));
+        var scratch = Directory.CreateTempSubdirectory("shirokuro-kestrel-ci-");
+        try
+        {
+            var pfxPath = Path.Combine(scratch.FullName, "kestrel.pfx");
+            var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+            using (var pem = X509Certificate2.CreateFromPemFile(certificate, privateKey))
+                File.WriteAllBytes(pfxPath, pem.Export(X509ContentType.Pkcs12, password));
+            if (OperatingSystem.IsLinux())
+                File.SetUnixFileMode(pfxPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+            var portA = ReserveUnusedLoopbackPort();
+            var portB = ReserveUnusedLoopbackPort();
+            while (portB == portA)
+                portB = ReserveUnusedLoopbackPort();
+            var api = ApiAssembly();
+            var dp = TestDataProtectionConfiguration.Values;
+            await using var first = StartKestrel(portA, api, pfxPath,
+                password, dp, redis);
+            using var visitorA = Http(portA);
+            await ReadyAsync(visitorA, first, timeout.Token);
+            // A must persist the shared DP key BEFORE B starts, avoiding
+            // concurrent initial key generation by isolated processes.
+            var (alice, aliceCookie) = await LoginAsync(visitorA, timeout.Token);
+
+            await using var second = StartKestrel(portB, api, pfxPath,
+                password, dp, redis);
+            using var visitorB = Http(portB);
+            await ReadyAsync(visitorB, second, timeout.Token);
+            var (bob, bobCookie) = await LoginAsync(visitorB, timeout.Token);
+            Assert.NotEqual(alice, bob);
+
+            using var aliceA = Http(portA, aliceCookie);
+            using var aliceB = Http(portB, aliceCookie);
+            using var bobA = Http(portA, bobCookie);
+            using var bobB = Http(portB, bobCookie);
+            using (var crossProcessTicket = await aliceB.GetAsync(
+                "/api/sessions/me", timeout.Token))
+                Assert.Equal(HttpStatusCode.OK, crossProcessTicket.StatusCode);
+
+            string room;
+            using (var create = Mutation(HttpMethod.Post, aliceA, "/api/lobbies",
+                       new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+            using (var response = await aliceA.SendAsync(create, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+                using var data = JsonDocument.Parse(
+                    await response.Content.ReadAsStringAsync(timeout.Token));
+                room = data.RootElement.GetProperty("lobbyId").GetString()!;
+            }
+
+            using var socketAliceA = await WebSocketAsync(portA, aliceCookie, timeout.Token);
+            using var socketAliceB = await WebSocketAsync(portB, aliceCookie, timeout.Token);
+            using var socketBobB = await WebSocketAsync(portB, bobCookie, timeout.Token);
+
+            var outsider = await RosterAsync(socketBobB, room,
+                "not-member", timeout.Token);
+            var missing = await RosterAsync(socketBobB,
+                "room-00000000000000000000000000000000",
+                "not-found", timeout.Token);
+            AssertOpaque(outsider, room, alice, bob);
+            AssertOpaque(missing, room, alice, bob);
+            Assert.Equal(missing.GetProperty("error").GetString(),
+                outsider.GetProperty("error").GetString());
+
+            using (var join = Mutation(HttpMethod.Post, bobB,
+                       "/api/lobbies/" + room + "/join",
+                       new { teamId = "black", expectedRevision = 1L }))
+            using (var response = await bobB.SendAsync(join, timeout.Token))
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            foreach (var (socket, invocation) in new[]
+            {
+                (socketAliceA, "alice-on-A"),
+                (socketAliceB, "alice-on-B"),
+                (socketBobB, "bob-on-B")
+            })
+            {
+                var completion = await RosterAsync(socket, room, invocation,
+                    timeout.Token);
+                Assert.False(completion.TryGetProperty("error", out _));
+                var roster = completion.GetProperty("result");
+                Assert.Equal(room, roster.GetProperty("lobbyId").GetString());
+                Assert.Equal(2, roster.GetProperty("revision").GetInt64());
+                var members = roster.GetProperty("participants").EnumerateArray()
+                    .Select(x => x.GetProperty("playerId").GetString()).ToArray();
+                Assert.Equal(2, members.Length);
+                Assert.Contains(alice, members);
+                Assert.Contains(bob, members);
+            }
+
+            using (var logout = Mutation(HttpMethod.Delete,
+                       aliceB, "/api/sessions/guest"))
+            using (var result = await aliceB.SendAsync(logout, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.NoContent, result.StatusCode);
+                Assert.True(result.Headers.CacheControl?.NoStore == true);
+            }
+
+            AssertOpaque(await RosterAsync(socketAliceA, room,
+                "revoked-on-A", timeout.Token), room, alice, bob);
+            AssertOpaque(await RosterAsync(socketAliceB, room,
+                "revoked-on-B", timeout.Token), room, alice, bob);
+            using (var meA = await aliceA.GetAsync("/api/sessions/me", timeout.Token))
+            using (var meB = await aliceB.GetAsync("/api/sessions/me", timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.Unauthorized, meA.StatusCode);
+                Assert.Equal(HttpStatusCode.Unauthorized, meB.StatusCode);
+            }
+            var surviving = await RosterAsync(socketBobB, room,
+                "survivor", timeout.Token);
+            Assert.False(surviving.TryGetProperty("error", out _));
+            var view = surviving.GetProperty("result");
+            Assert.Equal(3, view.GetProperty("revision").GetInt64());
+            Assert.Equal(bob, Assert.Single(view.GetProperty("participants")
+                .EnumerateArray()).GetProperty("playerId").GetString());
+            Assert.DoesNotContain(alice, surviving.GetRawText(), StringComparison.Ordinal);
+            using (var bobAliveA = await bobA.GetAsync("/api/sessions/me", timeout.Token))
+            using (var bobAliveB = await bobB.GetAsync("/api/sessions/me", timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.OK, bobAliveA.StatusCode);
+                Assert.Equal(HttpStatusCode.OK, bobAliveB.StatusCode);
+            }
+
+            foreach (var client in new[] { aliceA, aliceB })
+            {
+                using var renegotiated = await client.PostAsync(
+                    "/hubs/lobbies/negotiate?negotiateVersion=1",
+                    null, timeout.Token);
+                Assert.Equal(HttpStatusCode.Unauthorized, renegotiated.StatusCode);
+                Assert.True(renegotiated.Headers.CacheControl?.NoStore == true);
+                Assert.False(renegotiated.Headers.Contains("Set-Cookie"));
+                Assert.False(renegotiated.Headers.Contains("Location"));
+            }
+        }
+        finally
+        {
+            Directory.Delete(scratch.FullName, recursive: true);
+        }
+    }
+}
