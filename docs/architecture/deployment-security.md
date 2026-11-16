@@ -2457,3 +2457,42 @@ uno staging reale sotto #21. xUnit #152 verifica il callback
 direttamente su contesti SignalR fittizi con tracking e richiesta
 roster in-flight: non simula un bilanciatore effettivo, TCP o
 SIGUSR1 inviato dall'orchestratore.
+
+## Metriche locali di preStop e tentativi di chiusura SignalR (#153)
+
+Per validare il drain durante i rollout e analizzare un eventuale preStop
+inefficace, il meter aggregato esistente `Shirokuro.Api.Multiplayer` espone
+due nuovi counters **solo server-side** (nessun nuovo endpoint):
+
+- `shirokuro.node.drain.transitions`: un evento per processo al primo
+  passaggio monotono allo stato draining; attributo server-defined
+  `cause=prestop|host-shutdown`. Un SIGUSR1 ripetuto o il successivo
+  SIGTERM non incrementano nuovamente. Uno shutdown senza preStop
+  emette solo `host-shutdown`; i normali GET di readiness **non**
+  incrementano questo contatore.
+- `shirokuro.signalr.drain_abort_attempts`: un incremento per
+  `HubCallerContext.Abort()` **tentato dal registro connessioni**,
+  con attributo finito `reason=prestop|host-shutdown|late-connection`.
+  Il registro misura solo trasporti attivi tracciati e nuove
+  registrazioni respinte a drain avviato: non è una metrica di tutti i
+  socket TCP, né di chiusure riuscite, né di utenti distinti. Gli
+  eventuali `Abort()` invocati direttamente da SignalR fuori dal
+  registro non fanno parte del contatore.
+
+Le etichette sono codificate tramite enum chiusi: non includono
+connection ID, giocatori, inviti, lobby ID, IP, header, cookie,
+eccezioni o URL. Il meter confluisce nell'exporter OTLP metrics-only
+HTTPS già disponibile e **disabilitato per default**; non espone
+stato sensibile agli endpoint pubblici. I test #153 verificano le
+etichette con `MeterListener`, la semantica first-transition in
+`ApplicationStopping`/SIGUSR1, i contatori dei socket
+attivi/disconnessi/tardivi e l'export fittizio OTLP senza credenziali.
+
+Durante una prova staging del rollout, correlare tali serie a
+`/api/ready` (503 dal preStop), alla capacità del bilanciatore di
+rimuovere il nodo e alla riconnessione browser **sul nuovo nodo**.
+Non dedurre che il bilanciatore abbia svuotato un nodo dalla sola
+presenza di un contatore abort; un termination forzato può anche
+perdere le metriche non ancora esportate. La prova reale di SIGUSR1
+e del time budget/grace period rimane nel parent #21. Gli xUnit non
+certificano l'osservazione dell'evento OTLP da un collector reale.
