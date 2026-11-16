@@ -506,9 +506,9 @@ public sealed class RedisTlsProductionTestsKestrel
                     new SslClientAuthenticationOptions { TargetHost = "localhost" },
                     timeout.Token);
                 var request = Encoding.ASCII.GetBytes(
-                    "GET /api/ready HTTP/1.1\\r\\n" +
-                    "Host: attacker.example\\r\\n" +
-                    "Connection: close\\r\\n\\r\\n");
+                    "GET /api/ready HTTP/1.1\r\n" +
+                    "Host: attacker.example\r\n" +
+                    "Connection: close\r\n\r\n");
                 await tls.WriteAsync(request, timeout.Token);
                 using var reader = new StreamReader(
                     tls, Encoding.ASCII, detectEncodingFromByteOrderMarks: false,
