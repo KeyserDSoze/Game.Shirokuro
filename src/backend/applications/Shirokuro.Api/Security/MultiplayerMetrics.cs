@@ -16,6 +16,7 @@ public static class MultiplayerMetrics
     public const string MutationDecisionsName = "shirokuro.guest_mutation.decisions";
     public const string IngressRejectionsName = "shirokuro.ingress.rejections";
     public const string GuestCookieAuthorityName = "shirokuro.session.cookie_authority";
+    public const string RosterPostReadAuthorityName = "shirokuro.roster.post_read_authority";
     public const string ReadinessProbesName = "shirokuro.readiness.probes";
     public const string NodeDrainTransitionsName = "shirokuro.node.drain.transitions";
     public const string SignalRDrainAbortAttemptsName =
@@ -42,6 +43,9 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> GuestCookieAuthority = Meter.CreateCounter<long>(
         GuestCookieAuthorityName, unit: "{validation}",
         description: "Actual guest-cookie authority validation outcomes; not unique guests.");
+    private static readonly Counter<long> RosterPostReadAuthority = Meter.CreateCounter<long>(
+        RosterPostReadAuthorityName, unit: "{validation}",
+        description: "Completed guest authority checks after authorized roster reads, not unique guests or rooms.");
     private static readonly Counter<long> ReadinessProbes = Meter.CreateCounter<long>(
         ReadinessProbesName, unit: "{probe}",
         description: "Executed node-readiness probes, excluding cache hits.");
@@ -139,6 +143,34 @@ public static class MultiplayerMetrics
         };
         GuestCookieAuthority.Add(1,
             new KeyValuePair<string, object?>("outcome", value));
+    }
+
+    /// <summary>
+    /// Count an actually completed guest revalidation AFTER a member-scoped
+    /// roster read, not cookie middleware auth, requests, unique users or
+    /// successful deliveries. Both dimensions are closed server-side enums;
+    /// never attach room ID, invitation, identity, IP, path or exception text.
+    /// </summary>
+    public static void RecordRosterPostReadAuthority(
+        RosterPostReadSurface surface, GuestSessionAuthorityStatus outcome)
+    {
+        var surfaceName = surface switch
+        {
+            RosterPostReadSurface.HttpRefresh => "http-refresh",
+            RosterPostReadSurface.HttpPeek => "http-peek",
+            RosterPostReadSurface.SignalR => "signalr",
+            _ => throw new ArgumentOutOfRangeException(nameof(surface))
+        };
+        var outcomeName = outcome switch
+        {
+            GuestSessionAuthorityStatus.Active => "active",
+            GuestSessionAuthorityStatus.Inactive => "inactive",
+            GuestSessionAuthorityStatus.Unavailable => "unavailable",
+            _ => throw new ArgumentOutOfRangeException(nameof(outcome))
+        };
+        RosterPostReadAuthority.Add(1,
+            new KeyValuePair<string, object?>("surface", surfaceName),
+            new KeyValuePair<string, object?>("outcome", outcomeName));
     }
 
     public static void RecordReadinessProbe(bool ready) =>
@@ -318,6 +350,8 @@ public static class MultiplayerMetrics
                 new KeyValuePair<string, object?>("mode", mode));
     }
 }
+
+public enum RosterPostReadSurface { HttpRefresh, HttpPeek, SignalR }
 
 public enum MutationOutcome { Allowed, Limited, Unavailable }
 
