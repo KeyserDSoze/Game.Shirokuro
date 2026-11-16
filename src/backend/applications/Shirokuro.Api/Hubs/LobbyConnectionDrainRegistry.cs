@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.AspNetCore.SignalR;
 using Shirokuro.Api.Readiness;
+using Shirokuro.Api.Security;
 
 namespace Shirokuro.Api.Hubs;
 
@@ -27,13 +28,16 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
         // the optional Linux preStop. If SIGUSR1 ran before this registry
         // was first resolved, CancellationToken.Register invokes the
         // callback immediately. Both subscriptions are safe to repeat.
-        _stoppingRegistration =
-            lifetime.ApplicationStopping.Register(BeginDraining);
+        _stoppingRegistration = lifetime.ApplicationStopping.Register(
+            () => BeginDraining(SignalRDrainAbortReason.HostShutdown));
         if (drain is IPreStopDrainNotification notification)
-            _preStopRegistration =
-                notification.PreStopStarted.Register(BeginDraining);
+            _preStopRegistration = notification.PreStopStarted.Register(
+                () => BeginDraining(SignalRDrainAbortReason.PreStop));
         if (_drain.IsDraining)
-            BeginDraining();
+            BeginDraining(drain is IPreStopDrainNotification notified &&
+                          notified.PreStopStarted.IsCancellationRequested
+                ? SignalRDrainAbortReason.PreStop
+                : SignalRDrainAbortReason.HostShutdown);
     }
 
     public bool IsDraining =>
@@ -49,7 +53,7 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
 
         if (IsDraining)
         {
-            AbortSafely(context);
+            AbortSafely(context, SignalRDrainAbortReason.LateConnection);
             return false;
         }
 
@@ -58,7 +62,7 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
             return true;
 
         _connections.TryRemove(context.ConnectionId, out _);
-        AbortSafely(context);
+        AbortSafely(context, SignalRDrainAbortReason.LateConnection);
         return false;
     }
 
@@ -70,19 +74,24 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
         _connections.TryRemove(context.ConnectionId, out _);
     }
 
-    private void BeginDraining()
+    private void BeginDraining(SignalRDrainAbortReason reason)
     {
         // PreStop and SIGTERM can both fire, but existing sockets should
         // never be aborted twice by redundant lifecycle notifications.
         if (Interlocked.Exchange(ref _stopping, 1) != 0)
             return;
         foreach (var connection in _connections.Values)
-            AbortSafely(connection);
+            AbortSafely(connection, reason);
         _connections.Clear();
     }
 
-    private static void AbortSafely(HubCallerContext context)
+    private static void AbortSafely(HubCallerContext context,
+        SignalRDrainAbortReason reason)
     {
+        // This counts ATTEMPTED local aborts (including throws), not network
+        // closure, distinct players or room exits. It has only a finite
+        // server-owned reason label; never record the ConnectionId.
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(reason);
         try
         {
             context.Abort();
