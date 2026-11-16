@@ -2927,3 +2927,47 @@ routing sticky/non-sticky o rediscovery K8s. Questi restano nella
 parent #21, che non può essere chiusa in base a tale test.
 I/O con timeout esplicito; nessun ID, cookie, corpo privato o
 connection string finisce nei nomi dei test o in telemetria.
+
+## Verifica CI con due processi OS Kestrel e HTTPS/WSS effettivi — #166
+
+La issue #165 ha verificato SignalR JSON con due host Production
+`TestServer`, ma il WebSocket era un trasporto in-memory nel **medesimo**
+processo del test. La #166 aggiunge
+`RedisTlsProductionTestsKestrel` al job CI Redis TLS già esistente:
+due processi Linux indipendenti `dotnet Shirokuro.Api.dll` usando
+configurazione **Production non sostituita**, collegati allo stesso
+Redis TLS (sessioni, lobby Lua/CAS, revocation fencing ed expiry
+condivisi) e allo stesso volume di chiavi Data Protection e certificato
+PFX. Il secondo processo parte **dopo** che il primo ha emesso un guest
+e inizializzato il keyring persistente.
+
+Kestrel serve `https://localhost:<porta-effimera>` su loopback in
+ciascun processo, con il certificato server temporaneo firmato dalla
+CA generata per Redis TLS nel job CI (SAN `localhost`). Il PFX è
+assemblato nel test in una directory temporanea protetta e cancellato
+dopo il run. I client `HttpClient` e `ClientWebSocket` usano le normali
+verifiche di trust e hostname del runner: **nessun**
+`DangerousAcceptAnyServerCertificateValidator` o callback TLS
+di approvazione, niente X-Forwarded-Proto/Host simulati. L'allowlist
+Production di `AllowedHosts` e `Security:AllowedOrigins` segue
+esattamente l'autorità e la porta di ciascun listener; l'host non
+ascolta su interfacce pubbliche.
+
+La prova esercita `/api/ready` su entrambi i processi, cookie emesso
+da A e verificato da B, create di A, impossibilità del non-membro Bob
+di leggere via WSS su B, join HTTP su B, roster member-only sui
+tre socket WSS (Alice su A e su B, Bob su B), logout HTTP di Alice
+su B e rifiuto dei vecchi socket di Alice su entrambi i processi.
+Bob mantiene sessione e proprio roster dopo il cleanup; negotiate
+con cookie revocato è 401/no-store su A e B. Le operazioni sono
+delimitate da timeout e il teardown termina e raccoglie i figli
+OS anche in caso di asserzione fallita; gli output delle child API
+vengono drenati senza essere stampati, così nessuna sessione, stanza,
+URL, password o stack trace con configurazioni finisce nei log CI.
+
+**Limite operativo**: questo è traffico TCP/TLS reale verso Kestrel
+ma sempre su loopback di un singolo runner. Non verifica routing di un
+load balancer, header forward di un proxy di ingress, sticky sessions,
+ingress WSS/HTTPS esterno, certificati/rinnovi di dominio reali,
+network partition o pod Kubernetes. La parent #21 rimane aperta
+per uno staging end-to-end con edge e processi/pod su nodi reali.
