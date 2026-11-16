@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using Shirokuro.Api.Security;
 
 namespace Shirokuro.Api.Readiness;
 
@@ -59,8 +60,10 @@ public sealed class HostLifetimeReadinessDrainSignal :
     private const int LinuxSigusr1 = 10;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly PosixSignalRegistration? _registration;
+    private readonly CancellationTokenRegistration _hostStopRegistration;
     private readonly CancellationTokenSource _preStopStarted = new();
     private int _preStopDraining;
+    private int _firstDrainRecorded;
 
     public HostLifetimeReadinessDrainSignal(
         IHostApplicationLifetime lifetime,
@@ -73,25 +76,31 @@ public sealed class HostLifetimeReadinessDrainSignal :
             throw new InvalidOperationException(
                 "Security:PreStopDrain:EnableSigusr1 must be 'true' or 'false'.");
 
-        if (raw != "true")
-            return;
+        if (raw == "true")
+        {
+            if (environment?.IsDevelopment() == true)
+                throw new InvalidOperationException(
+                    "PreStop SIGUSR1 must not be enabled in Development.");
+            if (!OperatingSystem.IsLinux())
+                throw new PlatformNotSupportedException(
+                    "PreStop SIGUSR1 is supported only on Linux.");
 
-        if (environment?.IsDevelopment() == true)
-            throw new InvalidOperationException(
-                "PreStop SIGUSR1 must not be enabled in Development.");
-        if (!OperatingSystem.IsLinux())
-            throw new PlatformNotSupportedException(
-                "PreStop SIGUSR1 is supported only on Linux.");
+            // SIGUSR1 prepares a node for LB removal; never intercept
+            // SIGTERM. This callback is not driven by HTTP requests.
+            _registration = PosixSignalRegistration.Create(
+                (PosixSignal)LinuxSigusr1, context =>
+                {
+                    context.Cancel = true;
+                    BeginPreStopDrain();
+                });
+        }
 
-        // Cancel the OS's default SIGUSR1 termination; this is a *prepare*
-        // signal, not SIGTERM. Signal registration is eagerly resolved before
-        // Kestrel starts, and disposed with the DI host.
-        _registration = PosixSignalRegistration.Create(
-            (PosixSignal)LinuxSigusr1, context =>
-            {
-                context.Cancel = true;
-                BeginPreStopDrain();
-            });
+        // Observe the default shutdown path too, even when preStop is
+        // disabled. A token already cancelled at construction invokes
+        // the callback immediately. Each node records only its FIRST
+        // transition; later SIGTERM after SIGUSR1 cannot double-count.
+        _hostStopRegistration =
+            lifetime.ApplicationStopping.Register(RecordHostShutdown);
     }
 
     public bool IsDraining =>
@@ -112,15 +121,31 @@ public sealed class HostLifetimeReadinessDrainSignal :
     {
         // Publish the drain flag FIRST, so late connections fail even when
         // a subscriber's synchronous callback is still closing old sockets.
-        // Cancel once: repeated SIGUSR1 events and later SIGTERM cannot
-        // schedule duplicate aborts from this preStop notification.
-        if (Interlocked.Exchange(ref _preStopDraining, 1) == 0)
-            _preStopStarted.Cancel();
+        // A host already stopping wins the first-transition telemetry race.
+        if (_lifetime.ApplicationStopping.IsCancellationRequested)
+            RecordHostShutdown();
+
+        if (Interlocked.Exchange(ref _preStopDraining, 1) != 0)
+            return;
+
+        if (Interlocked.CompareExchange(ref _firstDrainRecorded, 1, 0) == 0)
+            MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.PreStop);
+
+        // Cancel once: later SIGUSR1/SIGTERM cannot trigger duplicate
+        // socket cleanup notifications.
+        _preStopStarted.Cancel();
+    }
+
+    private void RecordHostShutdown()
+    {
+        if (Interlocked.CompareExchange(ref _firstDrainRecorded, 1, 0) == 0)
+            MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.HostShutdown);
     }
 
     public void Dispose()
     {
         _registration?.Dispose();
+        _hostStopRegistration.Dispose();
         _preStopStarted.Dispose();
     }
 }
