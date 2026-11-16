@@ -892,16 +892,14 @@ public sealed class RedisTlsProductionTestsKestrel
                 room, "affinity-alice-revoked", timeout.Token), room, alice, bob);
             AssertOpaque(await RosterAsync(aliceExtraSocket,
                 room, "affinity-extra-revoked", timeout.Token), room, alice, bob);
-            foreach (var client in new[] { aliceEdge, Http(portA, aliceCookie),
-                         Http(portB, aliceCookie) })
+            using var aliceDirectA = Http(portA, aliceCookie);
+            using var aliceDirectB = Http(portB, aliceCookie);
+            foreach (var client in new[] { aliceEdge, aliceDirectA, aliceDirectB })
             {
-                using (client == aliceEdge ? null : client)
-                using (var session = await client.GetAsync(
-                    "/api/sessions/me", timeout.Token))
-                {
-                    Assert.Equal(HttpStatusCode.Unauthorized, session.StatusCode);
-                    Assert.True(session.Headers.CacheControl?.NoStore == true);
-                }
+                using var session = await client.GetAsync(
+                    "/api/sessions/me", timeout.Token);
+                Assert.Equal(HttpStatusCode.Unauthorized, session.StatusCode);
+                Assert.True(session.Headers.CacheControl?.NoStore == true);
             }
             using (var rejected = Mutation(HttpMethod.Post, aliceEdge,
                        "/hubs/lobbies/negotiate?negotiateVersion=1"))
