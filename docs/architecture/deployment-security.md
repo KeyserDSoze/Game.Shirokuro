@@ -2420,3 +2420,40 @@ xUnit #151 **simulano la transizione** del callback POSIX con l'identico
 metodo in-processo, e installano in Linux la registrazione reale senza
 inviare SIGUSR1 all'intero processo di test. Una prova operativa di
 preStop+LB resta necessaria in staging.
+
+## PreStop: chiusura dei socket SignalR già connessi (#152)
+
+La fase Linux `SIGUSR1` di #151 passa immediatamente il nodo a
+`IsDraining`. Fino a #152 questo rendeva indisponibili nuove
+negoziazioni e invocazioni `GetRoster`, ma i trasporti SignalR
+**già connessi** restavano aperti fino al successivo `SIGTERM`.
+Il `HostLifetimeReadinessDrainSignal` ora pubblica un
+`IPreStopDrainNotification.PreStopStarted` **one-shot**, un
+`CancellationToken` locale interno al processo, attivato dopo aver
+marcato il drain: **non** è un endpoint amministrativo HTTP e nessun
+client può impostarlo.
+
+`LobbyConnectionDrainRegistry` registra un callback su quel token,
+**oltre** all'originale `ApplicationStopping`. Quando SIGUSR1
+avvia preStop, abortisce best-effort i soli contesti Hub **attivi**
+tracciati, non quelli già disconnessi; blocca e abortisce le nuove
+registrazioni e non abortisce due volte per il successivo SIGTERM.
+Se il preStop precede la creazione lazy del registro, la registrazione
+su un token già cancellato chiama subito il callback. Le letture
+`GetRoster` attive hanno comunque il proprio controllo dopo l'await
+Redis: nemmeno il risultato arrivato a cavallo del drain può
+pubblicare roster privati. Non viene scritto alcun `playerId`,
+cookie, token o identificativo lobby nei callback.
+
+Il preStop **non** invia ai client un messaggio che promette di
+riprenderli altrove e non trasferisce automaticamente le connessioni
+su un altro nodo. I browser devono gestire una normale disconnessione
+e, se opportuno, ristabilire una connessione autenticata al bilanciatore
+dopo la propagazione del routing/readiness. Il token non implica un
+commit/rollback delle mutazioni Redis già avviate, né garantisce che
+ogni connessione TCP esterna del bilanciatore sia stata chiusa. La
+durata del preStop e la terminazione forzata restano da validare in
+uno staging reale sotto #21. xUnit #152 verifica il callback
+direttamente su contesti SignalR fittizi con tracking e richiesta
+roster in-flight: non simula un bilanciatore effettivo, TCP o
+SIGUSR1 inviato dall'orchestratore.
