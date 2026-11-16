@@ -834,6 +834,7 @@ public sealed class LobbyRosterTransportTests
     [Fact]
     public async Task ExistingSignalRConnectionCannotReadAfterGuestLogoutRevocation()
     {
+        using var capture = new MultiplayerMetricCapture();
         var playerId = "guest-" + new string('a', 32);
         var clock = TimeProvider.System;
         var registry = new GuestSessionRegistry(clock);
@@ -851,6 +852,9 @@ public sealed class LobbyRosterTransportTests
             Context = new FakeHubContext(principal)
         };
         Assert.Equal(RoomSecret, (await hub.GetRoster(RoomSecret)).LobbyId);
+        Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
+            m => m.Tags["surface"] == "signalr" &&
+                 m.Tags["outcome"] == "active");
         Assert.True(registry.Revoke(principal));
         Assert.Equal("Lobby unavailable.",
             (await Assert.ThrowsAsync<HubException>(() => hub.GetRoster(RoomSecret))).Message);
