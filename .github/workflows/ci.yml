@@ -38,6 +38,82 @@ jobs:
         env:
           SHIROKURO_TEST_REDIS: localhost:6379
 
+      # The normal xUnit TestServer suites simulate preStop via a trusted
+      # method. This extra Linux-only OS-process smoke sends REAL SIGUSR1 to
+      # a disposable child PID and verifies the Production POSIX handler,
+      # live SignalR socket abort, process survival and later SIGTERM. It
+      # never sends signals to the runner, Redis, API, or xUnit process.
+      - name: Verify real Linux SIGUSR1 preStop and SIGTERM in isolated child
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="tests/backend/Shirokuro.PreStopSignalSmoke/Shirokuro.PreStopSignalSmoke.csproj"
+          dotnet restore "$project"
+          dotnet build "$project" -c Release --no-restore
+          dll="tests/backend/Shirokuro.PreStopSignalSmoke/bin/Release/net10.0/Shirokuro.PreStopSignalSmoke.dll"
+          temp="$(mktemp -d /tmp/shirokuro-ci-signal-XXXXXX)"
+          pid=""
+          cleanup() {
+            if [[ -n "$pid" ]]; then
+              if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null || true
+                for i in $(seq 1 30); do
+                  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+                  sleep 0.1
+                done
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+              wait "$pid" 2>/dev/null || true
+            fi
+            rm -rf -- "$temp"
+          }
+          trap cleanup EXIT
+
+          DOTNET_ENVIRONMENT=Production dotnet "$dll" > "$temp/child.log" 2>&1 &
+          pid=$!
+          marker_or_fail() {
+            local marker="$1"
+            for i in $(seq 1 120); do
+              if grep -qxF "$marker" "$temp/child.log"; then return 0; fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                cat "$temp/child.log"
+                echo "Isolated preStop child terminated before $marker."
+                return 1
+              fi
+              sleep 0.1
+            done
+            cat "$temp/child.log"
+            echo "Isolated preStop child did not reach $marker."
+            return 1
+          }
+          marker_or_fail SHIROKURO_SIGNAL_ARMED
+          kill -USR1 "$pid"
+          marker_or_fail SHIROKURO_SIGNAL_DRAINED
+          # PreStop must NOT terminate the process or accidentally send
+          # SIGTERM before the orchestrator's grace interval.
+          kill -0 "$pid"
+          kill -USR1 "$pid"
+          sleep 0.2
+          kill -0 "$pid"
+          kill -TERM "$pid"
+          exited=0
+          for i in $(seq 1 120); do
+            if ! kill -0 "$pid" 2>/dev/null; then exited=1; break; fi
+            sleep 0.1
+          done
+          if [[ "$exited" -ne 1 ]]; then
+            cat "$temp/child.log"
+            echo "Isolated preStop child did not exit after SIGTERM."
+            exit 1
+          fi
+          # A normal successful shutdown should exit zero and print a
+          # marker only after checking that active sockets were not
+          # aborted twice by the duplicate preStop + SIGTERM.
+          wait "$pid" || { cat "$temp/child.log"; exit 1; }
+          pid=""
+          grep -qxF SHIROKURO_SIGNAL_STOPPED "$temp/child.log"
+          echo "Linux SIGUSR1 -> drain/socket abort -> SIGTERM: verified."
+
       # This separate TLS-only fixture exercises the *actual* Production
       # StackExchangeRedisCache and lobby multiplexer, not test DI fakes.
       # CA, cert and keys are freshly generated on each CI runner, never
