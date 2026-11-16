@@ -612,6 +612,119 @@ public sealed class SignalRWebSocketDrainTests
         Assert.Equal(HttpStatusCode.OK, valid.StatusCode);
     }
 
+    [Fact]
+    public async Task NegotiatedConnectionTokenCannotUpgradeAfterGuestHttpLogout()
+    {
+        using var server = Server();
+        const string otherGuestId = "guest-dddddddddddddddddddddddddddddddd";
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        coordinator.Create(Room, ["white", "black"]);
+        coordinator.Join(Room, GuestId, "white", 0);
+        coordinator.Join(Room, otherGuestId, "black", 1);
+
+        var alice = TicketFor(server);
+        var bob = TicketFor(server, otherGuestId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+
+        // Negotiate is not a grant: the opaque connection token is bound to
+        // the transport on one node, while the guest cookie and server-side
+        // registry remain authoritative at the subsequent upgrade.
+        static async Task<string> NegotiateAsync(
+            HttpClient client, string cookie, CancellationToken cancellationToken)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post,
+                "/hubs/lobbies/negotiate?negotiateVersion=1");
+            request.Headers.TryAddWithoutValidation("Cookie", cookie);
+            using var response = await client.SendAsync(request, cancellationToken);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            using var json = JsonDocument.Parse(
+                await response.Content.ReadAsStringAsync(cancellationToken));
+            var token = json.RootElement.GetProperty("connectionToken").GetString();
+            Assert.False(string.IsNullOrEmpty(token));
+            return token!;
+        }
+
+        var negotiatedAlice = await NegotiateAsync(http, alice.Cookie, timeout.Token);
+
+        // Real HTTP logout occurs BETWEEN the successful negotiate response
+        // and WebSocket upgrade. It also cleans Alice's lobby membership.
+        using var logout = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/sessions/guest");
+        logout.Headers.TryAddWithoutValidation("Cookie", alice.Cookie);
+        logout.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        logout.Headers.TryAddWithoutValidation(WebMutationGuard.RequestHeaderName,
+            WebMutationGuard.RequestHeaderValue);
+        using var loggedOut = await http.SendAsync(logout, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, loggedOut.StatusCode);
+        Assert.True(loggedOut.Headers.CacheControl?.NoStore == true);
+
+        using var sessionRequest = new HttpRequestMessage(
+            HttpMethod.Get, "/api/sessions/me");
+        sessionRequest.Headers.TryAddWithoutValidation("Cookie", alice.Cookie);
+        using var revokedSession = await http.SendAsync(sessionRequest, timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, revokedSession.StatusCode);
+        Assert.Equal("no-store", revokedSession.Headers.CacheControl?.ToString());
+        Assert.False(revokedSession.Headers.Contains("Set-Cookie"));
+
+        // Deliberately attempt the previously negotiated token with the OLD
+        // signed cookie. If transport admission succeeds, this test fails
+        // even if a later Hub invocation would have rejected the roster.
+        // Never print tokens or cookie values in assertions or diagnostics.
+        WebSocket? unexpectedSocket = null;
+        var rejected = false;
+        try
+        {
+            unexpectedSocket = await SocketClient(server, alice.Cookie).ConnectAsync(
+                new Uri("ws://localhost/hubs/lobbies?id=" +
+                    Uri.EscapeDataString(negotiatedAlice)), timeout.Token);
+        }
+        catch (WebSocketException)
+        {
+            rejected = true;
+        }
+        catch (InvalidOperationException)
+        {
+            rejected = true;
+        }
+        catch (HttpRequestException)
+        {
+            rejected = true;
+        }
+        finally
+        {
+            unexpectedSocket?.Dispose();
+        }
+        Assert.True(rejected, "Revoked guest must not upgrade a negotiated socket.");
+        Assert.Null(unexpectedSocket);
+
+        // Positive control: the same TestServer's /negotiate + WebSocket id
+        // flow genuinely works for a different still-authorized guest.
+        var negotiatedBob = await NegotiateAsync(http, bob.Cookie, timeout.Token);
+        using var survivingSocket = await SocketClient(server, bob.Cookie).ConnectAsync(
+            new Uri("ws://localhost/hubs/lobbies?id=" +
+                Uri.EscapeDataString(negotiatedBob)), timeout.Token);
+        await SendJsonAsync(survivingSocket,
+            "{\"protocol\":\"json\",\"version\":1}", timeout.Token);
+        var handshake = await ReadSignalRMessageAsync(survivingSocket,
+            message => message.ValueKind == JsonValueKind.Object &&
+                       !message.TryGetProperty("type", out _), timeout.Token);
+        Assert.Equal("{}", handshake.GetRawText());
+        var completion = await InvokeRosterAsync(survivingSocket, Room,
+            "survivor-after-negotiation", timeout.Token);
+        Assert.False(completion.TryGetProperty("error", out _));
+        var roster = completion.GetProperty("result");
+        Assert.Equal(Room, roster.GetProperty("lobbyId").GetString());
+        Assert.Equal(3, roster.GetProperty("revision").GetInt64());
+        var member = Assert.Single(roster.GetProperty("participants").EnumerateArray());
+        Assert.Equal(otherGuestId, member.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(GuestId, completion.GetRawText());
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
