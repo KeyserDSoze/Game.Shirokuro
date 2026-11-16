@@ -21,10 +21,18 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
     // SignalR invokes these lifecycle callbacks, not as callable Hub methods.
     public override async Task OnConnectedAsync()
     {
-        if (drain?.IsDraining == true || connections?.IsDraining == true ||
-            (connections is not null && !connections.TryTrack(Context)))
+        if (drain?.IsDraining == true || connections?.IsDraining == true)
         {
+            // The admission fence can reject this socket before it is
+            // passed to the registry. No registry abort has occurred yet.
             Context.Abort();
+            return;
+        }
+        if (connections is not null && !connections.TryTrack(Context))
+        {
+            // TryTrack always attempts Abort() when it rejects a connection.
+            // A late preStop racing with the post-insert check must not
+            // trigger a second Abort from the Hub lifecycle callback.
             return;
         }
         await base.OnConnectedAsync();
