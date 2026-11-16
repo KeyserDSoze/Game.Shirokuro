@@ -178,6 +178,47 @@ public sealed class MultiplayerMetricsTests
     }
 
     [Fact]
+    public void RosterPostReadAuthorityCounterUsesOnlyFixedSurfaceAndOutcomeLabels()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        foreach (var surface in Enum.GetValues<RosterPostReadSurface>())
+        foreach (var outcome in Enum.GetValues<GuestSessionAuthorityStatus>())
+            MultiplayerMetrics.RecordRosterPostReadAuthority(surface, outcome);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordRosterPostReadAuthority(
+                (RosterPostReadSurface)999, GuestSessionAuthorityStatus.Active));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordRosterPostReadAuthority(
+                RosterPostReadSurface.HttpPeek, (GuestSessionAuthorityStatus)999));
+
+        var observations = capture.For(MultiplayerMetrics.RosterPostReadAuthorityName);
+        var expectedSurfaces = new[] { "http-refresh", "http-peek", "signalr" };
+        var expectedOutcomes = new[] { "active", "inactive", "unavailable" };
+        foreach (var surface in expectedSurfaces)
+        foreach (var outcome in expectedOutcomes)
+            Assert.Contains(observations, m =>
+                m.Value == 1 && m.Tags.Count == 2 &&
+                m.Tags["surface"] == surface && m.Tags["outcome"] == outcome);
+        Assert.All(observations, m =>
+        {
+            Assert.Equal(1, m.Value);
+            Assert.Equal(new[] { "outcome", "surface" },
+                m.Tags.Keys.OrderBy(key => key, StringComparer.Ordinal));
+            Assert.Contains(m.Tags["surface"], expectedSurfaces);
+            Assert.Contains(m.Tags["outcome"], expectedOutcomes);
+            foreach (var label in m.Tags.Values)
+            {
+                Assert.DoesNotContain("guest-", label, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("room-", label, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("cookie", label, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("127.0.0.1", label, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("private", label, StringComparison.OrdinalIgnoreCase);
+            }
+        });
+    }
+
+    [Fact]
     public void MetricContractUsesOnlyClosedFiniteLabelsAndRejectsUnknownEnums()
     {
         using var capture = new MultiplayerMetricCapture();
