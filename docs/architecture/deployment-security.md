@@ -2645,3 +2645,27 @@ readiness, né rollback di CAS Redis già avviati. La prova di
 rollout, grace period e failover in staging reale rimane aperta
 nella #21. Le identità di test sono fittizie e nessuna stanza o
 cookie è esposto come etichetta di telemetria.
+
+## Test della privacy WebSocket pre-match e revoca dopo handshake — #158
+
+Le prove TestServer della #157 vengono estese in #158 con vere
+invocazioni SignalR JSON **su socket autenticato**, oltre al solo handshake
+o alla chiusura in preStop. Un guest membro della stanza A riceve lo
+**stesso errore generico** richiedendo la stanza B (con un membro diverso)
+o una stanza inesistente: nessuna completion deve includere un roster,
+un ID stanza/membro privato o informazioni riservate. Dopo due rifiuti,
+il socket deve ancora restituire il roster della sola stanza A.
+
+Un secondo caso registra un guest Development, legge il proprio roster,
+**revoca il suo ticket nel registry** mentre il WebSocket resta aperto
+e verifica che il successivo `GetRoster` sia respinto senza dati.
+Anche `GET /api/sessions/me` col medesimo cookie deve risultare 401/no-store
+senza nuovo `Set-Cookie`. La verifica di appartenenza e di sessione è
+lato server **a ogni invocazione**: il solo handshake non autorizza
+letture future.
+
+I test usano vere cookie firmate e framing WebSocket/SignalR su TestServer,
+ma non dimostrano Redis distribuito in failover, reale rete TCP/TLS,
+load balancer/proxy, reconnect del browser o matrice futura delle
+osservazioni PvP (bloccata dalla #3/#9). Gli aspetti operativi sono
+ancora tracciati nella parent #21.
