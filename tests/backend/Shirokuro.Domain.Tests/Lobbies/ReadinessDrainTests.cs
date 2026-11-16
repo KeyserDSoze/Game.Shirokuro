@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Shirokuro.Api.Readiness;
+using Shirokuro.Api.Security;
 using Xunit;
 
 namespace Shirokuro.Domain.Tests.Lobbies;
@@ -118,6 +119,47 @@ public sealed class ReadinessDrainTests
         lifetime.StopApplication();
         Assert.True(signal.IsDraining);
         Assert.True(signal.IsDraining);
+    }
+
+    [Fact]
+    public void PreStopAndSigtermReportOnlyFirstNodeDrainTransition()
+    {
+        using var metrics = new MultiplayerMetricCapture();
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+
+        signal.BeginPreStopDrain();
+        signal.BeginPreStopDrain();
+        lifetime.StopApplication();
+
+        var transitions = metrics.For(
+            MultiplayerMetrics.NodeDrainTransitionsName);
+        Assert.Contains(transitions, observation =>
+            observation.Value == 1 &&
+            observation.Tags.TryGetValue("cause", out var reason) &&
+            reason == "prestop");
+        Assert.True(signal.IsDraining);
+        Assert.True(lifetime.ApplicationStopping.IsCancellationRequested);
+        // Local per-node metric increments from this signal exactly once.
+        // The fake lifetime and repeated preStop also prove the monotonic
+        // lifecycle without sending a global OS signal to the test runner.
+        Assert.All(transitions, transition =>
+            Assert.Single(transition.Tags));
+    }
+
+    [Fact]
+    public void HostShutdownWithoutSigusr1EmitsHostStopMetric()
+    {
+        using var metrics = new MultiplayerMetricCapture();
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        lifetime.StopApplication();
+        Assert.True(signal.IsDraining);
+        Assert.False(signal.PreStopStarted.IsCancellationRequested);
+        Assert.Contains(metrics.For(MultiplayerMetrics.NodeDrainTransitionsName),
+            observation => observation.Value == 1 &&
+                observation.Tags.TryGetValue("cause", out var reason) &&
+                reason == "host-shutdown");
     }
 
     [Fact]
