@@ -2771,3 +2771,40 @@ ulteriori integrazioni eseguono un vero logout HTTP parallelo a
 una lettura trattenuta e verificano che l'altro guest mantenga
 il roster ristretto al proprio membership. TestServer non simula
 un vero bilanciatore o traffico cross-pod.
+
+## Telemetria anonimizzata della seconda verifica guest roster — #162
+
+Le verifiche di autorità guest delle issue #160 (SignalR) e #161 (HTTP)
+eseguono un controllo successivo al risultato member-scoped del backend.
+Il meter già esistente `Shirokuro.Api.Multiplayer` include ora
+`shirokuro.roster.post_read_authority`, un Counter<long> incrementato
+**una sola volta per ogni verifica post-read effettivamente conclusa**.
+Ha esattamente due attributi di enum server-side, con domini chiusi:
+`surface = http-refresh | http-peek | signalr` e
+`outcome = active | inactive | unavailable` (9 combinazioni).
+
+Non ci sono attributi da request: mai cookie, token, player ID, room ID,
+invito, IP, percorso, Host, URL, messaggio di errore o dettagli Redis.
+Gli ingress negati prima di leggere il roster, le probe anonime, gli
+errori di membership e la cancellazione prima della seconda verifica
+non contano come revalidazioni post-read. Il contatore è per chiamate,
+**non** per guest unici e **non** dimostra che una risposta sia stata
+serializzata o consegnata al client.
+
+Per distinguere i due casi di fallimento dell'ultima verifica,
+`LobbyRosterHub.GetRoster` usa `GuestSessionRegistry.CheckAuthorityAsync`
+e alimenta l'outcome; continua a rispondere con identico
+`HubException("Lobby unavailable.")` sia per revoca che per Redis
+non disponibile, senza rivelare lo stato della sessione al peer.
+Il trasporto HTTP conserva 401 per ticket certamente revocato e 503
+per un'autorità indisponibile. Nessuna verifica Redis in più viene
+introdotta rispetto alle due letture sessione per roster guest
+preesistenti (#160/#161).
+
+L'operatore può esportare solo questo meter con il meccanismo OTLP
+HTTPS **opt-in** già documentato (mai un endpoint metrics HTTP
+pubblico). Monitorare la frequenza relativa di `inactive` e
+`unavailable` per i tre trasporti; senza un deployment/staging reale
+non fissare soglie di alert o SLO non misurati. L'ultimo controllo
+e l'invio dei byte non sono una transazione distribuita: questa
+metrica non certifica l'atomicità della revoca (resta #21).
