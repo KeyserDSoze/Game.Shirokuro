@@ -33,6 +33,9 @@ public sealed class GuestSessionCacheTimeoutTests
         public bool IgnoreSet { get; set; }
         public bool BlockSet { get; set; }
         public bool BlockRemove { get; set; }
+        public bool IgnoreRemove { get; set; }
+        public bool CorruptGetAfterRemove { get; set; }
+        public bool BlockGetAfterRemove { get; set; }
 
         public TaskCompletionSource<byte[]?> PendingGet { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -51,8 +54,10 @@ public sealed class GuestSessionCacheTimeoutTests
             if (FailGet)
                 return Task.FromException<byte[]?>(
                     new IOException("sensitive private Redis connection detail"));
-            return BlockGet ? PendingGet.Task :
-                Task.FromResult(CorruptGet ? new byte[] { 0xff } : Get(key));
+            var afterRemove = Volatile.Read(ref _removes) > 0;
+            return BlockGet || (BlockGetAfterRemove && afterRemove) ? PendingGet.Task :
+                Task.FromResult(CorruptGet || (CorruptGetAfterRemove && afterRemove)
+                    ? new byte[] { 0xff } : Get(key));
         }
 
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
@@ -75,7 +80,7 @@ public sealed class GuestSessionCacheTimeoutTests
         {
             Interlocked.Increment(ref _removes);
             if (BlockRemove) return PendingRemove.Task;
-            Remove(key);
+            if (!IgnoreRemove) Remove(key);
             return Task.CompletedTask;
         }
     }
@@ -383,6 +388,66 @@ public sealed class GuestSessionCacheTimeoutTests
             Assert.Equal(HttpStatusCode.NoContent, succeeded.StatusCode);
         using var revoked = await member.GetAsync("/api/sessions/me");
         Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+    }
+
+
+    [Theory]
+    [InlineData("ignored-delete")]
+    [InlineData("corrupt-readback")]
+    [InlineData("stalled-readback")]
+    public async Task ProductionLogoutRequiresConfirmedSharedTicketDeletion(
+        string fault)
+    {
+        var cache = new StalledCache();
+        using var serverA = Production(cache);
+        using var serverB = Production(cache);
+        using var visitor = Client(serverA);
+        var cookie = await Issue(visitor);
+        using var a = Client(serverA, cookie);
+        using var b = Client(serverB, cookie);
+        using (var first = await b.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+
+        cache.IgnoreRemove = fault == "ignored-delete";
+        cache.CorruptGetAfterRemove = fault == "corrupt-readback";
+        cache.BlockGetAfterRemove = fault == "stalled-readback";
+
+        using (var logout = Mutate(HttpMethod.Delete, "/api/sessions/guest"))
+        using (var denied = await a.SendAsync(logout).WaitAsync(TestDeadline))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+            Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+            Assert.False(denied.Headers.Contains("Set-Cookie"));
+            var body = await denied.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("Redis", body, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("guest-", body, StringComparison.OrdinalIgnoreCase);
+        }
+        Assert.Equal(1, cache.RemoveCalls);
+        Assert.Equal(1, serverA.Services.GetRequiredService<GuestSessionRegistry>()
+            .StoredSessionCount);
+        if (fault == "stalled-readback")
+            Assert.False(cache.PendingGet.Task.IsCompleted);
+
+        cache.CorruptGetAfterRemove = false;
+        cache.BlockGetAfterRemove = false;
+        if (fault == "ignored-delete")
+        {
+            // A copied signed cookie is STILL valid on node B: 204 here
+            // would have been a false security guarantee to the user.
+            using (var replay = await b.GetAsync("/api/sessions/me"))
+                Assert.Equal(HttpStatusCode.OK, replay.StatusCode);
+            cache.IgnoreRemove = false;
+            using (var retry = Mutate(HttpMethod.Delete, "/api/sessions/guest"))
+            using (var confirmed = await a.SendAsync(retry))
+                Assert.Equal(HttpStatusCode.NoContent, confirmed.StatusCode);
+        }
+
+        // For a corrupt/stalled read-back the delete may actually have
+        // succeeded; retry is not required and no resurrected ticket exists.
+        using (var revokedOnB = await b.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, revokedOnB.StatusCode);
+        using (var revokedOnA = await a.GetAsync("/api/sessions/me"))
+            Assert.Equal(HttpStatusCode.Unauthorized, revokedOnA.StatusCode);
     }
 
     [Fact]

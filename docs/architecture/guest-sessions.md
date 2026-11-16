@@ -160,3 +160,28 @@ mandatory registration confirmation from subsequent auth reads. The
 full runner verifies actual Redis TLS/ACL/HA/Sentinel and Linux lifecycle,
 but it is not a staging ingress across physical pods or LB failover; #21
 remains open for those operational prerequisites.
+
+
+## Confirmed shared guest ticket deletion — #175
+
+In non-Development, a completed `IDistributedCache.RemoveAsync` is not
+proof of revocation. A silently ignored delete could leave a copied signed
+cookie valid on another node while the logout returns HTTP 204. The guest
+registry now uses a single bounded two-second deadline for reading the
+existing ticket, deleting its SHA-256-token-keyed record, and **reading the
+same key back**. Only a missing record confirms revocation; the key is never
+reused. If delete is ignored, the confirmation returns unexpected bytes, or
+Redis cannot complete the confirmation, the HTTP mutation reports a generic
+503/no-store with no new Set-Cookie and no false promise of logout. A ticket
+that was actually deleted may already return 401 while the client received
+503 because its confirmation failed; clients must not infer authority from
+this transient error. A subsequent retry can confirm deletion if the key
+still exists. No raw token, key, player identity or Redis exception is sent
+in responses.
+
+This preserves Development's in-memory behavior, verified-session cookie
+authority, post-revocation lobby fence and cleanup, and all gameplay rules.
+Tests exercise two Production TestServers sharing a cache which ignores
+remove, corrupts the verification read or blocks it, including cross-node
+cookie replay and recovery after an unconfirmed delete. Parent #21 remains
+open for staging/multi-pod and operational failover validation.

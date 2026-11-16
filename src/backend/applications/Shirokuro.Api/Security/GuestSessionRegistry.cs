@@ -197,19 +197,29 @@ public sealed class GuestSessionRegistry(TimeProvider clock, IDistributedCache? 
             return false;
 
         var key = SharedKey(token);
-        var value = await AwaitCacheAsync(
-            sharedCache.GetAsync(key, cancellationToken), cancellationToken);
+        // All three commands share one bounded deadline. A cache adapter
+        // may acknowledge RemoveAsync without actually deleting its key;
+        // such a logout must never claim to have revoked a copied cookie.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var value = await sharedCache.GetAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
         if (!Matches(value, playerId, clock.GetUtcNow()))
             return false;
 
-        // Tokens are never reused: removing their unique key invalidates any
-        // later validation in every node. Concurrent already-in-flight checks
-        // may finish before this deletion, as with local revocation.
-        // A timeout cannot confirm revocation. If Redis has already deleted
-        // the key, a subsequent request will fail auth; never report success
-        // based on a timed-out RemoveAsync.
-        await AwaitCacheAsync(sharedCache.RemoveAsync(key, cancellationToken),
-            cancellationToken);
+        // Tokens and their hashed Redis keys are never reused. Confirm the
+        // key is ABSENT after delete before acknowledging global revocation.
+        // A failed/ambiguous read-back leaves the local tracking intact and
+        // the HTTP handler responds 503 without signing out the browser.
+        await sharedCache.RemoveAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
+        var remaining = await sharedCache.GetAsync(key, timeout.Token)
+            .WaitAsync(timeout.Token);
+        if (remaining is not null)
+            throw new InvalidOperationException(
+                "Guest session storage did not confirm revocation.");
+        timeout.Token.ThrowIfCancellationRequested();
         lock (_gate)
             _active.Remove(token);
         return true;
