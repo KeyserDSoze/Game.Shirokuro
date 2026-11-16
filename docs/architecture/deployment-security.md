@@ -3277,3 +3277,34 @@ identità, dati privati in risposte/log/metriche o regole PvP.
 La CI mantiene Redis reale TLS/ACL/HA/Sentinel, ma la verifica non
 certifica linearizzabilità cross-replica, restore operator o
 deploy ingress multi-pod: parent #21 aperta.
+
+
+## Conferma ZADD/ZScore della coda expiry guest cifrata — #179
+
+La coda `RedisGuestExpiryIndex` conserva membri opachi Data Protection
+in un sorted set Redis, con score che esprime la scadenza assoluta
+UTC in millisecondi. La #179 verifica che ogni nuova emissione
+guest e ogni work item post-logout sia stato **davvero osservato
+in Redis**: `SortedSetAddAsync` è seguito da
+`SortedSetScoreAsync` sulla **stessa coppia key/member**. Il valore
+letto deve essere esattamente lo score intero previsto; la conferma
+booleana dell'ADD da sola non basta. Il membro è cifrato e
+randomizzato; non è una stringa scelta dal browser.
+
+I comandi condividono un solo timeout di 2s; una cancellazione
+dopo ADD non invia SCORE tardivo. Un risultato nullo,
+score non corrispondente, guasto o read-back stalled
+fallisce l'operazione, senza retry automatico di una scrittura
+dal risultato ambiguo. L'emissione Production ritorna
+503/no-store senza cookie su scheduling non confermato,
+eseguendo il rollback guest preesistente. Per il logout
+non viene dichiarata durabile una entry non verificata;
+resta il fallback di cleanup già tracciato da #21/#41.
+
+Test xUnit con fake `IDatabase` simulano scritture confermate ma
+ignorate, SCORE errato, assente, errore e timeout, recovery,
+cancellazione nel mezzo delle operazioni e boundary HTTP Production
+senza leak di identificativi. La CI mantiene Redis reale con
+TLS/ACL/HA/Sentinel, Linux preStop, Vitest e Playwright.
+Il test non dimostra linearizzabilità cross-replica, Redis Cluster
+o un ingress multi-pod operativo, ancora sotto #21.

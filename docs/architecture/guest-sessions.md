@@ -239,3 +239,41 @@ e il lavoro operativo aperto nella parent #21.
 [CI applicativa #43915651694](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43915651694)
 SUCCESS 3/3 su `7de2770`: 816 xUnit, 21 Redis TLS/ACL/HA/Sentinel,
 SIGUSR1 Linux, 347 Vitest, 43 Playwright, 35 Python e build.
+
+
+## Conferma di persistenza della coda cifrata delle scadenze — #179
+
+Prima della consegna del cookie guest in non-Development, l'API
+registra il ticket in Redis e accoda il work item di scadenza cifrato
+con Data Protection. In precedenza il secondo passaggio si fidava
+del solo risultato di `SortedSetAddAsync`, senza verificare che il
+membro fosse realmente persistito. Un adattatore Redis che confermava
+un ADD ignorato poteva produrre un cookie valido ma privo del lavoro
+persistente necessario al cleanup cross-node dopo un crash.
+
+Ora `RedisGuestExpiryIndex.SaveAsync` scrive il membro opaco e
+rilegge **lo score Redis dello stesso membro** con
+`SortedSetScoreAsync`; l'esatto score UTC arrotondato al millisecondo
+deve corrispondere a quello scritto. ADD e SCORE usano un unico
+deadline di **2 secondi**, con cancellazione controllata tra le
+chiamate, sia durante `ScheduleAsync` (issuance) sia durante
+`ScheduleRevokedAsync` (logout). ADD riuscito senza record, score
+mancante o corrotto, errore e timeout non confermano la persistenza.
+In caso di issuance fallita, il codice HTTP già esistente tenta
+la revoca del ticket non pubblicato e risponde 503/no-store
+**senza Set-Cookie**. Per il logout una coda non confermata
+non è riportata come durabile e si usa il percorso di cleanup/fallback
+esistente; non si promette la consegna di un lavoro che manca.
+
+Lo score e il membro cifrato sono tecnici; player ID, token, digest,
+inviti, path e contenuti Redis non entrano in metriche, log o risposte.
+I nuovi xUnit verificano ADD ignorato, ZSCORE nullo/corrotto,
+eccezione, lettura bloccata, cancellation e ripresa per entrambe
+le operazioni, nonché il boundary HTTP Production e il recupero
+dell'emissione. Il read-back prova solo lo stato osservato sul
+connettore Redis, **non** un quorum fra repliche o il deployment
+staging reale: #21 resta aperta.
+
+[CI codice #43919216201](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43919216201)
+SUCCESS 3/3 su `57b9ef6`: 831 xUnit, 21 Redis TLS/ACL/HA/Sentinel,
+SIGUSR1, 347 Vitest, 43 Playwright, 35 Python e build.
