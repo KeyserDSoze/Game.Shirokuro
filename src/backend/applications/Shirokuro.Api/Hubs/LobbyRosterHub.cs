@@ -80,7 +80,18 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
                 ? reader.ForMember(lobbyId, trustedPlayerId)
                 : await lobby.ForMemberAsync(
                     lobbyId, trustedPlayerId, Context.ConnectionAborted);
-            // Shutdown might begin during an awaited Redis roster read.
+            // The first guest-authority check happened BEFORE the awaited
+            // roster read. A concurrent logout (potentially on another node)
+            // may have revoked the signed session while Redis was resolving
+            // that read. Recheck the authoritative registry before publishing
+            // even a previously member-authorized snapshot. An unavailable
+            // registry must also fail closed. This is a second read, not an
+            // atomic transaction with concurrent revocation.
+            if (isGuestLike &&
+                !await sessions!.IsActiveAsync(Context.User, Context.ConnectionAborted))
+                throw new HubException("Lobby unavailable.");
+
+            // Shutdown might begin during either awaited Redis operation.
             // Even a successful in-flight result is no longer deliverable.
             if (drain?.IsDraining == true || connections?.IsDraining == true)
                 throw new HubException("Lobby unavailable.");
