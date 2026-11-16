@@ -359,6 +359,133 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(1, lobby.Reads);
     }
 
+    private sealed class PausedRosterWithLogout(
+        LobbyRosterReader reader, InMemoryLobbyCoordinator coordinator)
+        : IAsyncGuestLobby
+    {
+        public TaskCompletionSource<bool> ReadStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleaseRead { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private async Task<LobbyRosterView> ReadAsync(
+            string roomId, string trustedPlayerId, bool passive,
+            CancellationToken cancellationToken)
+        {
+            // Capture a genuinely member-authorized snapshot BEFORE logout.
+            // The underlying storage response arrives only after release.
+            var view = passive
+                ? reader.PeekForMember(roomId, trustedPlayerId)
+                : reader.ForMember(roomId, trustedPlayerId);
+            if (trustedPlayerId == GuestAlice)
+            {
+                ReadStarted.TrySetResult(true);
+                await ReleaseRead.Task.WaitAsync(cancellationToken);
+            }
+            return view;
+        }
+
+        public Task<LobbyRosterView> ForMemberAsync(string roomId,
+            string trustedPlayerId, CancellationToken cancellationToken = default)
+            => ReadAsync(roomId, trustedPlayerId, false, cancellationToken);
+        public Task<LobbyRosterView> PeekForMemberAsync(string roomId,
+            string trustedPlayerId, CancellationToken cancellationToken = default)
+            => ReadAsync(roomId, trustedPlayerId, true, cancellationToken);
+        public Task<int> RemovePlayerFromAllRoomsAsync(string trustedPlayerId,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(coordinator.RemovePlayerFromAllRooms(trustedPlayerId));
+        }
+        public Task<LobbyRosterView> CreateAsync(string trustedPlayerId,
+            IReadOnlyList<string>? teamIds, string? initialTeam,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+        public Task<LobbyRosterView> JoinAsync(string roomId,
+            string trustedPlayerId, string? teamId, long? expectedRevision,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+        public Task<LobbyRosterView> ChooseHeroAsync(string roomId,
+            string trustedPlayerId, string? heroId, long expectedRevision,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+        public Task<LobbyRosterView> ChangeTeamAsync(string roomId,
+            string trustedPlayerId, string? teamId, long expectedRevision,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+        public Task LeaveAsync(string roomId, string trustedPlayerId,
+            long expectedRevision, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+    }
+
+    [Theory]
+    [InlineData("roster")]
+    [InlineData("roster/peek")]
+    public async Task ConcurrentRealHttpLogoutRevokesInFlightRosterButOtherGuestCanRead(
+        string relativePath)
+    {
+        using var server = CreateServer().WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAsyncGuestLobby>();
+                services.AddSingleton<PausedRosterWithLogout>();
+                services.AddSingleton<IAsyncGuestLobby>(services =>
+                    services.GetRequiredService<PausedRosterWithLogout>());
+            }));
+        var paused = server.Services.GetRequiredService<PausedRosterWithLogout>();
+        using var alice = MemberClientFor(server, GuestAlice);
+        using var bob = MemberClientFor(server, GuestBob);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        // The conditional validator matches the snapshot revision. The
+        // passive route must not report 304 after the issuing guest logs out.
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"/api/lobbies/{RoomA}/{relativePath}");
+        request.Headers.TryAddWithoutValidation("If-None-Match", "\"rev-3\"");
+        var inFlight = alice.SendAsync(request, timeout.Token);
+        await paused.ReadStarted.Task.WaitAsync(timeout.Token);
+
+        using var logout = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/sessions/guest");
+        logout.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        logout.Headers.TryAddWithoutValidation(
+            WebMutationGuard.RequestHeaderName, WebMutationGuard.RequestHeaderValue);
+        using var loggedOut = await alice.SendAsync(logout, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, loggedOut.StatusCode);
+        Assert.True(loggedOut.Headers.CacheControl?.NoStore == true);
+
+        paused.ReleaseRead.SetResult(true);
+        using var stale = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, stale.StatusCode);
+        Assert.True(stale.Headers.CacheControl?.NoStore == true);
+        Assert.False(stale.Headers.Contains("ETag"));
+        Assert.False(stale.Headers.Contains("Set-Cookie"));
+        var deniedBody = await stale.Content.ReadAsStringAsync(timeout.Token);
+        Assert.DoesNotContain(RoomA, deniedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain(GuestAlice, deniedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain(GuestBob, deniedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", deniedBody,
+            StringComparison.OrdinalIgnoreCase);
+
+        using var revoked = await alice.GetAsync("/api/sessions/me", timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+        Assert.True(revoked.Headers.CacheControl?.NoStore == true);
+
+        using var surviving = await bob.GetAsync(
+            $"/api/lobbies/{RoomA}/{relativePath}", timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, surviving.StatusCode);
+        Assert.True(surviving.Headers.CacheControl?.NoStore == true);
+        using var json = JsonDocument.Parse(
+            await surviving.Content.ReadAsStringAsync(timeout.Token));
+        var roster = json.RootElement;
+        Assert.Equal(4, roster.GetProperty("revision").GetInt64());
+        var member = Assert.Single(roster.GetProperty("participants").EnumerateArray());
+        Assert.Equal(GuestBob, member.GetProperty("playerId").GetString());
+        Assert.DoesNotContain(GuestAlice, roster.GetRawText());
+        using var otherSession = await bob.GetAsync("/api/sessions/me", timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, otherSession.StatusCode);
+    }
+
     [Fact]
     public async Task SignalRDoesNotExposeUndecodableRedisRoomOrUnverifiedRoster()
     {
