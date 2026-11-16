@@ -2569,3 +2569,47 @@ istantaneamente una connessione TCP esterna: il bilanciatore e le
 sessioni browser devono ancora essere testati in staging (#21).
 Il meccanismo non trasferisce connessioni, non modifica le regole
 PvP né annulla operazioni Redis CAS già iniziate.
+
+## PreStop: isolamento degli errori nei subscriber e dispose concorrente (#156)
+
+La notifica locale `IPreStopDrainNotification.PreStopStarted` invoca
+i callback registrati **sincronicamente** durante `SIGUSR1`.
+`CancellationTokenSource.Cancel()` chiama gli observer, ma può
+lanciare `AggregateException` se anche uno solo fallisce:
+senza protezione quell'eccezione poteva propagarsi dal callback di
+`PosixSignalRegistration` e compromettere il grace period preStop.
+
+`HostLifetimeReadinessDrainSignal` mantiene ora lo stato di drain
+monotono **prima** della notifica e isola le sole
+`AggregateException` causate dagli observer di `Cancel()`;
+la cancellazione .NET tenta tutti i callback nonostante l'errore.
+Il registry SignalR continua ad abortire i socket tracciati anche
+quando un altro observer è guasto; un SIGUSR1 ripetuto non ripete
+né la notifica né la metrica first-transition. Non vengono registrati
+messaggi/eccezioni dei subscriber, che potrebbero contenere dettagli
+sensibili. Altre eccezioni inattese fuori dalla notifica non vengono
+soppresse genericamente.
+
+Durante la dismissione dell'host la registrazione POSIX viene
+smontata prima della fonte di cancellazione. Se un SIGUSR1 già
+distribuito attraversa `Dispose()`, la relativa
+`ObjectDisposedException` è gestita esclusivamente **quando
+il teardown è effettivamente iniziato**. Il
+`CancellationToken` immutabile viene catturato prima
+dell'installazione dell'handler ed è leggibile anche dopo il
+dispose della source. `Dispose()` è idempotente.
+La protezione non promette l'invio di nuovi eventi dopo la fine
+dell'host né sostituisce `ApplicationStopping`:
+`SIGTERM` resta il fallback autorevole.
+
+Quattro test xUnit deterministici (failure di observer,
+registro SignalR con socket attivo, dispose già avvenuta
+e dispose che si sovrappone a un observer in esecuzione)
+esercitano il comportamento senza mandare veri segnali al
+runner; il test di processo Linux reale di #154 resta in CI.
+
+Questa è una garanzia locale sulla robustezza del dispatcher.
+Non dimostra che il bilanciatore abbia rimosso il pod,
+che ogni WebSocket TCP sia realmente chiuso, che un client
+si sia riconnesso altrove o che un CAS Redis già avviato
+possa essere annullato. Queste prove rimangono operative in #21.
