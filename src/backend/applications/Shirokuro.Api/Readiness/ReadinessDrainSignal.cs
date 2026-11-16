@@ -62,8 +62,12 @@ public sealed class HostLifetimeReadinessDrainSignal :
     private readonly PosixSignalRegistration? _registration;
     private readonly CancellationTokenRegistration _hostStopRegistration;
     private readonly CancellationTokenSource _preStopStarted = new();
+    // The token remains readable even after the source has been disposed.
+    // Never fetch CancellationTokenSource.Token during host teardown.
+    private readonly CancellationToken _preStopToken;
     private int _preStopDraining;
     private int _firstDrainRecorded;
+    private int _disposed;
 
     public HostLifetimeReadinessDrainSignal(
         IHostApplicationLifetime lifetime,
@@ -71,6 +75,9 @@ public sealed class HostLifetimeReadinessDrainSignal :
         IHostEnvironment? environment = null)
     {
         _lifetime = lifetime;
+        // Capture BEFORE installing the OS handler, which may be called at
+        // any time once PosixSignalRegistration.Create has returned.
+        _preStopToken = _preStopStarted.Token;
         var raw = configuration?[EnablePreStopSignalKey];
         if (raw is not null and not "true" and not "false")
             throw new InvalidOperationException(
@@ -109,7 +116,7 @@ public sealed class HostLifetimeReadinessDrainSignal :
 
     // A subscriber registered after preStop also gets notified immediately
     // by CancellationToken.Register. The token is never reset or reused.
-    public CancellationToken PreStopStarted => _preStopStarted.Token;
+    public CancellationToken PreStopStarted => _preStopToken;
 
     /// <summary>
     /// Only in-process trusted lifecycle code calls this (the SIGUSR1 handler,
@@ -131,9 +138,29 @@ public sealed class HostLifetimeReadinessDrainSignal :
         if (Interlocked.CompareExchange(ref _firstDrainRecorded, 1, 0) == 0)
             MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.PreStop);
 
-        // Cancel once: later SIGUSR1/SIGTERM cannot trigger duplicate
-        // socket cleanup notifications.
-        _preStopStarted.Cancel();
+        // CancellationTokenSource.Cancel executes every registered callback
+        // synchronously. A faulty observer can throw an AggregateException
+        // even though all callbacks were invoked. Never allow that observer
+        // failure to escape the POSIX signal dispatcher: the drain flag
+        // stays authoritative and healthy subscribers (such as the SignalR
+        // registry) must still see this transition.
+        //
+        // Dispose may race with an already-dispatched SIGUSR1 callback.
+        // Once teardown has begun, an ObjectDisposedException from the
+        // source is harmless: the normal host shutdown fence remains active.
+        try
+        {
+            _preStopStarted.Cancel();
+        }
+        catch (AggregateException)
+        {
+            // Do not log exception messages or callback arguments in the
+            // signal path; those may contain arbitrary or sensitive data.
+        }
+        catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0)
+        {
+            // Cancellation began after the host disposed its notifier.
+        }
     }
 
     private void RecordHostShutdown()
@@ -144,6 +171,11 @@ public sealed class HostLifetimeReadinessDrainSignal :
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        // Unregister OS signals before freeing the notification source.
+        // An already-running callback is protected against disposal races
+        // in BeginPreStopDrain and must not bring down the host.
         _registration?.Dispose();
         _hostStopRegistration.Dispose();
         _preStopStarted.Dispose();
