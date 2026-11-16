@@ -3169,3 +3169,42 @@ recovery; un altro xUnit prova chiavi distinte tra due istanze.
 La suite usa Redis del runner CI e TestServer, non dimostra la capacità
 operativa di due pod/ingress reali, reconnect durante failover né disaster
 recovery affidabile del deployment. Questa evidenza non chiude la parent #21.
+
+
+## Readiness Redis lobby con read-back del nonce — #176
+
+L'endpoint di readiness Production/Staging verifica due connettori Redis
+indipendenti: storage delle lobby e cache delle sessioni guest, oltre al
+key ring Data Protection. La #172 aveva già introdotto un nonce con
+read-back per la cache guest, ma il connector lobby si fidava del solo
+`StringSetAsync` positivo di un valore statico `"1"` senza leggere la
+chiave. Un adapter o failover incoerente che conferma un SET non persistito
+poteva quindi far apparire `/api/ready` sano anche quando le lobby non
+erano scrivibili in modo affidabile.
+
+Con #176 ogni probe reale genera **due nonce indipendenti e freschi a
+128 bit**: uno binario per `IDistributedCache`, uno lowercase hex per
+`IDatabase` lobby. Dopo i SET, `StringGetAsync` sullo **stesso
+connector lobby** deve restituire esattamente il nonce scritto; solo dopo
+il controllo locale viene letta la cache delle sessioni e verificato il
+key ring. Il valore è tecnico e non diventa mai un ticket guest, una
+membership, una quota, un invito, un log o una dimensione metrica. Una
+mancanza, una vecchia lettura, un valore non corrispondente, un errore o
+un timeout falliscono con HTTP 503 minimal e no-store. La metrica interna
+espone soltanto la fase a cardinalità chiusa `lobby-read`, oppure
+`timeout` quando il deadline scade, mai i valori di Redis.
+
+Restano intatti il TTL tecnico di 10 secondi, la chiave casuale isolata
+per servizio, il limite condiviso di 2 secondi per probe, la coalescenza
+dei waiter, la cache del risultato di 3 secondi, la liveness indipendente
+`/api/health`, Host/HTTPS e le autorizzazioni dei roster. I test xUnit
+Production TestServer con `IConnectionMultiplexer` simulato riproducono
+SET ignorato dopo un primo probe sano, GET nullo/corrotto/errore/bloccato,
+liveness durante l'errore e recovery successivo 200. La suite standard
+Redis TLS/ACL/HA/Sentinel rimane necessaria. Questa non è una verifica
+dello staging multi-pod o del LB esterno: #21 resta aperta.
+
+[CI applicativa #43904871330](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43904871330)
+ha superato tutti e tre i job su `f6f44eb` (801 xUnit standard, 21
+Redis TLS/ACL/HA/Sentinel, smoke Linux SIGUSR1, 347 Vitest, 43
+Playwright, 35 Python, build .NET/frontend).
