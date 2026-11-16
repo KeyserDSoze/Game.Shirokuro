@@ -167,7 +167,9 @@ public sealed class RedisTlsProductionTestsKestrel
         using var request = Mutation(HttpMethod.Post, visitor, "/api/sessions/guest");
         using var response = await visitor.SendAsync(request, token);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var cookie = Assert.Single(response.Headers.GetValues("Set-Cookie")).Split(';')[0];
+        var cookies = response.Headers.GetValues("Set-Cookie").ToArray();
+        Assert.True(cookies.Length == 1, "Exactly one signed guest cookie is required.");
+        var cookie = cookies[0].Split(';')[0];
         using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
         return (json.RootElement.GetProperty("playerId").GetString()!, cookie);
     }
@@ -256,11 +258,16 @@ public sealed class RedisTlsProductionTestsKestrel
         Assert.True(completion.TryGetProperty("error", out var error));
         Assert.False(string.IsNullOrWhiteSpace(error.GetString()));
         Assert.False(completion.TryGetProperty("result", out _));
-        Assert.DoesNotContain(room, completion.GetRawText(), StringComparison.Ordinal);
-        Assert.DoesNotContain(alice, completion.GetRawText(), StringComparison.Ordinal);
-        Assert.DoesNotContain(bob, completion.GetRawText(), StringComparison.Ordinal);
-        Assert.DoesNotContain("participants", completion.GetRawText(),
-            StringComparison.OrdinalIgnoreCase);
+        var json = completion.GetRawText();
+        // Never hand potentially private bytes or expected identities to
+        // assertion formatters: a failed test also runs in shared CI logs.
+        Assert.False(json.Contains(room, StringComparison.Ordinal),
+            "Denied SignalR completion disclosed room information.");
+        Assert.False(json.Contains(alice, StringComparison.Ordinal) ||
+                     json.Contains(bob, StringComparison.Ordinal),
+            "Denied SignalR completion disclosed player information.");
+        Assert.False(json.Contains("participants", StringComparison.OrdinalIgnoreCase),
+            "Denied SignalR completion contained a private roster.");
     }
 
     [Fact]
@@ -306,7 +313,8 @@ public sealed class RedisTlsProductionTestsKestrel
             using var visitorB = Http(portB);
             await ReadyAsync(visitorB, second, timeout.Token);
             var (bob, bobCookie) = await LoginAsync(visitorB, timeout.Token);
-            Assert.NotEqual(alice, bob);
+            Assert.True(!string.Equals(alice, bob, StringComparison.Ordinal),
+                "Independent guest sessions must have different identities.");
 
             using var aliceA = Http(portA, aliceCookie);
             using var aliceB = Http(portB, aliceCookie);
@@ -358,13 +366,16 @@ public sealed class RedisTlsProductionTestsKestrel
                     timeout.Token);
                 Assert.False(completion.TryGetProperty("error", out _));
                 var roster = completion.GetProperty("result");
-                Assert.Equal(room, roster.GetProperty("lobbyId").GetString());
+                Assert.True(string.Equals(room,
+                    roster.GetProperty("lobbyId").GetString(), StringComparison.Ordinal),
+                    "Authorized cross-process roster must use the expected room.");
                 Assert.Equal(2, roster.GetProperty("revision").GetInt64());
                 var members = roster.GetProperty("participants").EnumerateArray()
                     .Select(x => x.GetProperty("playerId").GetString()).ToArray();
                 Assert.Equal(2, members.Length);
-                Assert.Contains(alice, members);
-                Assert.Contains(bob, members);
+                Assert.True(members.Contains(alice, StringComparer.Ordinal) &&
+                            members.Contains(bob, StringComparer.Ordinal),
+                    "Cross-process roster must contain exactly its two members.");
             }
 
             using (var logout = Mutation(HttpMethod.Delete,
@@ -390,9 +401,11 @@ public sealed class RedisTlsProductionTestsKestrel
             Assert.False(surviving.TryGetProperty("error", out _));
             var view = surviving.GetProperty("result");
             Assert.Equal(3, view.GetProperty("revision").GetInt64());
-            Assert.Equal(bob, Assert.Single(view.GetProperty("participants")
-                .EnumerateArray()).GetProperty("playerId").GetString());
-            Assert.DoesNotContain(alice, surviving.GetRawText(), StringComparison.Ordinal);
+            Assert.True(string.Equals(bob, Assert.Single(view.GetProperty("participants")
+                .EnumerateArray()).GetProperty("playerId").GetString(),
+                StringComparison.Ordinal), "Only the surviving member may read the roster.");
+            Assert.False(surviving.GetRawText().Contains(alice, StringComparison.Ordinal),
+                "Survivor roster must not disclose the revoked guest.");
             using (var bobAliveA = await bobA.GetAsync("/api/sessions/me", timeout.Token))
             using (var bobAliveB = await bobB.GetAsync("/api/sessions/me", timeout.Token))
             {
