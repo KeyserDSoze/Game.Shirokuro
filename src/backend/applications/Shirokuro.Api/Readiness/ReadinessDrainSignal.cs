@@ -17,6 +17,17 @@ public interface IReadinessDrainSignal
 }
 
 /// <summary>
+/// An in-process, server-owned one-shot notification for a preStop transition.
+/// This is intentionally NOT a network command, nor a way for arbitrary
+/// request code to trigger drain. Host shutdown remains separately observed
+/// by IHostApplicationLifetime.ApplicationStopping.
+/// </summary>
+public interface IPreStopDrainNotification
+{
+    CancellationToken PreStopStarted { get; }
+}
+
+/// <summary>
 /// Trusted routing marker for the two member-only HTTP roster GETs. Using
 /// endpoint metadata (not a URL prefix) prevents a draining node from
 /// changing unknown paths or framework 405 replies into misleading 503s.
@@ -38,7 +49,7 @@ public sealed class LobbyJoinDrainRequired { }
 /// administrative endpoint, network listener or client-owned flag exists.
 /// </summary>
 public sealed class HostLifetimeReadinessDrainSignal :
-    IReadinessDrainSignal, IDisposable
+    IReadinessDrainSignal, IPreStopDrainNotification, IDisposable
 {
     public const string EnablePreStopSignalKey =
         "Security:PreStopDrain:EnableSigusr1";
@@ -48,6 +59,7 @@ public sealed class HostLifetimeReadinessDrainSignal :
     private const int LinuxSigusr1 = 10;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly PosixSignalRegistration? _registration;
+    private readonly CancellationTokenSource _preStopStarted = new();
     private int _preStopDraining;
 
     public HostLifetimeReadinessDrainSignal(
@@ -86,14 +98,29 @@ public sealed class HostLifetimeReadinessDrainSignal :
         _lifetime.ApplicationStopping.IsCancellationRequested ||
         Volatile.Read(ref _preStopDraining) != 0;
 
+    // A subscriber registered after preStop also gets notified immediately
+    // by CancellationToken.Register. The token is never reset or reused.
+    public CancellationToken PreStopStarted => _preStopStarted.Token;
+
     /// <summary>
     /// Only in-process trusted lifecycle code calls this (the SIGUSR1 handler,
     /// or a deterministic test). It is deliberately NOT exposed through DI's
     /// IReadinessDrainSignal or any HTTP/SignalR entry point.
     /// Does not stop the host or revoke established members' sessions.
     /// </summary>
-    public void BeginPreStopDrain() =>
-        Interlocked.Exchange(ref _preStopDraining, 1);
+    public void BeginPreStopDrain()
+    {
+        // Publish the drain flag FIRST, so late connections fail even when
+        // a subscriber's synchronous callback is still closing old sockets.
+        // Cancel once: repeated SIGUSR1 events and later SIGTERM cannot
+        // schedule duplicate aborts from this preStop notification.
+        if (Interlocked.Exchange(ref _preStopDraining, 1) == 0)
+            _preStopStarted.Cancel();
+    }
 
-    public void Dispose() => _registration?.Dispose();
+    public void Dispose()
+    {
+        _registration?.Dispose();
+        _preStopStarted.Dispose();
+    }
 }
