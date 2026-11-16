@@ -201,6 +201,36 @@ public sealed class SignalRWebSocketDrainTests
         Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingOrInvalidGuestCookieCannotNegotiateSignalR(
+        bool invalidCookie)
+    {
+        using var server = Server();
+        using var http = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false
+        });
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            "/hubs/lobbies/negotiate?negotiateVersion=1");
+        if (invalidCookie)
+        {
+            var cookieName = server.Services
+                .GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>()
+                .Get(CookieAuthenticationDefaults.AuthenticationScheme).Cookie.Name;
+            request.Headers.TryAddWithoutValidation(
+                "Cookie", cookieName + "=invalid-signed-ticket");
+        }
+
+        using var rejected = await http.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+        Assert.Equal("no-store", rejected.Headers.CacheControl?.ToString());
+        Assert.False(rejected.Headers.Contains("Set-Cookie"));
+        Assert.False(rejected.Headers.Contains("Location"));
+    }
+
     [Fact]
     public async Task PreStopRejectsNewSignalRNegotiateWithoutTouchingExistingGuest()
     {
