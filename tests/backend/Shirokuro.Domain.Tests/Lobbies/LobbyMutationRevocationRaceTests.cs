@@ -314,4 +314,72 @@ public sealed class LobbyMutationRevocationRaceTests
         Assert.DoesNotContain("private redis", body, StringComparison.OrdinalIgnoreCase);
         Assert.True(cache.Reads >= 2); // Post-command guest authority lookup.
     }
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("hero")]
+    [InlineData("team")]
+    public async Task ActiveGuestReceivesCommittedRosterOnlyAfterSecondSessionCheck(
+        string operation)
+    {
+        var cache = new FailingSessionCache();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server(cache);
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        PrepareRoom(coordinator, operation, actorIdentity.PlayerId, survivorIdentity.PlayerId);
+        var paused = server.Services.GetRequiredService<CompletedButHeldLobby>();
+
+        using var request = Operation(operation);
+        var inFlight = actor.SendAsync(request, timeout.Token);
+        await paused.Committed.Task.WaitAsync(timeout.Token);
+        Assert.Equal(1, cache.Reads); // Cookie middleware, not post-command yet.
+        paused.Release.TrySetResult(true);
+
+        using var result = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(operation == "create" ? HttpStatusCode.Created : HttpStatusCode.OK,
+            result.StatusCode);
+        Assert.True(result.Headers.CacheControl?.NoStore == true);
+        Assert.Equal(2, cache.Reads); // Exactly one additional authority lookup.
+        using var json = JsonDocument.Parse(
+            await result.Content.ReadAsStringAsync(timeout.Token));
+        Assert.Contains(json.RootElement.GetProperty("participants").EnumerateArray(),
+            member => member.GetProperty("playerId").GetString() ==
+                      actorIdentity.PlayerId);
+        if (operation == "create")
+            Assert.Equal(
+                $"/api/lobbies/{paused.CreatedRoomId}/roster",
+                result.Headers.Location?.OriginalString);
+        else
+            Assert.False(result.Headers.Contains("Location"));
+    }
+
+    [Fact]
+    public async Task RejectedMutationDoesNotSpendAdditionalGuestAuthorityRead()
+    {
+        var cache = new FailingSessionCache();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server(cache);
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        PrepareRoom(server.Services.GetRequiredService<InMemoryLobbyCoordinator>(),
+            "hero", actorIdentity.PlayerId, survivorIdentity.PlayerId);
+
+        using var request = Mutation(HttpMethod.Patch,
+            $"/api/lobbies/{Room}/hero",
+            new { heroId = "not-a-registered-hero", expectedRevision = 2 });
+        using var response = await actor.SendAsync(request, timeout.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(1, cache.Reads); // Failed before post-mutation roster check.
+        Assert.False(response.Headers.Contains("Location"));
+        Assert.True(response.Headers.CacheControl?.NoStore == true);
+    }
+
 }
