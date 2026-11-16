@@ -190,6 +190,14 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.RecordGuestCookieAuthority(outcome);
         MultiplayerMetrics.RecordReadinessProbe(true);
         MultiplayerMetrics.RecordReadinessProbe(false);
+        MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.PreStop);
+        MultiplayerMetrics.RecordNodeDrain(NodeDrainCause.HostShutdown);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(
+            SignalRDrainAbortReason.PreStop);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(
+            SignalRDrainAbortReason.HostShutdown);
+        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(
+            SignalRDrainAbortReason.LateConnection);
         MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
             RedisConnectionTransition.Failed);
         MultiplayerMetrics.RecordRedisConnection(RedisConnector.Lobby,
@@ -218,6 +226,11 @@ public sealed class MultiplayerMetricsTests
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: true, success: true, membershipsRemoved: 3);
         MultiplayerMetrics.RecordExpirySweep(sharedRedis: false, success: true, membershipsRemoved: 1);
 
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordNodeDrain((NodeDrainCause)999));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordSignalRDrainAbortAttempt(
+                (SignalRDrainAbortReason)999));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             MultiplayerMetrics.RecordMutation((GuestMutationKind)999, MutationOutcome.Allowed));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
@@ -248,6 +261,26 @@ public sealed class MultiplayerMetricsTests
             Assert.Throws<ArgumentOutOfRangeException>(() =>
                 MultiplayerMetrics.RecordReadinessDuration(
                     true, ReadinessProbeStage.Success, invalid));
+
+        var firstTransitions = capture.For(
+            MultiplayerMetrics.NodeDrainTransitionsName);
+        Assert.Contains(firstTransitions, item =>
+            item.Value == 1 && item.Tags.Count == 1 &&
+            item.Tags.TryGetValue("cause", out var cause) &&
+            cause == "prestop");
+        Assert.Contains(firstTransitions, item =>
+            item.Value == 1 && item.Tags.Count == 1 &&
+            item.Tags.TryGetValue("cause", out var cause) &&
+            cause == "host-shutdown");
+        var socketAborts = capture.For(
+            MultiplayerMetrics.SignalRDrainAbortAttemptsName);
+        foreach (var reason in new[] { "prestop", "host-shutdown", "late-connection" })
+            Assert.Contains(socketAborts, item =>
+                item.Value == 1 && item.Tags.Count == 1 &&
+                item.Tags.TryGetValue("reason", out var tag) && tag == reason);
+        Assert.All(firstTransitions.Concat(socketAborts), item =>
+            Assert.DoesNotContain(item.Tags.Keys, key =>
+                key is "ip" or "player" or "room" or "connection" or "cookie"));
 
         var timing = capture.ForDurations(
             MultiplayerMetrics.ReadinessDurationSecondsName);
