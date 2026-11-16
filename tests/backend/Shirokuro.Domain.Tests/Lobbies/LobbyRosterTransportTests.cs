@@ -604,6 +604,55 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task RemoteGuestRevocationDuringInFlightHubReadRejectsStaleRoster()
+    {
+        var services = new ServiceCollection();
+        services.AddDistributedMemoryCache();
+        using var provider = services.BuildServiceProvider();
+        var shared = provider.GetRequiredService<
+            Microsoft.Extensions.Caching.Distributed.IDistributedCache>();
+        var clock = TimeProvider.System;
+        var firstNodeSessions = new GuestSessionRegistry(clock, shared);
+        var secondNodeSessions = new GuestSessionRegistry(clock, shared);
+        var playerId = GuestSessions.NewPlayerId();
+        var token = await firstNodeSessions.RegisterAsync(
+            playerId, clock.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(playerId, token);
+
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create(RoomShared, ["white", "black"]);
+        coordinator.Join(RoomShared, playerId, "white", 0);
+        var reader = new LobbyRosterReader(coordinator);
+        // Snapshot was authorized when the read started, but must not be
+        // delivered once a second node has revoked the session.
+        var stale = reader.ForMember(RoomShared, playerId);
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby { Pending = pending };
+        var hub = new LobbyRosterHub(reader, firstNodeSessions, lobby: lobby)
+        {
+            Context = new FakeHubContext(principal)
+        };
+
+        var inFlight = hub.GetRoster(RoomShared);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, lobby.Reads);
+        Assert.True(await secondNodeSessions.RevokeAsync(principal));
+        pending.SetResult(stale);
+
+        var denied = await Assert.ThrowsAsync<HubException>(
+            () => inFlight.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal("Lobby unavailable.", denied.Message);
+        // The room read was not retried after revocation and no cached
+        // local guest registry entry can override the shared authority.
+        Assert.Equal(1, lobby.Reads);
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(RoomShared))).Message);
+        Assert.Equal(1, lobby.Reads);
+    }
+
+    [Fact]
     public void SessionCookieSettingsHaveStrictSecurityDefaults()
     {
         using var server = CreateServer();
