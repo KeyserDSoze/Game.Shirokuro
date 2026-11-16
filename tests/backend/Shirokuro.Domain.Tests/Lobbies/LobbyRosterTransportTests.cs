@@ -223,6 +223,7 @@ public sealed class LobbyRosterTransportTests
     public async Task RevokedGuestCannotReceiveInFlightHttpRosterOrNotModified(
         string relativePath)
     {
+        using var capture = new MultiplayerMetricCapture();
         var pending = new TaskCompletionSource<LobbyRosterView>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         var lobby = new ContendedLobby();
@@ -261,6 +262,9 @@ public sealed class LobbyRosterTransportTests
         Assert.DoesNotContain(GuestBob, body, StringComparison.Ordinal);
         Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, lobby.Reads); // No second roster query after revocation.
+        Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
+            measurement => measurement.Tags["surface"] == (relativePath == "roster" ? "http-refresh" : "http-peek") &&
+                           measurement.Tags["outcome"] == "inactive");
     }
 
     private sealed class InterruptibleGuestCache : IDistributedCache
@@ -312,6 +316,7 @@ public sealed class LobbyRosterTransportTests
     public async Task GuestAuthorityOutageAfterInFlightRosterReturnsOpaque503(
         string relativePath)
     {
+        using var capture = new MultiplayerMetricCapture();
         var cache = new InterruptibleGuestCache();
         var registry = new GuestSessionRegistry(TimeProvider.System, cache);
         var pending = new TaskCompletionSource<LobbyRosterView>(
@@ -357,6 +362,9 @@ public sealed class LobbyRosterTransportTests
         Assert.DoesNotContain("private shared", body, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(2, cache.ReadCount); // Exactly one post-read authority lookup.
         Assert.Equal(1, lobby.Reads);
+        Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
+            measurement => measurement.Tags["surface"] == (relativePath == "roster" ? "http-refresh" : "http-peek") &&
+                           measurement.Tags["outcome"] == "unavailable");
     }
 
     private sealed class PausedRosterWithLogout(
@@ -424,6 +432,7 @@ public sealed class LobbyRosterTransportTests
     public async Task ConcurrentRealHttpLogoutRevokesInFlightRosterButOtherGuestCanRead(
         string relativePath)
     {
+        using var capture = new MultiplayerMetricCapture();
         using var server = CreateServer().WithWebHostBuilder(builder =>
             builder.ConfigureTestServices(services =>
             {
@@ -484,6 +493,12 @@ public sealed class LobbyRosterTransportTests
         Assert.DoesNotContain(GuestAlice, roster.GetRawText());
         using var otherSession = await bob.GetAsync("/api/sessions/me", timeout.Token);
         Assert.Equal(HttpStatusCode.OK, otherSession.StatusCode);
+        var surface = relativePath == "roster" ? "http-refresh" : "http-peek";
+        var metrics = capture.For(MultiplayerMetrics.RosterPostReadAuthorityName);
+        Assert.Contains(metrics, m => m.Tags["surface"] == surface &&
+            m.Tags["outcome"] == "inactive");
+        Assert.Contains(metrics, m => m.Tags["surface"] == surface &&
+            m.Tags["outcome"] == "active");
     }
 
     [Fact]
@@ -879,6 +894,7 @@ public sealed class LobbyRosterTransportTests
     [Fact]
     public async Task RemoteGuestRevocationDuringInFlightHubReadRejectsStaleRoster()
     {
+        using var capture = new MultiplayerMetricCapture();
         var services = new ServiceCollection();
         services.AddDistributedMemoryCache();
         using var provider = services.BuildServiceProvider();
@@ -923,6 +939,47 @@ public sealed class LobbyRosterTransportTests
             (await Assert.ThrowsAsync<HubException>(
                 () => hub.GetRoster(RoomShared))).Message);
         Assert.Equal(1, lobby.Reads);
+        Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
+            m => m.Tags["surface"] == "signalr" &&
+                 m.Tags["outcome"] == "inactive");
+    }
+
+    [Fact]
+    public async Task SignalRPostReadAuthorityOutageRemainsOpaqueAndCountsUnavailable()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        var cache = new InterruptibleGuestCache();
+        var registry = new GuestSessionRegistry(TimeProvider.System, cache);
+        var token = await registry.RegisterAsync(GuestAlice,
+            TimeProvider.System.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(GuestAlice, token);
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create(RoomA, ["white", "black"]);
+        coordinator.Join(RoomA, GuestAlice, "white", 0);
+        var reader = new LobbyRosterReader(coordinator);
+        var oldRoster = reader.ForMember(RoomA, GuestAlice);
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby { Pending = pending };
+        var hub = new LobbyRosterHub(reader, registry, lobby: lobby)
+        {
+            Context = new FakeHubContext(principal)
+        };
+
+        var inFlight = hub.GetRoster(RoomA);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, cache.ReadCount);
+        cache.FailReads = true; // Simulated remote authority outage after read started.
+        pending.SetResult(oldRoster);
+
+        var denied = await Assert.ThrowsAsync<HubException>(
+            () => inFlight.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal("Lobby unavailable.", denied.Message);
+        Assert.Equal(2, cache.ReadCount);
+        Assert.Equal(1, lobby.Reads);
+        Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
+            m => m.Tags["surface"] == "signalr" &&
+                 m.Tags["outcome"] == "unavailable");
     }
 
     [Fact]
