@@ -2808,3 +2808,47 @@ pubblico). Monitorare la frequenza relativa di `inactive` e
 non fissare soglie di alert o SLO non misurati. L'ultimo controllo
 e l'invio dei byte non sono una transazione distribuita: questa
 metrica non certifica l'atomicità della revoca (resta #21).
+
+## Mutazioni roster HTTP: fence guest dopo il commit — #163
+
+Le quattro mutazioni pre-match che rispondono con un
+`LobbyRosterView` (`POST /api/lobbies`, `POST /api/lobbies/{id}/join`,
+`PATCH /api/lobbies/{id}/hero`, `PATCH /api/lobbies/{id}/team`)
+autorizzano il principal via cookie e applicano guard origin/intent,
+quota e stato lobby. In una richiesta concorrente, tuttavia, un
+`DELETE /api/sessions/guest` può revocare il ticket mentre il comando
+lobby sta per terminare, così il DTO prodotto prima della revoca non è
+più pubblicabile.
+
+`AuthorizedMutationRosterAsync` rivalida l'autorità guest **dopo**
+il completamento riuscito del comando `IAsyncGuestLobby`, ma **prima**
+di creare `Results.Ok` o `Results.Created` (incluso il `Location`
+che conterrebbe l'ID room). Confermata revoca => HTTP 401; autorità
+Redis non verificabile => HTTP 503. Entrambi con no-store, senza
+roster, ETag, Set-Cookie o Location. Un errore del comando stesso
+(400/404/409/429/503) mantiene la semantica precedente senza
+effettuare un lookup sessione supplementare. `DELETE membership`
+non restituisce un roster: nessuna nuova verifica post-command.
+
+La verifica HTTP del cookie all'inizio e il ricontrollo post-commit
+richiedono ora **due letture di sessione guest per mutazione che produce
+un roster**, contro una in precedenza, oltre al proprio CAS/lettura
+lobby. Non utilizzare cache positiva locale per saltare la seconda.
+La revalidation non riapplica, ritenta o annulla una mutazione riuscita.
+Se essa ha committato *prima* del logout, l'operazione può avere avuto
+effetto: è il worker/cleanup server-side di logout che rimuove le
+membership, mentre la fence Redis #42 impedisce l'attore revocato
+in CAS iniziati troppo tardi. Una revoca che arrivi *dopo* il check
+finale può ancora concorrere con la serializzazione dei byte:
+**non** è una transazione distribuita o una garanzia di revoca
+istantanea sul trasporto TCP. Il rollout multi-pod, LB, TLS reale
+rimangono nella parent #21.
+
+TestServer esercita ciascuno dei quattro endpoint con una lobby
+realmente mutata e un risultato sospeso tramite `TaskCompletionSource`
+fino al completamento di un **vero logout HTTP**. Verifica 401/no-store,
+assenza di dati e Location, sessione del secondo guest intatta e
+cleanup delle membership. Un'altra suite rende indisponibile la cache
+sessioni solo prima della seconda validazione, confermando 503/no
+roster; test di successi e comandi invalidi misurano i lookup Redis.
+Non equivale a una prova di stallo rete tra due pod in produzione.
