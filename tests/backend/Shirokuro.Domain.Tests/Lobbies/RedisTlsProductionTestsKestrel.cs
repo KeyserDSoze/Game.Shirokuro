@@ -82,7 +82,8 @@ public sealed class RedisTlsProductionTestsKestrel
 
     private static ChildProcess StartKestrel(
         int port, string apiAssembly, string serverPfx, string password,
-        (string Folder, string Pfx, string Password) keyRing, string redis)
+        (string Folder, string Pfx, string Password) keyRing, string redis,
+        int? trustedEdgePort = null)
     {
         var process = new ProcessStartInfo("dotnet")
         {
@@ -97,8 +98,18 @@ public sealed class RedisTlsProductionTestsKestrel
         process.Environment["ASPNETCORE_URLS"] = $"https://localhost:{port}";
         process.Environment["Kestrel__Certificates__Default__Path"] = serverPfx;
         process.Environment["Kestrel__Certificates__Default__Password"] = password;
-        process.Environment["AllowedHosts"] = $"localhost:{port}";
+        process.Environment["AllowedHosts"] = trustedEdgePort is null
+            ? $"localhost:{port}"
+            : $"localhost:{port};localhost:{trustedEdgePort.Value}";
         process.Environment["Security__AllowedOrigins__0"] = $"https://localhost:{port}";
+        if (trustedEdgePort is not null)
+        {
+            // Exact single-hop proxy IP; never trust the request's XFH.
+            // Both Kestrel and the edge check the canonical public authority.
+            process.Environment["Security__AllowedOrigins__1"] =
+                $"https://localhost:{trustedEdgePort.Value}";
+            process.Environment["Security__KnownProxies__0"] = "127.0.0.1";
+        }
         process.Environment["Security__GuestSessions__RedisConnectionString"] = redis;
         process.Environment["Security__DataProtection__KeysDirectory"] = keyRing.Folder;
         process.Environment["Security__DataProtection__CertificatePath"] = keyRing.Pfx;
