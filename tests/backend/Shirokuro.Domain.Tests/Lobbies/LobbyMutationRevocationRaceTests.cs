@@ -1,0 +1,317 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Shirokuro.Api.Lobbies;
+using Shirokuro.Api.Security;
+using Shirokuro.Application.Lobbies;
+using Xunit;
+
+namespace Shirokuro.Domain.Tests.Lobbies;
+
+/// <summary>
+/// Real HTTP mutation + concurrent logout on TestServer, using a deliberately
+/// delayed already-committed lobby command. No network LB/TLS claims.
+/// </summary>
+public sealed class LobbyMutationRevocationRaceTests
+{
+    private const string Room = "room-cccccccccccccccccccccccccccccccc";
+
+    private sealed class CompletedButHeldLobby(
+        GuestLobbyCommands commands, LobbyRosterReader reader,
+        InMemoryLobbyCoordinator coordinator) : IAsyncGuestLobby
+    {
+        private readonly LocalGuestLobbyRuntime _local =
+            new(commands, reader, coordinator);
+        public TaskCompletionSource<bool> Committed { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public string? CreatedRoomId { get; private set; }
+
+        private async Task<LobbyRosterView> Hold(
+            Task<LobbyRosterView> command, CancellationToken cancellationToken)
+        {
+            var roster = await command;
+            CreatedRoomId ??= roster.LobbyId;
+            Committed.TrySetResult(true);
+            await Release.Task.WaitAsync(cancellationToken);
+            return roster;
+        }
+
+        public Task<LobbyRosterView> CreateAsync(string actor,
+            IReadOnlyList<string>? teams, string? team,
+            CancellationToken cancellationToken = default) =>
+            Hold(_local.CreateAsync(actor, teams, team, cancellationToken),
+                cancellationToken);
+        public Task<LobbyRosterView> JoinAsync(string room, string actor,
+            string? team, long? revision,
+            CancellationToken cancellationToken = default) =>
+            Hold(_local.JoinAsync(room, actor, team, revision, cancellationToken),
+                cancellationToken);
+        public Task<LobbyRosterView> ChooseHeroAsync(string room, string actor,
+            string? hero, long revision,
+            CancellationToken cancellationToken = default) =>
+            Hold(_local.ChooseHeroAsync(room, actor, hero, revision, cancellationToken),
+                cancellationToken);
+        public Task<LobbyRosterView> ChangeTeamAsync(string room, string actor,
+            string? team, long revision,
+            CancellationToken cancellationToken = default) =>
+            Hold(_local.ChangeTeamAsync(room, actor, team, revision, cancellationToken),
+                cancellationToken);
+        public Task LeaveAsync(string room, string actor, long revision,
+            CancellationToken cancellationToken = default) =>
+            _local.LeaveAsync(room, actor, revision, cancellationToken);
+        public Task<LobbyRosterView> ForMemberAsync(string room, string actor,
+            CancellationToken cancellationToken = default) =>
+            _local.ForMemberAsync(room, actor, cancellationToken);
+        public Task<LobbyRosterView> PeekForMemberAsync(string room, string actor,
+            CancellationToken cancellationToken = default) =>
+            _local.PeekForMemberAsync(room, actor, cancellationToken);
+        public Task<int> RemovePlayerFromAllRoomsAsync(string actor,
+            CancellationToken cancellationToken = default) =>
+            _local.RemovePlayerFromAllRoomsAsync(actor, cancellationToken);
+    }
+
+    private sealed class FailingSessionCache : IDistributedCache
+    {
+        private readonly ConcurrentDictionary<string, byte[]> _data = new();
+        private int _gets;
+        public int Reads => Volatile.Read(ref _gets);
+        public bool FailReads { get; set; }
+        public byte[]? Get(string key)
+        {
+            Interlocked.Increment(ref _gets);
+            if (FailReads)
+                throw new IOException("private redis/session connection detail");
+            return _data.TryGetValue(key, out var result) ? result : null;
+        }
+        public Task<byte[]?> GetAsync(string key,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(Get(key));
+        }
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
+            => _data[key] = value;
+        public Task SetAsync(string key, byte[] value,
+            DistributedCacheEntryOptions options,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Set(key, value, options);
+            return Task.CompletedTask;
+        }
+        public void Refresh(string key) { }
+        public Task RefreshAsync(string key,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public void Remove(string key) => _data.TryRemove(key, out _);
+        public Task RemoveAsync(string key,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Remove(key);
+            return Task.CompletedTask;
+        }
+    }
+
+    private static WebApplicationFactory<Program> Server(
+        FailingSessionCache? cache = null) =>
+        new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAsyncGuestLobby>();
+                services.AddSingleton<CompletedButHeldLobby>();
+                services.AddSingleton<IAsyncGuestLobby>(sp =>
+                    sp.GetRequiredService<CompletedButHeldLobby>());
+                if (cache is not null)
+                {
+                    services.RemoveAll<IDistributedCache>();
+                    services.AddSingleton<IDistributedCache>(cache);
+                }
+            }));
+
+    private static HttpClient Client(WebApplicationFactory<Program> server,
+        string? cookie = null)
+    {
+        var client = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            AllowAutoRedirect = false,
+            HandleCookies = false
+        });
+        if (cookie is not null)
+            client.DefaultRequestHeaders.Add("Cookie", cookie);
+        return client;
+    }
+
+    private static HttpRequestMessage Mutation(HttpMethod method, string path, object? body,
+        bool withBody = true)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.TryAddWithoutValidation("Origin", "http://localhost");
+        request.Headers.TryAddWithoutValidation(
+            WebMutationGuard.RequestHeaderName, WebMutationGuard.RequestHeaderValue);
+        if (withBody)
+            request.Content = JsonContent.Create(body);
+        return request;
+    }
+
+    private static async Task<(string PlayerId, string Cookie)> SignIn(
+        HttpClient visitor, CancellationToken cancellationToken)
+    {
+        using var request = Mutation(HttpMethod.Post, "/api/sessions/guest",
+            body: null, withBody: false);
+        using var response = await visitor.SendAsync(request, cancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(cancellationToken));
+        return (json.RootElement.GetProperty("playerId").GetString()!,
+            Assert.Single(response.Headers.GetValues("Set-Cookie")).Split(';')[0]);
+    }
+
+    private static HttpRequestMessage Operation(string name) => name switch
+    {
+        "create" => Mutation(HttpMethod.Post, "/api/lobbies",
+            new { teamIds = new[] { "white", "black" }, teamId = "white" }),
+        "join" => Mutation(HttpMethod.Post, $"/api/lobbies/{Room}/join",
+            new { teamId = "black", expectedRevision = 1 }),
+        "hero" => Mutation(HttpMethod.Patch, $"/api/lobbies/{Room}/hero",
+            new { heroId = "kira", expectedRevision = 2 }),
+        "team" => Mutation(HttpMethod.Patch, $"/api/lobbies/{Room}/team",
+            new { teamId = "black", expectedRevision = 2 }),
+        _ => throw new ArgumentOutOfRangeException(nameof(name))
+    };
+
+    private static void PrepareRoom(
+        InMemoryLobbyCoordinator coordinator, string operation,
+        string actor, string survivor)
+    {
+        coordinator.Create(Room, ["white", "black"]);
+        if (operation == "join" || operation == "create")
+        {
+            coordinator.Join(Room, survivor, "white", 0);
+            return;
+        }
+        coordinator.Join(Room, actor, "white", 0);
+        coordinator.Join(Room, survivor, "black", 1);
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("hero")]
+    [InlineData("team")]
+    public async Task CompletedRosterMutationCannotReturnPrivateResultAfterRealHttpLogout(
+        string operation)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server();
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        using var survivor = Client(server, survivorIdentity.Cookie);
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        PrepareRoom(coordinator, operation, actorIdentity.PlayerId, survivorIdentity.PlayerId);
+        var paused = server.Services.GetRequiredService<CompletedButHeldLobby>();
+
+        using var request = Operation(operation);
+        var inFlight = actor.SendAsync(request, timeout.Token);
+        await paused.Committed.Task.WaitAsync(timeout.Token);
+
+        // The command has already mutated real lobby state, but has not
+        // returned its body or (for create) a new private room Location.
+        using var logout = Mutation(HttpMethod.Delete,
+            "/api/sessions/guest", body: null, withBody: false);
+        using var loggedOut = await actor.SendAsync(logout, timeout.Token);
+        Assert.Equal(HttpStatusCode.NoContent, loggedOut.StatusCode);
+        Assert.True(loggedOut.Headers.CacheControl?.NoStore == true);
+
+        paused.Release.TrySetResult(true);
+        using var denied = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
+        Assert.True(denied.Headers.CacheControl?.NoStore == true);
+        Assert.False(denied.Headers.Contains("Location"));
+        Assert.False(denied.Headers.Contains("ETag"));
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
+        var body = await denied.Content.ReadAsStringAsync(timeout.Token);
+        Assert.DoesNotContain(Room, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(actorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+
+        using var revoked = await actor.GetAsync("/api/sessions/me", timeout.Token);
+        Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+
+        // A different signed guest keeps their existing room and sees the
+        // cleanup result, never the signed-out actor.
+        using var rosterReply = await survivor.GetAsync(
+            $"/api/lobbies/{Room}/roster", timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, rosterReply.StatusCode);
+        using var parsed = JsonDocument.Parse(
+            await rosterReply.Content.ReadAsStringAsync(timeout.Token));
+        var participants = parsed.RootElement.GetProperty("participants");
+        var survivorOnly = Assert.Single(participants.EnumerateArray());
+        Assert.Equal(survivorIdentity.PlayerId,
+            survivorOnly.GetProperty("playerId").GetString());
+
+        if (operation == "create")
+        {
+            Assert.NotNull(paused.CreatedRoomId);
+            Assert.NotEqual(Room, paused.CreatedRoomId);
+            using var absent = await survivor.GetAsync(
+                $"/api/lobbies/{paused.CreatedRoomId}/roster", timeout.Token);
+            Assert.Equal(HttpStatusCode.NotFound, absent.StatusCode);
+        }
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("hero")]
+    [InlineData("team")]
+    public async Task SessionAuthorityOutageAfterCommittedMutationReturns503WithoutRoster(
+        string operation)
+    {
+        var cache = new FailingSessionCache();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var server = Server(cache);
+        using var actorVisitor = Client(server);
+        using var survivorVisitor = Client(server);
+        var actorIdentity = await SignIn(actorVisitor, timeout.Token);
+        var survivorIdentity = await SignIn(survivorVisitor, timeout.Token);
+        using var actor = Client(server, actorIdentity.Cookie);
+        var coordinator = server.Services.GetRequiredService<InMemoryLobbyCoordinator>();
+        PrepareRoom(coordinator, operation, actorIdentity.PlayerId, survivorIdentity.PlayerId);
+        var paused = server.Services.GetRequiredService<CompletedButHeldLobby>();
+
+        using var request = Operation(operation);
+        var inFlight = actor.SendAsync(request, timeout.Token);
+        await paused.Committed.Task.WaitAsync(timeout.Token);
+        Assert.True(cache.Reads >= 1); // Pre-handler auth validated the cookie.
+
+        cache.FailReads = true;
+        paused.Release.TrySetResult(true);
+        using var denied = await inFlight.WaitAsync(timeout.Token);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+        Assert.True(denied.Headers.CacheControl?.NoStore == true);
+        Assert.False(denied.Headers.Contains("Location"));
+        Assert.False(denied.Headers.Contains("ETag"));
+        Assert.False(denied.Headers.Contains("Set-Cookie"));
+        var body = await denied.Content.ReadAsStringAsync(timeout.Token);
+        Assert.DoesNotContain(Room, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(actorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private redis", body, StringComparison.OrdinalIgnoreCase);
+        Assert.True(cache.Reads >= 2); // Post-command guest authority lookup.
+    }
+}
