@@ -3137,3 +3137,35 @@ HTTP→WebSocket, **non** un redirect/upgrade WSS affidabile su due nodi,
 né rotazione cookie, failure/reconnect, aggiornamento hash LB o ingress
 sticky di staging. La #168 copre separatamente il percorso TLS Nginx;
 la #21 resta aperta per deployment multi-pod reale.
+
+
+## Redis readiness per-probe nonce — #172
+
+Il probe `GET /api/ready` Production prova i **due** connector Redis
+indipendenti e il key ring. Per il cache delle sessioni non basta un
+`GetAsync` che legge il valore lasciato da un probe precedente: un adapter
+con `SetAsync` che completa ma non persiste la scrittura può ancora
+restituire il valore storico. Un controllo con il vecchio byte statico
+`[1]` e chiave fissa v2 avrebbe riportato erroneamente un 200.
+
+Ogni nuova istanza di `RedisDeploymentReadiness` crea due chiavi tecniche
+`...:readiness:write-probe-v3:<random>` indipendenti con 128 bit
+casuali, una per ogni connector. A ogni *nuova* verifica la cache di
+sessione riceve un nonce fresco di 128 bit; la lettura deve restituire
+**esattamente quel nonce**. Un valore vecchio o la risposta di un altro
+nodo non certificano la nuova scrittura. Tutte le chiavi tecniche hanno
+TTL 10s e non contengono identità/cookie/lobby/secret; non vengono esposte
+in HTTP, log o attributi metriche. Non usare chiavi probe per autenticazione,
+revoca, quota o matchmaking.
+
+Il comportamento HTTP resta invariato: `/api/ready` restituisce 200/503
+minimal con `Cache-Control: no-store`, massimo 2 secondi per un probe
+reale, coalescing delle richieste simultanee e memoizzazione per 3 secondi.
+`/api/health` rimane liveness, non dipende da Redis; la verifica del key
+ring non è saltata. xUnit (#172) prova un SetAsync silenziosamente
+ignorato dopo il primo probe: il successivo è 503 e poi torna 200 dopo
+recovery; un altro xUnit prova chiavi distinte tra due istanze.
+
+La suite usa Redis del runner CI e TestServer, non dimostra la capacità
+operativa di due pod/ingress reali, reconnect durante failover né disaster
+recovery affidabile del deployment. Questa evidenza non chiude la parent #21.
