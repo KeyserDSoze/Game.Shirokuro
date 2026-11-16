@@ -15,7 +15,44 @@ namespace Shirokuro.Api.Hubs;
 public sealed class LobbyConnectionDrainRegistry : IDisposable
 {
     private readonly IReadinessDrainSignal _drain;
-    private readonly ConcurrentDictionary<string, HubCallerContext> _connections = new();
+    private readonly ConcurrentDictionary<string, TrackedConnection> _connections = new();
+
+    // A callback may snapshot a tracked context while TryTrack is also
+    // completing its post-insert drain check. Both paths must coordinate a
+    // single Abort() attempt. Untrack marks the entry disconnected before
+    // removal so a stale snapshot does not abort a departed socket.
+    private sealed class TrackedConnection(HubCallerContext context)
+    {
+        private const int Active = 0;
+        private const int Disconnected = 1;
+        private const int AbortAttempted = 2;
+        private int _state;
+
+        public HubCallerContext Context { get; } = context;
+
+        public void MarkDisconnected() =>
+            Interlocked.CompareExchange(ref _state, Disconnected, Active);
+
+        public void AbortOnce(SignalRDrainAbortReason reason)
+        {
+            if (Interlocked.CompareExchange(ref _state, AbortAttempted, Active)
+                != Active)
+                return;
+
+            // One metric only for an Abort() actually attempted. Never
+            // record the socket ID or any request/member data.
+            MultiplayerMetrics.RecordSignalRDrainAbortAttempt(reason);
+            try
+            {
+                Context.Abort();
+            }
+            catch (Exception)
+            {
+                // A closing transport must not prevent the remaining
+                // tracked sockets from being drained.
+            }
+        }
+    }
     private readonly CancellationTokenRegistration _stoppingRegistration;
     private readonly CancellationTokenRegistration _preStopRegistration;
     private int _stopping;
@@ -51,27 +88,37 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
     {
         ArgumentNullException.ThrowIfNull(context);
 
+        var tracked = new TrackedConnection(context);
         if (IsDraining)
         {
-            AbortSafely(context, SignalRDrainAbortReason.LateConnection);
+            tracked.AbortOnce(SignalRDrainAbortReason.LateConnection);
             return false;
         }
 
-        _connections[context.ConnectionId] = context;
+        _connections[context.ConnectionId] = tracked;
         if (!IsDraining)
             return true;
 
+        // BeginDraining may have already aborted this entry through its
+        // dictionary snapshot. The same atomic state prevents a second
+        // Abort() and duplicate metrics in this post-insert race.
         _connections.TryRemove(context.ConnectionId, out _);
-        AbortSafely(context, SignalRDrainAbortReason.LateConnection);
+        tracked.AbortOnce(SignalRDrainAbortReason.LateConnection);
         return false;
     }
 
     public void Untrack(HubCallerContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        // SignalR connection IDs are unique for a live connection, so this
-        // removes exactly the disconnected context rather than a player.
-        _connections.TryRemove(context.ConnectionId, out _);
+        // Mark disconnected BEFORE removal: a drain callback may already
+        // hold a snapshot of this entry. Connection IDs are unique for the
+        // lifetime of a SignalR transport; never store a player/room ID.
+        if (_connections.TryGetValue(context.ConnectionId, out var tracked) &&
+            ReferenceEquals(tracked.Context, context))
+        {
+            tracked.MarkDisconnected();
+            _connections.TryRemove(context.ConnectionId, out _);
+        }
     }
 
     private void BeginDraining(SignalRDrainAbortReason reason)
@@ -81,26 +128,8 @@ public sealed class LobbyConnectionDrainRegistry : IDisposable
         if (Interlocked.Exchange(ref _stopping, 1) != 0)
             return;
         foreach (var connection in _connections.Values)
-            AbortSafely(connection, reason);
+            connection.AbortOnce(reason);
         _connections.Clear();
-    }
-
-    private static void AbortSafely(HubCallerContext context,
-        SignalRDrainAbortReason reason)
-    {
-        // This counts ATTEMPTED local aborts (including throws), not network
-        // closure, distinct players or room exits. It has only a finite
-        // server-owned reason label; never record the ConnectionId.
-        MultiplayerMetrics.RecordSignalRDrainAbortAttempt(reason);
-        try
-        {
-            context.Abort();
-        }
-        catch (Exception)
-        {
-            // A transport already closing must not prevent other sockets
-            // from being aborted or block the server's shutdown callback.
-        }
     }
 
     public void Dispose()
