@@ -3391,3 +3391,58 @@ parent #21 resta aperta.
 **SUCCESS 3/3** su `3bbbd80`: 855 xUnit standard,
 21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest,
 43 Playwright, 35 Python e build.
+
+
+## Verifica di persistenza dopo CAS delle lobby Redis — #182
+
+Oltre al controllo di `CREATE` introdotto dalla #181, anche il
+CAS di aggiornamento `RedisLobbySnapshotStore.CompareExchangeAsync`
+deve garantire che la nuova revisione osservata sia realmente
+presente sul connettore Redis prima di poter essere pubblicata.
+Questo percorso serve ingresso stanza, scelta eroe, cambio squadra,
+heartbeat esplicito del roster e cleanup amministrativo delle
+membership dopo scadenza/revoca del ticket.
+
+Un primo Lua effettua il confronto byte-per-byte della versione
+precedente e aggiorna atomicamente snapshot e, quando previsto,
+indici globale/per creatore. **Soltanto su CAS = 1**, un secondo
+Lua **read-only**, sullo stesso namespace/hash slot, verifica:
+- esatta uguaglianza dei bytes salvati con il nuovo snapshot
+  autorevole; record assente o modificato non è una conferma;
+- `PEXPIRETIME` della stanza positiva e osservata dal Redis stesso;
+- per lobby con quota, entrambi i membri ZSET
+  (indice globale e indice creator) presenti con score uguale
+  all'expiry assoluta della stanza. Per snapshot legacy non
+  quotati non si creano né si richiedono indici.
+
+CAS + verifica condividono **una deadline complessiva di 2s**:
+se l'operazione è cancellata dopo il CAS non si invia un secondo
+script; esito di persist non confermato, errore o timeout **non**
+vengono ripetuti automaticamente. Un eventuale CAS già avvenuto ma
+superato da un nuovo CAS concorrente può produrre un conservativo 503,
+mai uno snapshot vecchio spacciato come autorevole.
+Per CAS = 0 restano le normali collisioni/revision conflict;
+per fence = -1 resta il rifiuto guest già revocato.
+
+Una verifica negativa solleva solo la nuova eccezione
+`LobbyMutationUnavailableException`, senza payload, player ID,
+room ID, password, Redis key, stack privato o eccezione interna.
+API HTTP autorizzata rende 503/no-store senza roster o Set-Cookie;
+SignalR rende l'errore opaco uniforme `Lobby unavailable.`.
+I normali 409 di revisione, 429 quota e il 404 per lobbisti
+non autorizzati non vengono riclassificati.
+
+16 nuovi test xUnit deterministici iniettano CAS dichiarati riusciti
+ma persi, bytes corrotti, ZSET mancanti/stale, expiry non valida,
+letture bloccate/fallite, pre-cancel/cancel nel mezzo, CAS=0,
+fence=-1, room non quotate e recupero HTTP Production da 503 a
+roster autentico 200. Aggiornati test esistenti di contention
+che eseguono una lettura successiva solo su CAS riuscito;
+CI Redis TLS/ACL/HA/Sentinel ed E2E browser rimasti obbligatori.
+
+[CI applicativa #43943844639](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43943844639)
+**SUCCESS 3/3 su `888575e`**: 871 xUnit, 21 Redis, SIGUSR1,
+347 Vitest, 43 Playwright, 35 Python e build.
+L'osservazione sul singolo connettore non dimostra un quorum
+cross-replica, un deploy multi-pod/staging reale o atomicità tra
+sessioni, lobby e ingress; parent #21 ancora aperta.

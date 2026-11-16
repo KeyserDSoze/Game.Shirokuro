@@ -230,3 +230,25 @@ eseguito alcun retry nascosto in caso di esito Redis incerto.
 Quote, team, eroi e sessioni guest non cambiano. Il controllo non
 dimostra atomicità cross-replica, né la produzione con ingress
 multi-pod non ancora verificata dalla #21.
+
+
+## Conferma del roster dopo join, team, eroe e heartbeat — #182
+
+Il server Production aggiorna il roster con un CAS Redis
+sulla versione completa precedente. Ora una risposta positiva
+del primo Lua non è sufficiente per consegnare al browser il
+nuovo roster: un Lua di sola lettura conferma **lo snapshot
+aggiornato byte-per-byte** e, per lobby con quote, le due
+membership negli indici quota con la stessa scadenza Redis.
+Entrambe le chiamate condividono **2 secondi complessivi**.
+
+Se il CAS è stato dichiarato riuscito ma non è più verificabile
+(perdita di write, ripristino stale, altro CAS, Redis non
+disponibile o timeout), la richiesta riceve **503/no-store**
+e non una revisione/roster inventata. Non si ripete un'azione
+mutante dal risultato ambiguo. Il trasporto SignalR mantiene
+l'errore generico `Lobby unavailable.` e nessun dettaglio
+interno. Un CAS conflittuale non produce un ulteriore roundtrip,
+e resta l'errore di revisione già previsto.
+Questo non altera le regole delle squadre, eroi o attività
+in partita né garantisce quorum Redis multi-replica (#21).
