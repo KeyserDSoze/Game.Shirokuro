@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Claims;
 using System.Text.Json;
@@ -9,6 +10,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -211,6 +213,150 @@ public sealed class LobbyRosterTransportTests
         Assert.Equal(1, lobby.Reads); // No further storage access.
         using var health = await guest.GetAsync("/api/health");
         Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+    }
+
+    // The HTTP handler must never publish a roster or even a 304 ETag
+    // whose first guest auth succeeded before a concurrent revocation.
+    [Theory]
+    [InlineData("roster")]
+    [InlineData("roster/peek")]
+    public async Task RevokedGuestCannotReceiveInFlightHttpRosterOrNotModified(
+        string relativePath)
+    {
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby();
+        if (relativePath == "roster")
+            lobby.Pending = pending;
+        else
+            lobby.PendingPeek = pending;
+
+        using var server = CreateServer(lobby);
+        var registry = server.Services.GetRequiredService<GuestSessionRegistry>();
+        var token = registry.Register(GuestAlice,
+            TimeProvider.System.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(GuestAlice, token);
+        using var guest = ClientFor(server, principal.Claims.ToArray());
+        var roster = new LobbyRosterReader(
+            server.Services.GetRequiredService<InMemoryLobbyCoordinator>())
+            .ForMember(RoomA, GuestAlice);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"/api/lobbies/{RoomA}/{relativePath}");
+        request.Headers.TryAddWithoutValidation("If-None-Match",
+            "\"rev-" + roster.Revision + "\"");
+        var inFlight = guest.SendAsync(request);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, lobby.Reads);
+
+        Assert.True(registry.Revoke(principal));
+        pending.SetResult(roster);
+        using var response = await inFlight.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.True(response.Headers.CacheControl?.NoStore == true);
+        Assert.False(response.Headers.Contains("ETag"));
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(RoomA, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(GuestBob, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, lobby.Reads); // No second roster query after revocation.
+    }
+
+    private sealed class InterruptibleGuestCache : IDistributedCache
+    {
+        private readonly ConcurrentDictionary<string, byte[]> _values = new();
+        private int _readCount;
+        public int ReadCount => Volatile.Read(ref _readCount);
+        public bool FailReads { get; set; }
+
+        public byte[]? Get(string key)
+        {
+            Interlocked.Increment(ref _readCount);
+            if (FailReads)
+                throw new IOException("private shared session authority unavailable");
+            return _values.TryGetValue(key, out var value) ? value : null;
+        }
+
+        public Task<byte[]?> GetAsync(string key,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(Get(key));
+        }
+
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
+            => _values[key] = value;
+        public Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Set(key, value, options);
+            return Task.CompletedTask;
+        }
+        public void Refresh(string key) { }
+        public Task RefreshAsync(string key, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+        public void Remove(string key) => _values.TryRemove(key, out _);
+        public Task RemoveAsync(string key, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Remove(key);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Theory]
+    [InlineData("roster")]
+    [InlineData("roster/peek")]
+    public async Task GuestAuthorityOutageAfterInFlightRosterReturnsOpaque503(
+        string relativePath)
+    {
+        var cache = new InterruptibleGuestCache();
+        var registry = new GuestSessionRegistry(TimeProvider.System, cache);
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby();
+        if (relativePath == "roster")
+            lobby.Pending = pending;
+        else
+            lobby.PendingPeek = pending;
+        using var server = CreateServer(lobby).WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<GuestSessionRegistry>();
+                services.AddSingleton(registry);
+            }));
+        var token = await registry.RegisterAsync(GuestAlice,
+            TimeProvider.System.GetUtcNow().AddHours(1));
+        var principal = GuestSessions.CreatePrincipal(GuestAlice, token);
+        using var guest = ClientFor(server, principal.Claims.ToArray());
+        var roster = new LobbyRosterReader(
+            server.Services.GetRequiredService<InMemoryLobbyCoordinator>())
+            .ForMember(RoomA, GuestAlice);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"/api/lobbies/{RoomA}/{relativePath}");
+        request.Headers.TryAddWithoutValidation("If-None-Match",
+            "\"rev-" + roster.Revision + "\"");
+        var inFlight = guest.SendAsync(request);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, cache.ReadCount); // Auth middleware checked real authority.
+        cache.FailReads = true; // Remote Redis outage before post-read check.
+        pending.SetResult(roster);
+
+        using var response = await inFlight.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.True(response.Headers.CacheControl?.NoStore == true);
+        Assert.False(response.Headers.Contains("ETag"));
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(RoomA, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(GuestBob, body, StringComparison.Ordinal);
+        Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private shared", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, cache.ReadCount); // Exactly one post-read authority lookup.
+        Assert.Equal(1, lobby.Reads);
     }
 
     [Fact]
