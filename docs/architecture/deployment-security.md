@@ -2893,3 +2893,37 @@ durante il secondo lookup (due controlli e 503 anche con Active).
 La suite Linux esistente verifica SIGUSR1 → drain/socket abort →
 SIGTERM su processo reale; i test in-process non sostituiscono
 una prova di rete/convergenza di più pod.
+
+## WebSocket autentici cross-node nel job Redis TLS reale — #165
+
+La verifica `RedisTlsProductionTests.CrossNodeProductionTlsRealSignalRWebSocketsHonorJoinAndRemoteLogout`
+colma la differenza tra i test con `HubCallerContext` simulato
+nei percorsi multi-istanza e i test WebSocket SignalR JSON in
+Development sul singolo host. Nel job CI già previsto per Redis
+TLS vengono avviati **due host ASP.NET Core Production** indipendenti
+con DI e configurazioni **non sostituite**. Entrambi condividono
+l'autorità sessioni guest, il persistito Data Protection key ring,
+il Redis TLS Redis-lobby/Lua/fencing e la vista room server-side.
+
+Tre client WebSocket stabiliscono un handshake JSON completo
+(`wss://game.example/hubs/lobbies` nel TestServer, con Origin
+`https://game.example` e vero cookie guest firmato):
+Alice su host A, lo stesso cookie Alice su host B e Bob su host B.
+Un non-membro non deve leggere o distinguere un invito privato
+da una stanza mancante: errore SignalR opaco identico, nessun DTO.
+Il join HTTP su B abilita la nuova membership e il successivo
+`GetRoster` dei tre socket conserva la revisione e i soli membri.
+Dopo logout HTTP su B l'autorità Redis e le membership diventano
+indisponibili ai due socket già aperti di Alice, anche sul nodo A.
+Bob conserva sessione e roster senza Alice. Il ticket revocato
+non può più avviare una nuova negoziazione SignalR, né su A né su B.
+
+La suite usa reali Redis TLS, firme di cookie e middleware Production,
+non mock positivi di auth. L'interazione SignalR usa però la
+implementazione WebSocket in-memory di ASP.NET Core TestServer:
+**non** esercita TCP/TLS effettivo tra il client browser e Kestrel,
+certificati del load balancer, ingress, processi/pod isolati,
+routing sticky/non-sticky o rediscovery K8s. Questi restano nella
+parent #21, che non può essere chiusa in base a tale test.
+I/O con timeout esplicito; nessun ID, cookie, corpo privato o
+connection string finisce nei nomi dei test o in telemetria.
