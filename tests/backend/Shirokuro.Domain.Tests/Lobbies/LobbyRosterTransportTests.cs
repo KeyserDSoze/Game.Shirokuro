@@ -632,10 +632,125 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task PreStopAbortsOnlyActiveSocketsBeforeSigtermAndRejectsReconnects()
+    {
+        using var host = new StoppingHostLifetime();
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var reader = new LobbyRosterReader(new InMemoryLobbyCoordinator());
+
+        var active = new FakeHubContext(Principal("alice"),
+            connectionId: "prestop-active");
+        var departed = new FakeHubContext(Principal("bob"),
+            connectionId: "prestop-disconnected");
+        var activeHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = active };
+        var departedHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = departed };
+        await activeHub.OnConnectedAsync();
+        await departedHub.OnConnectedAsync();
+        await departedHub.OnDisconnectedAsync(null);
+
+        Assert.False(host.ApplicationStopping.IsCancellationRequested);
+        Assert.False(tracker.IsDraining);
+        Assert.Equal(0, active.AbortCount);
+        drain.BeginPreStopDrain();
+
+        Assert.True(drain.IsDraining);
+        Assert.True(tracker.IsDraining);
+        Assert.False(host.ApplicationStopping.IsCancellationRequested);
+        Assert.Equal(1, active.AbortCount);
+        Assert.Equal(0, departed.AbortCount); // No stale transport abort.
+
+        // A duplicate SIGUSR1, followed by the ordinary SIGTERM fallback,
+        // must not abort previously tracked sockets multiple times.
+        drain.BeginPreStopDrain();
+        host.StopApplication();
+        Assert.Equal(1, active.AbortCount);
+        Assert.Equal(0, departed.AbortCount);
+
+        var late = new FakeHubContext(Principal("alice"),
+            connectionId: "prestop-late");
+        Assert.False(tracker.TryTrack(late));
+        Assert.Equal(1, late.AbortCount);
+        var lateViaHub = new FakeHubContext(Principal("bob"),
+            connectionId: "prestop-late-hub");
+        var lateHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = lateViaHub };
+        await lateHub.OnConnectedAsync();
+        Assert.Equal(1, lateViaHub.AbortCount);
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => activeHub.GetRoster(RoomA))).Message);
+    }
+
+    [Fact]
+    public async Task PreStopDuringInFlightHubRosterDeniesResultAndClosesSocket()
+    {
+        var coordinator = new InMemoryLobbyCoordinator();
+        coordinator.Create(RoomA, ["white", "black"]);
+        coordinator.Join(RoomA, "alice", "white", 0);
+        var reader = new LobbyRosterReader(coordinator);
+        using var host = new StoppingHostLifetime();
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var pending = new TaskCompletionSource<LobbyRosterView>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lobby = new ContendedLobby { Pending = pending };
+        var context = new FakeHubContext(Principal("alice"),
+            connectionId: "prestop-in-flight");
+        var hub = new LobbyRosterHub(reader, lobby: lobby,
+            drain: drain, connections: tracker) { Context = context };
+        await hub.OnConnectedAsync();
+
+        var inFlight = hub.GetRoster(RoomA);
+        await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, lobby.Reads);
+        Assert.Equal(0, context.AbortCount);
+
+        // The async Redis roster result is already in flight but the node
+        // enters preStop (not SIGTERM). No private result can be published.
+        drain.BeginPreStopDrain();
+        Assert.False(host.ApplicationStopping.IsCancellationRequested);
+        Assert.Equal(1, context.AbortCount);
+        pending.SetResult(reader.ForMember(RoomA, "alice"));
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(() => inFlight)).Message);
+
+        Assert.Equal("Lobby unavailable.",
+            (await Assert.ThrowsAsync<HubException>(
+                () => hub.GetRoster(RoomA))).Message);
+        Assert.Equal(1, lobby.Reads); // No further Redis/member lookup.
+        Assert.Equal(1, context.AbortCount);
+    }
+
+    [Fact]
+    public async Task PreStopBeforeRegistryConstructionRejectsLateSocket()
+    {
+        using var host = new StoppingHostLifetime();
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
+        drain.BeginPreStopDrain();
+
+        // Lazy DI: no connection registry existed when SIGUSR1 arrived.
+        // CancellationToken.Register invokes the callback immediately;
+        // fresh sockets must still be rejected before SIGTERM.
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        Assert.True(tracker.IsDraining);
+        Assert.False(host.ApplicationStopping.IsCancellationRequested);
+        var context = new FakeHubContext(Principal("alice"),
+            connectionId: "prestop-already-draining");
+        Assert.False(tracker.TryTrack(context));
+        Assert.Equal(1, context.AbortCount);
+        host.StopApplication();
+        Assert.Equal(1, context.AbortCount);
+        await Task.CompletedTask;
+    }
+
+    [Fact]
     public async Task ShutdownAbortsTrackedLobbySocketsAndRejectsNewConnections()
     {
         using var host = new StoppingHostLifetime();
-        var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
         using var tracker = new LobbyConnectionDrainRegistry(drain, host);
         var reader = new LobbyRosterReader(new InMemoryLobbyCoordinator());
 
@@ -688,7 +803,7 @@ public sealed class LobbyRosterTransportTests
         coordinator.Join(RoomA, "alice", "white", 0);
         var reader = new LobbyRosterReader(coordinator);
         using var host = new StoppingHostLifetime();
-        var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
         var pending = new TaskCompletionSource<LobbyRosterView>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         var lobby = new ContendedLobby { Pending = pending };
