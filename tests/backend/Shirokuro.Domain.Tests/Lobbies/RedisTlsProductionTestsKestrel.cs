@@ -327,7 +327,8 @@ public sealed class RedisTlsProductionTestsKestrel
 
     private static async Task<EphemeralNginxProxy> StartNginxAsync(
         int edgePort, int nodeA, int nodeB, string certificates,
-        string scratch, CancellationToken cancellationToken)
+        string scratch, CancellationToken cancellationToken,
+        bool affinityByGuestCookie = false)
     {
         var config = Path.Combine(scratch, "nginx.conf");
         // A real nginx reverse proxy (not an ASP.NET test implementation).
@@ -349,7 +350,9 @@ public sealed class RedisTlsProductionTestsKestrel
                 default upgrade;
                 '' close;
             }
+            @@GUEST_COOKIE_MAP@@
             upstream shirokuro_backend {
+                @@ROUTING_POLICY@@
                 server 127.0.0.1:@@NODE_A@@;
                 server 127.0.0.1:@@NODE_B@@;
             }
@@ -384,7 +387,18 @@ public sealed class RedisTlsProductionTestsKestrel
         }
         """.Replace("@@NODE_A@@", nodeA.ToString(System.Globalization.CultureInfo.InvariantCulture))
            .Replace("@@NODE_B@@", nodeB.ToString(System.Globalization.CultureInfo.InvariantCulture))
-           .Replace("@@EDGE_PORT@@", edgePort.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+           .Replace("@@EDGE_PORT@@", edgePort.ToString(System.Globalization.CultureInfo.InvariantCulture))
+           .Replace("@@GUEST_COOKIE_MAP@@", affinityByGuestCookie ? """
+               # Only the Shirokuro guest auth ticket is the affinity key.
+               # Unrelated cookies MUST NOT change the chosen upstream.
+               # Fallback is an edge-only source IP for unauthenticated calls.
+               map $http_cookie $shirokuro_route_key {
+                   default $remote_addr;
+                   "~(?:^|;[ ]*)Shirokuro[.]Session=([^;]+)" $1;
+               }
+               """ : "")
+           .Replace("@@ROUTING_POLICY@@",
+               affinityByGuestCookie ? "hash $shirokuro_route_key consistent;" : ""));
         var name = "shirokuro-nginx-ci-" + Guid.NewGuid().ToString("N")[..12];
         var ok = await DockerAsync([
             "run", "-d", "--rm",
