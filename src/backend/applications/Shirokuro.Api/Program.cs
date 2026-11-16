@@ -923,14 +923,31 @@ static async Task<IResult> ServeGuestRosterAsync(
         var roster = heartbeat
             ? await lobby.ForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted)
             : await lobby.PeekForMemberAsync(lobbyId, trustedPlayerId, context.RequestAborted);
-        // A node may start shutdown while a guest/room read is awaiting
-        // Redis. Never publish a 200/304 body or ETag from that in-flight
-        // result once the host is draining, even when the snapshot was
-        // otherwise member-authorized.
+        // Authentication middleware checked this guest cookie BEFORE the
+        // awaited roster read. A concurrent HTTP logout or remote-node
+        // revocation may have invalidated it while storage was resolving.
+        // Do not return even a conditional 304 for an unverified snapshot.
+        // Redis authority failures are NOT proof of revocation: return 503
+        // instead of 401 so clients do not discard a still-valid identity.
+        if (GuestSessions.IsGuest(user))
+        {
+            var authority = await context.RequestServices
+                .GetRequiredService<GuestSessionRegistry>()
+                .CheckAuthorityAsync(user, context.RequestAborted);
+            if (authority != GuestSessionAuthorityStatus.Active)
+                return Results.StatusCode(
+                    authority == GuestSessionAuthorityStatus.Inactive
+                        ? StatusCodes.Status401Unauthorized
+                        : StatusCodes.Status503ServiceUnavailable);
+        }
+
+        // A node may start shutdown during either awaited read. Never
+        // publish a 200/304 body or ETag from that in-flight result once
+        // the host is draining, even when the snapshot was member-authorized.
         if (drain.IsDraining)
             return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         // A revision is merely a representation validator, never proof
-        // of guest identity or room membership. Both checks above MUST run
+        // of guest identity or room membership. All checks above MUST run
         // before considering any conditional response.
         if (!heartbeat)
         {
