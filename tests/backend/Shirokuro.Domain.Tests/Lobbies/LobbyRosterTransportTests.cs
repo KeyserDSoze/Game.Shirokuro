@@ -632,6 +632,67 @@ public sealed class LobbyRosterTransportTests
     }
 
     [Fact]
+    public async Task PreStopSocketMetricsCountOnlyRegistryAbortAttempts()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        using var host = new StoppingHostLifetime();
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var reader = new LobbyRosterReader(new InMemoryLobbyCoordinator());
+        var connected = new FakeHubContext(Principal("alice"),
+            connectionId: "observed-socket");
+        var disconnected = new FakeHubContext(Principal("bob"),
+            connectionId: "untracked-socket");
+        var liveHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = connected };
+        var lostHub = new LobbyRosterHub(reader,
+            drain: drain, connections: tracker) { Context = disconnected };
+        await liveHub.OnConnectedAsync();
+        await lostHub.OnConnectedAsync();
+        await lostHub.OnDisconnectedAsync(null);
+
+        drain.BeginPreStopDrain();
+        drain.BeginPreStopDrain();
+        host.StopApplication();
+        Assert.Equal(1, connected.AbortCount);
+        Assert.Equal(0, disconnected.AbortCount);
+        Assert.Contains(capture.For(MultiplayerMetrics.SignalRDrainAbortAttemptsName),
+            item => item.Value == 1 && item.Tags.Count == 1 &&
+                item.Tags.TryGetValue("reason", out var reason) &&
+                reason == "prestop");
+
+        var late = new FakeHubContext(Principal("alice"),
+            connectionId: "after-prestop");
+        Assert.False(tracker.TryTrack(late));
+        Assert.Equal(1, late.AbortCount);
+        Assert.Contains(capture.For(MultiplayerMetrics.SignalRDrainAbortAttemptsName),
+            item => item.Value == 1 && item.Tags.Count == 1 &&
+                item.Tags.TryGetValue("reason", out var reason) &&
+                reason == "late-connection");
+    }
+
+    [Fact]
+    public async Task HostShutdownSocketMetricsUseFallbackReason()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        using var host = new StoppingHostLifetime();
+        using var drain = new HostLifetimeReadinessDrainSignal(host);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var context = new FakeHubContext(Principal("alice"),
+            connectionId: "shutdown-only");
+        var hub = new LobbyRosterHub(new LobbyRosterReader(
+            new InMemoryLobbyCoordinator()), drain: drain,
+            connections: tracker) { Context = context };
+        await hub.OnConnectedAsync();
+        host.StopApplication();
+        Assert.Equal(1, context.AbortCount);
+        Assert.Contains(capture.For(MultiplayerMetrics.SignalRDrainAbortAttemptsName),
+            item => item.Value == 1 && item.Tags.Count == 1 &&
+                item.Tags.TryGetValue("reason", out var reason) &&
+                reason == "host-shutdown");
+    }
+
+    [Fact]
     public async Task PreStopAbortsOnlyActiveSocketsBeforeSigtermAndRejectsReconnects()
     {
         using var host = new StoppingHostLifetime();
