@@ -87,9 +87,15 @@ public sealed class LobbyRosterHub(LobbyRosterReader reader,
             // even a previously member-authorized snapshot. An unavailable
             // registry must also fail closed. This is a second read, not an
             // atomic transaction with concurrent revocation.
-            if (isGuestLike &&
-                !await sessions!.IsActiveAsync(Context.User, Context.ConnectionAborted))
-                throw new HubException("Lobby unavailable.");
+            if (isGuestLike)
+            {
+                var authority = await sessions!.CheckAuthorityAsync(
+                    Context.User, Context.ConnectionAborted);
+                MultiplayerMetrics.RecordRosterPostReadAuthority(
+                    RosterPostReadSurface.SignalR, authority);
+                if (authority != GuestSessionAuthorityStatus.Active)
+                    throw new HubException("Lobby unavailable.");
+            }
 
             // Shutdown might begin during either awaited Redis operation.
             // Even a successful in-flight result is no longer deliverable.
