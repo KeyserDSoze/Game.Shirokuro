@@ -3029,3 +3029,56 @@ non un deployment Kubernetes multi-pod, un LB/cloud ingress,
 terminazione TLS di dominio esterno, failover proxy o fault
 injection di rete. Non chiudere la parent #21 sulla sola base
 di questa prova.
+
+## Affinità sperimentale Nginx per SignalR negotiate→WSS — #168
+
+Il test #167 ha dimostrato il passaggio di WebSocket **diretti**
+attraverso Nginx senza usare `/hubs/lobbies/negotiate`. La risposta
+di negotiate contiene un `connectionToken` per una connessione
+conosciuta **solo dal processo** SignalR selezionato. Senza affinità,
+una successiva richiesta WSS `?id=<connectionToken>` può finire
+su un altro upstream: Redis condiviso per le lobby **non** è un
+SignalR connection manager distribuito.
+
+`RedisTlsProductionTestsKestrel.RealNginxSignedGuestCookieAffinityPreservesNegotiateAndWssUpgrade`
+esegue un secondo container Nginx temporaneo con stessa configurazione
+TLS verificata di #167, ma con una scelta di backend deterministica.
+La direttiva `map` estrae **solo** il valore del cookie autenticato
+`Shirokuro.Session` da `$http_cookie` e il modulo upstream usa
+`hash $shirokuro_route_key consistent;`. Il fallback per richieste
+senza cookie è l'IP sorgente verso l'edge (non affinità per utenti
+anonimi); l'header Cookie intero non viene usato come chiave. È
+necessario preservare lo stesso ticket tra negotiate e WebSocket
+upgrade; cookie estranei aggiunti non modificano la route.
+Non vengono registrati valori di cookie, player, room o token
+negotiation. L'affinità **non** concede accesso e non sostituisce
+validazione della firma cookie, controllo sessione guest su Redis,
+revocation fencing e verifica membership in Hub.
+
+Il test usa due processi OS Kestrel Production distinti, Nginx
+Docker su loopback, TLS autenticato client→Nginx e Nginx→Kestrel,
+Data Protection keyring e Redis TLS condivisi. Con lo stesso cookie
+esegue due POST negotiate verso lo stesso upstream, poi reali
+upgrade WSS con token opachi e handshake SignalR JSON su tre
+socket (Alice normale, Alice con cookie aggiuntivo, Bob). Verifica
+errore opaco di Bob outsider e stanza inesistente, join e roster
+member-only, logout via edge che revoca Alice su entrambi i
+socket già aperti, HTTP 401 da entrambi i Kestrel, negotiate 401
+col vecchio ticket; Bob conserva sessione e roster privato dopo
+cleanup. I token negotiate restano in memoria del test, mai in
+messaggi d'asserzione o log; un errore WebSocket viene sanitizzato.
+Readiness Nginx viene verificata con retry/timeout prima di aprire
+WSS, per non confondere il bind asincrono del container con errori
+di autenticazione o connessione.
+
+**Limitazioni e rollout**: usare l'intero ticket guest come
+affinity key è solo un esempio CI controllato; ticket refresh,
+reissue o rotazione delle chiavi possono modificarlo e cambiare
+backend selezionato mentre una negotiate è in corso. Ingress
+reale deve definire esplicitamente sticky cookie/affinità, durata
+e capacità di fallback in rollout/drain, oppure supportare solo
+WebSocket skip-negotiate a condizioni note. Questo test NON
+dimostra affinity durante refresh, reconnect automatico, backend
+down, scaling, sessioni account persistenti, due pod su host
+diversi, WAF o certificati esterni. Nessuna configurazione Nginx
+di test va copiata come deployment completo. Parent #21 aperta.
