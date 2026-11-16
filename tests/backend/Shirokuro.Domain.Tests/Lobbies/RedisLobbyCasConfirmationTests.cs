@@ -122,7 +122,9 @@ public sealed class RedisLobbyCasConfirmationTests
         var state = LobbyState.Create(
             new LobbyDefinition(room, ["white", "black"], ["kira"]))
             .Join(actor, "white", 0);
-        var snapshot = new LobbySnapshot(state, DateTimeOffset.UtcNow,
+        // Leave headroom for an authorized heartbeat. A future activity
+        // timestamp is correctly rejected BEFORE any Redis command.
+        var snapshot = new LobbySnapshot(state, DateTimeOffset.UtcNow.AddSeconds(-2),
             actor, QuotaTracked: tracked);
         var bytes = RedisLobbySnapshotCodec.Encode(snapshot);
         return (new RedisLobbySnapshotStore(database, TimeProvider.System),
