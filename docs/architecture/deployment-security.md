@@ -2613,3 +2613,35 @@ Non dimostra che il bilanciatore abbia rimosso il pod,
 che ogni WebSocket TCP sia realmente chiuso, che un client
 si sia riconnesso altrove o che un CAS Redis già avviato
 possa essere annullato. Queste prove rimangono operative in #21.
+
+## Test del vero transport WebSocket SignalR nel TestServer (#157)
+
+I test delle #152/#155 simulavano `HubCallerContext.Abort()` e il
+processo Linux #154 usava un contesto Hub fittizio con `SIGUSR1`
+**reale**. La #157 verifica un passo successivo: nel job backend
+xUnit, ASP.NET Core `TestServer.CreateWebSocketClient()` attraversa
+la **vera pipeline SignalR pre-match**, con autenticazione mediante
+cookie guest firmato dal server e registro guest attivo, handshake
+JSON SignalR con framing `0x1e`, invocazione di `GetRoster`
+autorizzata e risposta privata conforme alla membership.
+
+Durante la connessione aperta, l'invocazione del preStop trusted
+`HostLifetimeReadinessDrainSignal.BeginPreStopDrain()` deve causare
+la chiusura del **WebSocket** osservata dal client entro un tempo
+limitato. Il nodo rimane vivo (`ApplicationStopping=false`,
+`/api/health=200`) ma rifiuta nuova readiness (`/api/ready=503`
+con `Cache-Control: no-store`) e nuove negoziazioni SignalR
+(`503/no-store`, senza cookie né redirect). Test separati negano
+`POST /hubs/lobbies/negotiate` con **401/no-store** in assenza di
+cookie o con ticket invalido. Il normale test Linux SIGUSR1/SIGTERM
+di #154 continua a essere eseguito indipendentemente dalla suite.
+
+Si tratta di un **WebSocket effettivo in-process** gestito da
+TestServer, non di un falso `HubCallerContext`, ma **non**
+attraversa una vera connessione TCP, TLS edge, reverse proxy,
+Kubernetes o load balancer multi-nodo. Non dimostra riconnessione
+automatizzata su una seconda istanza, che il LB abbia propagato
+readiness, né rollback di CAS Redis già avviati. La prova di
+rollout, grace period e failover in staging reale rimane aperta
+nella #21. Le identità di test sono fittizie e nessuna stanza o
+cookie è esposto come etichetta di telemetria.
