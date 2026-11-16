@@ -3208,3 +3208,44 @@ dello staging multi-pod o del LB esterno: #21 resta aperta.
 ha superato tutti e tre i job su `f6f44eb` (801 xUnit standard, 21
 Redis TLS/ACL/HA/Sentinel, smoke Linux SIGUSR1, 347 Vitest, 43
 Playwright, 35 Python, build .NET/frontend).
+
+
+## Conferma della barriera Redis di revoca guest — #177
+
+Il record Redis di revoca impedisce ai vecchi handler HTTP/SignalR,
+autenticati prima del logout, di completare una mutazione lobby nel
+successivo Lua CAS. Prima della #177, l'installazione chiamava
+`IDatabase.StringSetAsync(..., when: When.NotExists)` e considerava
+conclusa la barriera dopo il solo comando: un connettore che confermava
+la scrittura senza persisterla avrebbe lasciato la vecchia richiesta
+libera di modificare il roster pur facendo proseguire il logout.
+
+Ora `RedisLobbySnapshotStore.FenceGuestAsync` verifica l'esatto
+marker server-owned `"1"` tramite `StringGetAsync` sulla stessa
+chiave hash SHA-256 e sullo **stesso connector Redis**. Vale sia dopo
+SET NX=true sia per NX=false: una fence preesistente è idempotente solo
+se il marker è ancora presente. Il secondo tentativo non rinnova il TTL
+di 8 ore, non genera nuove identità e non rimuove il blocco. SET e GET
+condividono un unico timeout di 2 secondi e la cancellazione prima
+della lettura non invia una nuova operazione. Marker assente/corrotto,
+scrittura ignorata, errore o timeout non sono una conferma: il caller
+non deve restituire un falso logout completo. In Production il flusso
+esistente ha già revocato il cookie guest, tenta la pulizia e risponde
+503/no-store se non può confermare la fence. Il worker mantiene il
+work item dovuto per un nuovo tentativo; le letture e le mutazioni
+continuano a richiedere autorità Redis e CAS.
+
+Il marker, la chiave e il player ID non diventano log, dimensioni di
+metriche o testo di risposta HTTP. I test xUnit usano un
+`IDatabase` `DispatchProxy` controllato per riprodurre scritture
+ignorate, risposte NX=false incongruenti, GET assente/alterato,
+eccezione, blocco, recovery, cancellazione e nessuno sliding TTL. Un
+Production TestServer verifica 503/no-store per una fence silenziosamente
+ignorata e un vecchio cookie già invalidato. Restano obbligatori i test
+Redis TLS/ACL/HA/Sentinel e quelli Lua reali: il test non dimostra una
+transazione atomica cross-store tra session cache e lobby Redis, né
+staging con più pod e load balancer reale (#21).
+
+[CI implementativa #43908925553](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43908925553)
+SUCCESS 3/3 su `94e31b4`: 809 xUnit standard, 21 Redis,
+SIGUSR1, 347 Vitest, 43 Playwright, 35 Python, build.

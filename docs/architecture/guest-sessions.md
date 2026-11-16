@@ -187,3 +187,24 @@ cookie replay and recovery after an unconfirmed delete. Parent #21 remains
 open for staging/multi-pod and operational failover validation.
 
 Validation: [main CI #43899998215](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43899998215) passed all three jobs on `3707e3f`: 796 standard xUnit, 21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest, 43 Playwright, 35 Python and builds. The two preStop/issuance-drain rollback tests now explicitly count the additional post-delete authority read rather than weakening deletion invariants.
+
+
+## Conferma del fence per logout e scadenza — #177
+
+Dopo la revoca del token Redis condiviso, un guest potrebbe avere una
+mutazione lobby già autenticata in esecuzione. La barriera Redis
+dell'attore protegge i Lua CAS di tale richiesta; ora la sua
+installazione è considerata conclusa solo se un GET conferma lo stesso
+marker server-owned `"1"` sulla chiave SHA-256. Una scrittura
+`SET NX` riportata come completata ma non memorizzata, o un errore
+della lettura di conferma, non costituisce prova di blocco. Quando il
+cookie è già stato revocato, il logout non può ripristinarlo, ma
+restituisce 503/no-store anziché un falso 204; il lavoro di cleanup
+rimane ritentabile dal worker. Un fence già presente viene
+riconfermato senza estenderne l'8h TTL. SET/GET usano un solo
+deadline di 2s, senza ritentativi di mutazione incerta.
+
+Nessun segreto o ID viene restituito in errore HTTP. Le regressioni
+xUnit Production e Redis controllato accompagnano i normali test di
+revoca cross-node; la parent #21 resta aperta per failover operativo,
+account verificati e integrazione atomica cross-store.
