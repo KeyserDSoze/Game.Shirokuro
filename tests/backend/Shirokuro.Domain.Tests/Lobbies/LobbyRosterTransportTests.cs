@@ -692,6 +692,155 @@ public sealed class LobbyRosterTransportTests
                 reason == "host-shutdown");
     }
 
+    private sealed class PausingDrainSignal(
+        HostLifetimeReadinessDrainSignal actual) :
+        IReadinessDrainSignal, IPreStopDrainNotification
+    {
+        private int _reads;
+        private int _pauseAt = int.MaxValue;
+
+        public TaskCompletionSource<bool> ReadPaused { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ResumeRead { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public CancellationToken PreStopStarted => actual.PreStopStarted;
+
+        public bool IsDraining
+        {
+            get
+            {
+                var read = Interlocked.Increment(ref _reads);
+                if (read == Volatile.Read(ref _pauseAt))
+                {
+                    // This is the post-dictionary-insert drain check,
+                    // not a clock/timing guess: the test triggers the
+                    // lifecycle transition while this read is paused.
+                    ReadPaused.TrySetResult(true);
+                    ResumeRead.Task.GetAwaiter().GetResult();
+                }
+                return actual.IsDraining;
+            }
+        }
+
+        public void PauseAfterReads(int additionalReads) =>
+            Volatile.Write(ref _pauseAt,
+                Volatile.Read(ref _reads) + additionalReads);
+    }
+
+    [Fact]
+    public async Task PreStopDuringPostInsertTrackAbortsSocketOnce()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        using var host = new StoppingHostLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(host);
+        var drain = new PausingDrainSignal(signal);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var socket = new FakeHubContext(Principal("alice"),
+            connectionId: "post-insert-prestop");
+
+        // One read in registry ctor, then 2 in TryTrack: initial admission
+        // and the post-insert check. Pause at the latter, when the socket
+        // is already visible to the registry's drain callback.
+        drain.PauseAfterReads(2);
+        var pending = Task.Run(() => tracker.TryTrack(socket));
+        await drain.ReadPaused.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            signal.BeginPreStopDrain();
+            Assert.True(tracker.IsDraining);
+            Assert.False(host.ApplicationStopping.IsCancellationRequested);
+            Assert.Equal(1, socket.AbortCount);
+        }
+        finally
+        {
+            drain.ResumeRead.TrySetResult(true);
+        }
+
+        Assert.False(await pending.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, socket.AbortCount);
+        signal.BeginPreStopDrain();
+        host.StopApplication();
+        Assert.Equal(1, socket.AbortCount);
+        Assert.Contains(
+            capture.For(MultiplayerMetrics.SignalRDrainAbortAttemptsName),
+            item => item.Value == 1 && item.Tags.Count == 1 &&
+                    item.Tags.TryGetValue("reason", out var reason) &&
+                    reason == "prestop");
+    }
+
+    [Fact]
+    public async Task HostShutdownDuringHubConnectPostInsertCannotDoubleAbort()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        using var host = new StoppingHostLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(host);
+        var drain = new PausingDrainSignal(signal);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var socket = new FakeHubContext(Principal("alice"),
+            connectionId: "raced-hub-connect");
+        var hub = new LobbyRosterHub(new LobbyRosterReader(
+            new InMemoryLobbyCoordinator()), drain: drain,
+            connections: tracker) { Context = socket };
+
+        // The Hub's first drain check, registry IsDraining, TryTrack's
+        // pre-check and finally the post-insert check are 4 reads.
+        // Force SIGTERM after the context is inserted, while the Hub's
+        // callback awaits the result of TryTrack.
+        drain.PauseAfterReads(4);
+        var pending = Task.Run(() => hub.OnConnectedAsync());
+        await drain.ReadPaused.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            host.StopApplication();
+            Assert.True(signal.IsDraining);
+            Assert.Equal(1, socket.AbortCount);
+        }
+        finally
+        {
+            drain.ResumeRead.TrySetResult(true);
+        }
+        await pending.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, socket.AbortCount); // Both registry and Hub raced.
+        Assert.Contains(
+            capture.For(MultiplayerMetrics.SignalRDrainAbortAttemptsName),
+            item => item.Value == 1 && item.Tags.Count == 1 &&
+                    item.Tags.TryGetValue("reason", out var reason) &&
+                    reason == "host-shutdown");
+    }
+
+    [Fact]
+    public async Task DisconnectedAfterInsertionIsNotAbortedByConcurrentPreStop()
+    {
+        using var host = new StoppingHostLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(host);
+        var drain = new PausingDrainSignal(signal);
+        using var tracker = new LobbyConnectionDrainRegistry(drain, host);
+        var socket = new FakeHubContext(Principal("alice"),
+            connectionId: "post-insert-disconnected");
+
+        drain.PauseAfterReads(2);
+        var pending = Task.Run(() => tracker.TryTrack(socket));
+        await drain.ReadPaused.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            // A disconnect observed by the registry before the drain
+            // snapshot must win the atomic entry state transition.
+            tracker.Untrack(socket);
+            signal.BeginPreStopDrain();
+            Assert.True(tracker.IsDraining);
+            Assert.Equal(0, socket.AbortCount);
+        }
+        finally
+        {
+            drain.ResumeRead.TrySetResult(true);
+        }
+        Assert.False(await pending.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, socket.AbortCount);
+        host.StopApplication();
+        Assert.Equal(0, socket.AbortCount);
+    }
+
     [Fact]
     public async Task PreStopAbortsOnlyActiveSocketsBeforeSigtermAndRejectsReconnects()
     {
