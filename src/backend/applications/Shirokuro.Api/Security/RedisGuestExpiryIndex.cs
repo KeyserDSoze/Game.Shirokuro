@@ -156,10 +156,29 @@ public sealed class RedisGuestExpiryIndex : IGuestExpiryIndex
         if (member.Length > MaxProtectedMemberBytes)
             throw new InvalidDataException("Invalid guest expiry work item.");
         cancellationToken.ThrowIfCancellationRequested();
-        // Never report a durable expiry/revocation record on an uncertain
-        // Redis result. A command already delivered to Redis may still finish.
-        await AwaitRedisAsync(_database.SortedSetAddAsync(
-            _key, member, CeilingUnixMilliseconds(dueUtc)), cancellationToken);
+        // A positive ZADD acknowledgement is not evidence that an adapter
+        // or failover actually persisted the expiry job. The HTTP issuer must
+        // not release a valid cookie without its encrypted recovery work;
+        // likewise post-logout cleanup must not claim a queued retry that
+        // Redis silently dropped. Confirm this exact new opaque member and
+        // exact expected UTC-millisecond score on the SAME connector.
+        //
+        // Both commands share a single bounded deadline (not 2s each).
+        // A failed confirmation leaves only a random, protected orphan job
+        // when Redis did persist the write; it cannot grant an unissued ticket.
+        var score = CeilingUnixMilliseconds(dueUtc);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        await _database.SortedSetAddAsync(_key, member, score)
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
+        var observedScore = await _database.SortedSetScoreAsync(_key, member)
+            .WaitAsync(timeout.Token);
+        if (observedScore is null || observedScore.Value != score)
+            throw new InvalidOperationException(
+                "Guest expiry storage did not confirm schedule.");
+        timeout.Token.ThrowIfCancellationRequested();
         return member;
     }
 
