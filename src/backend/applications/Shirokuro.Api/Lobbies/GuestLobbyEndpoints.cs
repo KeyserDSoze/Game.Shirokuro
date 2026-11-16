@@ -43,12 +43,11 @@ public static class GuestLobbyEndpoints
             // Do not begin a new room CAS after that boundary.
             if (drain.IsDraining)
                 return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-            return await Respond(async () =>
-            {
-                var roster = await lobby.CreateAsync(actor!, request.TeamIds,
-                    request.TeamId, context.RequestAborted);
-                return Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster);
-            }, context.RequestAborted);
+            return await Respond(() => AuthorizedMutationRosterAsync(
+                context,
+                () => lobby.CreateAsync(actor!, request.TeamIds,
+                    request.TeamId, context.RequestAborted),
+                created: true), context.RequestAborted);
         });
         createRoom.WithMetadata(
             new GuestMutationRateLimit(GuestMutationKind.RoomCreation));
@@ -66,8 +65,10 @@ public static class GuestLobbyEndpoints
             // authoritative result; do not claim that they can be cancelled.
             if (drain.IsDraining)
                 return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-            return await Respond(async () => Results.Ok(await lobby.JoinAsync(
-                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
+            return await Respond(() => AuthorizedMutationRosterAsync(
+                context,
+                () => lobby.JoinAsync(roomId, actor!, request.TeamId,
+                    request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
         }).WithMetadata(new CanonicalLobbyIdRequired("roomId"),
             new Shirokuro.Api.Readiness.LobbyJoinDrainRequired());
@@ -77,8 +78,10 @@ public static class GuestLobbyEndpoints
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return await Respond(async () => Results.Ok(await lobby.ChooseHeroAsync(
-                roomId, actor!, request.HeroId, request.ExpectedRevision, context.RequestAborted)),
+            return await Respond(() => AuthorizedMutationRosterAsync(
+                context,
+                () => lobby.ChooseHeroAsync(roomId, actor!, request.HeroId,
+                    request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
         }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
 
@@ -87,8 +90,10 @@ public static class GuestLobbyEndpoints
         {
             if (!TryGuest(context, environment, out var actor))
                 return Results.Forbid();
-            return await Respond(async () => Results.Ok(await lobby.ChangeTeamAsync(
-                roomId, actor!, request.TeamId, request.ExpectedRevision, context.RequestAborted)),
+            return await Respond(() => AuthorizedMutationRosterAsync(
+                context,
+                () => lobby.ChangeTeamAsync(roomId, actor!, request.TeamId,
+                    request.ExpectedRevision, context.RequestAborted)),
                 context.RequestAborted);
         }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
 
@@ -104,6 +109,32 @@ public static class GuestLobbyEndpoints
                 return Results.NoContent();
             }, context.RequestAborted);
         }).WithMetadata(new CanonicalLobbyIdRequired("roomId"));
+    }
+
+    /// <summary>
+    /// A roster-returning mutation may have committed its Redis CAS while an
+    /// independent logout revoked this guest's cookie. Recheck the
+    /// authoritative session AFTER the command completes, BEFORE emitting
+    /// the body (or a Location header containing a newly issued room ID).
+    /// This does not replay or roll back an already successful mutation.
+    /// Only successful commands pay the second guest-authority read.
+    /// </summary>
+    private static async Task<IResult> AuthorizedMutationRosterAsync(
+        HttpContext context, Func<Task<LobbyRosterView>> execute, bool created = false)
+    {
+        var roster = await execute();
+        var status = await context.RequestServices
+            .GetRequiredService<GuestSessionRegistry>()
+            .CheckAuthorityAsync(context.User, context.RequestAborted);
+        if (status != GuestSessionAuthorityStatus.Active)
+            return Results.StatusCode(
+                status == GuestSessionAuthorityStatus.Inactive
+                    ? StatusCodes.Status401Unauthorized
+                    : StatusCodes.Status503ServiceUnavailable);
+
+        return created
+            ? Results.Created("/api/lobbies/" + roster.LobbyId + "/roster", roster)
+            : Results.Ok(roster);
     }
 
     private static bool TryGuest(
