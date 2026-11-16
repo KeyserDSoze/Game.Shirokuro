@@ -346,7 +346,7 @@ public sealed class LobbyRosterTransportTests
             "\"rev-" + roster.Revision + "\"");
         var inFlight = guest.SendAsync(request);
         await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(1, cache.ReadCount); // Auth middleware checked real authority.
+        Assert.Equal(3, cache.ReadCount); // Includes issuance confirmation. // Includes issuance confirmation. // Auth middleware checked real authority.
         cache.FailReads = true; // Remote Redis outage before post-read check.
         pending.SetResult(roster);
 
@@ -360,7 +360,7 @@ public sealed class LobbyRosterTransportTests
         Assert.DoesNotContain(GuestBob, body, StringComparison.Ordinal);
         Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("private shared", body, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(2, cache.ReadCount); // Exactly one post-read authority lookup.
+        Assert.Equal(3, cache.ReadCount); // Includes issuance confirmation. // Exactly one post-read authority lookup.
         Assert.Equal(1, lobby.Reads);
         Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
             measurement => measurement.Tags["surface"] == (relativePath == "roster" ? "http-refresh" : "http-peek") &&
@@ -972,14 +972,14 @@ public sealed class LobbyRosterTransportTests
 
         var inFlight = hub.GetRoster(RoomA);
         await lobby.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(1, cache.ReadCount);
+        Assert.Equal(3, cache.ReadCount); // Includes issuance confirmation. // Includes issuance confirmation.
         cache.FailReads = true; // Simulated remote authority outage after read started.
         pending.SetResult(oldRoster);
 
         var denied = await Assert.ThrowsAsync<HubException>(
             () => inFlight.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.Equal("Lobby unavailable.", denied.Message);
-        Assert.Equal(2, cache.ReadCount);
+        Assert.Equal(3, cache.ReadCount); // Includes issuance confirmation.
         Assert.Equal(1, lobby.Reads);
         Assert.Contains(capture.For(MultiplayerMetrics.RosterPostReadAuthorityName),
             m => m.Tags["surface"] == "signalr" &&

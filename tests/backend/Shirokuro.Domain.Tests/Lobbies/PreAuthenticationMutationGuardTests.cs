@@ -75,10 +75,17 @@ public sealed class PreAuthenticationMutationGuardTests
     private sealed class CountingCache : IDistributedCache
     {
         private readonly ConcurrentDictionary<string, byte[]> _data = new();
+        // Keep auth/read-admission counts separate from the single mandatory
+        // read-back of a newly issued ticket. These tests assert that invalid
+        // requests trigger NO extra auth lookup; the registration confirmation
+        // is a distinct, required Redis read and is counted independently.
+        private readonly ConcurrentDictionary<string, byte> _awaitingConfirmation = new();
         private int _reads;
+        private int _registrationConfirmations;
         private int _writes;
         private int _removes;
         public int Reads => Volatile.Read(ref _reads);
+        public int RegistrationConfirmations => Volatile.Read(ref _registrationConfirmations);
         public int Writes => Volatile.Read(ref _writes);
         public int Removes => Volatile.Read(ref _removes);
         public int StoredGuestKeys => _data.Keys.Count(key =>
@@ -100,10 +107,21 @@ public sealed class PreAuthenticationMutationGuardTests
         public async Task<byte[]?> GetAsync(string key,
             CancellationToken token = default)
         {
-            Interlocked.Increment(ref _reads);
-            ReadStarted?.TrySetResult(true);
-            if (ResumeRead is { } gate)
-                await gate.Task.WaitAsync(token);
+            // The first read of a freshly written guest-session key proves
+            // that registration persisted. Do not confuse that with the
+            // separate request-auth lookup measured by the ingress tests.
+            if (key.StartsWith("guest-session:", StringComparison.Ordinal) &&
+                _awaitingConfirmation.TryRemove(key, out _))
+            {
+                Interlocked.Increment(ref _registrationConfirmations);
+            }
+            else
+            {
+                Interlocked.Increment(ref _reads);
+                ReadStarted?.TrySetResult(true);
+                if (ResumeRead is { } gate)
+                    await gate.Task.WaitAsync(token);
+            }
             if (Unavailable)
                 throw new IOException("Private Redis endpoint and password");
             return Get(key);
@@ -113,6 +131,8 @@ public sealed class PreAuthenticationMutationGuardTests
         {
             Interlocked.Increment(ref _writes);
             _data[key] = value;
+            if (key.StartsWith("guest-session:", StringComparison.Ordinal))
+                _awaitingConfirmation[key] = 0;
         }
 
         public async Task SetAsync(string key, byte[] value,

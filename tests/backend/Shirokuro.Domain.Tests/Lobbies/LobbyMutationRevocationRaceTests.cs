@@ -23,6 +23,9 @@ namespace Shirokuro.Domain.Tests.Lobbies;
 public sealed class LobbyMutationRevocationRaceTests
 {
     private const string Room = "room-cccccccccccccccccccccccccccccccc";
+    // Every fixture signs in two guests; issuing a shared ticket now proves
+    // persistence with one GET each before regular cookie authentication.
+    private const int IssuanceReadbacks = 2;
 
     private sealed class ManualDrain : IReadinessDrainSignal
     {
@@ -311,7 +314,7 @@ public sealed class LobbyMutationRevocationRaceTests
         using var request = Operation(operation);
         var inFlight = actor.SendAsync(request, timeout.Token);
         await paused.Committed.Task.WaitAsync(timeout.Token);
-        Assert.True(cache.Reads >= 1); // Pre-handler auth validated the cookie.
+        Assert.True(cache.Reads >= IssuanceReadbacks + 1); // Pre-handler auth validated the cookie.
 
         cache.FailReads = true;
         paused.Release.TrySetResult(true);
@@ -327,7 +330,7 @@ public sealed class LobbyMutationRevocationRaceTests
         Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
         Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("private redis", body, StringComparison.OrdinalIgnoreCase);
-        Assert.True(cache.Reads >= 2); // Post-command guest authority lookup.
+        Assert.True(cache.Reads >= IssuanceReadbacks + 2); // Post-command guest authority lookup.
     }
     [Theory]
     [InlineData("create")]
@@ -352,14 +355,14 @@ public sealed class LobbyMutationRevocationRaceTests
         using var request = Operation(operation);
         var inFlight = actor.SendAsync(request, timeout.Token);
         await paused.Committed.Task.WaitAsync(timeout.Token);
-        Assert.Equal(1, cache.Reads); // Cookie middleware, not post-command yet.
+        Assert.Equal(IssuanceReadbacks + 1, cache.Reads); // Cookie middleware, not post-command yet.
         paused.Release.TrySetResult(true);
 
         using var result = await inFlight.WaitAsync(timeout.Token);
         Assert.Equal(operation == "create" ? HttpStatusCode.Created : HttpStatusCode.OK,
             result.StatusCode);
         Assert.True(result.Headers.CacheControl?.NoStore == true);
-        Assert.Equal(2, cache.Reads); // Exactly one additional authority lookup.
+        Assert.Equal(IssuanceReadbacks + 2, cache.Reads); // Exactly one additional authority lookup.
         using var json = JsonDocument.Parse(
             await result.Content.ReadAsStringAsync(timeout.Token));
         Assert.Contains(json.RootElement.GetProperty("participants").EnumerateArray(),
@@ -392,7 +395,7 @@ public sealed class LobbyMutationRevocationRaceTests
             new { heroId = "not-a-registered-hero", expectedRevision = 2 });
         using var response = await actor.SendAsync(request, timeout.Token);
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Equal(1, cache.Reads); // Failed before post-mutation roster check.
+        Assert.Equal(IssuanceReadbacks + 1, cache.Reads); // Failed before post-mutation roster check.
         Assert.False(response.Headers.Contains("Location"));
         Assert.True(response.Headers.CacheControl?.NoStore == true);
     }
@@ -421,7 +424,7 @@ public sealed class LobbyMutationRevocationRaceTests
         using var request = Operation(operation);
         var inFlight = actor.SendAsync(request, timeout.Token);
         await paused.Committed.Task.WaitAsync(timeout.Token);
-        Assert.Equal(1, cache.Reads); // The issuing guest passed cookie auth.
+        Assert.Equal(IssuanceReadbacks + 1, cache.Reads); // The issuing guest passed cookie auth.
         drain.Start(); // preStop happens after the command already committed.
         paused.Release.TrySetResult(true);
 
@@ -436,7 +439,7 @@ public sealed class LobbyMutationRevocationRaceTests
         Assert.DoesNotContain(actorIdentity.PlayerId, body, StringComparison.Ordinal);
         Assert.DoesNotContain(survivorIdentity.PlayerId, body, StringComparison.Ordinal);
         Assert.DoesNotContain("participants", body, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(1, cache.Reads); // Drain short-circuits the post-read Redis lookup.
+        Assert.Equal(IssuanceReadbacks + 1, cache.Reads); // Drain short-circuits the post-read Redis lookup.
 
         // Drain does not undo an earlier legitimate command or remove a
         // different guest's membership. Verify state directly, since
@@ -469,7 +472,7 @@ public sealed class LobbyMutationRevocationRaceTests
         // command was released. The result itself remains Active.
         cache.OnRead = count =>
         {
-            if (count == 2) drain.Start();
+            if (count == IssuanceReadbacks + 2) drain.Start();
         };
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         using var server = Server(cache, drain);
@@ -486,13 +489,13 @@ public sealed class LobbyMutationRevocationRaceTests
         var inFlight = actor.SendAsync(request, timeout.Token);
         await paused.Committed.Task.WaitAsync(timeout.Token);
         Assert.False(drain.IsDraining);
-        Assert.Equal(1, cache.Reads);
+        Assert.Equal(IssuanceReadbacks + 1, cache.Reads);
         paused.Release.TrySetResult(true);
 
         using var denied = await inFlight.WaitAsync(timeout.Token);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
         Assert.True(drain.IsDraining);
-        Assert.Equal(2, cache.Reads);
+        Assert.Equal(IssuanceReadbacks + 2, cache.Reads);
         Assert.True(denied.Headers.CacheControl?.NoStore == true);
         Assert.False(denied.Headers.Contains("Location"));
         Assert.False(denied.Headers.Contains("ETag"));
