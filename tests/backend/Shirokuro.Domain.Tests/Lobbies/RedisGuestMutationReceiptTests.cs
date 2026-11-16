@@ -22,6 +22,7 @@ public sealed class RedisGuestMutationReceiptTests
     {
         public string Mode { get; set; } = "valid";
         public bool LuaAllowed { get; set; } = true;
+        public long LuaOrdinal { get; set; } = 1;
         public int LuaCalls { get; private set; }
         public int ReceiptReads { get; private set; }
         public string? IssuedReceipt { get; private set; }
@@ -29,7 +30,7 @@ public sealed class RedisGuestMutationReceiptTests
         public RedisKey IssuedKey { get; private set; }
         public RedisKey ReadKey { get; private set; }
         public CancellationTokenSource? CancelAfterLua { get; set; }
-        public TaskCompletionSource<RedisValue> PendingReceipt { get; } =
+        public TaskCompletionSource<RedisResult> PendingReceipt { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
@@ -37,29 +38,43 @@ public sealed class RedisGuestMutationReceiptTests
             if (targetMethod?.Name == "ScriptEvaluateAsync" &&
                 targetMethod.ReturnType == typeof(Task<RedisResult>))
             {
-                LuaCalls++;
-                IssuedKey = ((RedisKey[])args![1]!)[0];
-                IssuedReceipt = ((RedisValue[])args[2]!)[2].ToString();
-                CancelAfterLua?.Cancel();
-                return Task.FromResult(RedisResult.Create(
-                    new RedisValue[] { LuaAllowed ? 1 : 0, 45_000 }));
-            }
-
-            if (targetMethod?.Name == "HashGetAsync" &&
-                targetMethod.ReturnType == typeof(Task<RedisValue>))
-            {
-                ReceiptReads++;
-                ReadKey = (RedisKey)args![0]!;
-                ReadReceipt = ((RedisValue)args[1]!).ToString();
-                return Mode switch
+                var values = (RedisValue[])args![2]!;
+                if (values.Length == 3)
                 {
-                    "missing" => Task.FromResult(RedisValue.Null),
-                    "wrong" => Task.FromResult((RedisValue)"other"),
-                    "stalled" => PendingReceipt.Task,
-                    "exception" => Task.FromException<RedisValue>(
-                        new IOException("Fake Redis connection detail")),
-                    _ => Task.FromResult((RedisValue)"1")
-                };
+                    LuaCalls++;
+                    IssuedKey = ((RedisKey[])args[1]!)[0];
+                    IssuedReceipt = values[2].ToString();
+                    CancelAfterLua?.Cancel();
+                    return Task.FromResult(RedisResult.Create(
+                        new RedisValue[] { LuaAllowed ? 1 : 0, 45_000,
+                                           LuaAllowed ? LuaOrdinal : 0 }));
+                }
+
+                if (values.Length == 4)
+                {
+                    ReceiptReads++;
+                    ReadKey = ((RedisKey[])args[1]!)[0];
+                    ReadReceipt = values[0].ToString();
+                    Assert.Contains("HLEN", (string)args[0]!);
+                    Assert.Contains("PTTL", (string)args[0]!);
+                    Assert.Equal(LuaOrdinal, (long)values[1]);
+                    Assert.Equal(12, (long)values[2]);
+                    Assert.Equal(RedisGuestMutationLimiter.WindowMilliseconds,
+                        (long)values[3]);
+                    return Mode switch
+                    {
+                        "missing" or "wrong" or "stale-count" or
+                            "missing-ttl" or "extended-ttl" or
+                            "invalid-cardinality" or "over-limit" =>
+                            Task.FromResult(RedisResult.Create(
+                                (RedisValue)0, ResultType.Integer)),
+                        "stalled" => PendingReceipt.Task,
+                        "exception" => Task.FromException<RedisResult>(
+                            new IOException("Fake Redis connection detail")),
+                        _ => Task.FromResult(RedisResult.Create(
+                            (RedisValue)1, ResultType.Integer))
+                    };
+                }
             }
             throw new InvalidOperationException("Unexpected test Redis command.");
         }
@@ -95,6 +110,11 @@ public sealed class RedisGuestMutationReceiptTests
     [Theory]
     [InlineData("missing")]
     [InlineData("wrong")]
+    [InlineData("stale-count")]
+    [InlineData("missing-ttl")]
+    [InlineData("extended-ttl")]
+    [InlineData("invalid-cardinality")]
+    [InlineData("over-limit")]
     [InlineData("exception")]
     public async Task LuaSuccessWithoutDurableReceiptNeverGrantsPermit(string mode)
     {
@@ -104,6 +124,20 @@ public sealed class RedisGuestMutationReceiptTests
                 .AcquireAsync(Policy, IPAddress.Loopback));
         Assert.Equal(1, proxy.LuaCalls);
         Assert.Equal(1, proxy.ReceiptReads);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(13)]
+    public async Task InvalidIssuedOrdinalCannotGrantPermitOrTriggerRead(long ordinal)
+    {
+        var (db, proxy) = Create("valid");
+        proxy.LuaOrdinal = ordinal;
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new RedisGuestMutationLimiter(db)
+                .AcquireAsync(Policy, IPAddress.Loopback));
+        Assert.Equal(1, proxy.LuaCalls);
+        Assert.Equal(0, proxy.ReceiptReads);
     }
 
     [Fact]
