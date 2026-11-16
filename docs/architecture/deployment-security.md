@@ -3345,3 +3345,49 @@ cross-replica, ingress multipod o failover reale (#21).
 SUCCESS 3/3 sul codice `64a7d18`: 838 xUnit standard,
 21 Redis TLS/ACL/HA/Sentinel, smoke Linux SIGUSR1,
 347 Vitest, 43 Playwright, 35 Python e build.
+
+
+## Conferma atomica di stanza e indici di quota nella creazione PvP — #181
+
+La creazione di una stanza tramite `RedisLobbySnapshotStore.CreateBoundedAsync`
+esegue un Lua `BoundedCreateScript` che applica le quote globali/per creator,
+installa il record della stanza e scrive entrambi gli indici nello **stesso
+hash slot Redis**. Un risultato `1` del primo Lua, tuttavia, non prova da
+solo la persistenza delle tre scritture in presenza di adapter difettoso,
+failover o conferma di rete ambigua. Prima della #181 un `201 Created`
+poteva promettere una room inesistente o senza indici di capacità.
+
+Da #181, **solo dopo un risultato create = 1** viene eseguito un secondo
+Lua di sola lettura, sulla **stessa connessione e namespace**, che:
+confronta byte-per-byte lo snapshot della stanza con il payload che il
+server aveva appena inviato; verifica con `ZSCORE` che la stessa room key
+sia membro degli indici **globale e del creator**; richiede che entrambi gli
+score corrispondano a `PEXPIRETIME` della room calcolato da Redis stesso.
+Non restituisce mai raw roster, token, id dell'attore o invito alla .NET
+application; il risultato è un semplice flag numerico.
+
+Il Lua di creazione e quello di conferma condividono **un deadline
+complessivo di 2 secondi**, con verifica cancellazione prima del secondo
+dispatch. Stato incompleto, indice mancante/stale, record cambiato,
+read-back fallito o timeout fanno fallire la creazione con
+`LobbyCreationUnavailableException`, *senza ripetere una mutation incerta*.
+L'endpoint Production rende **503/no-store**, senza Location/roster
+riservato e senza dettagli Redis, non `409 lobby_state_conflict`.
+Restano **409** i veri conflitti di revisione, **429** le quote,
+**404** gli accessi non autorizzati, ed è intatto il fence anti-revoca.
+Il tentativo fallito può aver lasciato un orphan room che avrà il TTL
+esistente: non viene dichiarato inesistente né cancellato arbitrariamente.
+
+Regressioni xUnit con `IDatabase DispatchProxy` verificano 17 casi
+inclusi tutti i read-back parziali, readback fermo/errore, cancellazione,
+collisione/quota/fence, successo e Production TestServer 503→201 con
+cookie firmato; le suite Redis reali TLS/ACL/HA/Sentinel validano gli
+script contro Redis vero. Nessuna modifica alle regole PvP.
+Questo read-back prova lo stato osservato sul connector, **non** una
+commit guarantee fra repliche o una prova di failover staging multi-pod;
+parent #21 resta aperta.
+
+[CI implementativa #43932571497](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/43932571497)
+**SUCCESS 3/3** su `3bbbd80`: 855 xUnit standard,
+21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest,
+43 Playwright, 35 Python e build.

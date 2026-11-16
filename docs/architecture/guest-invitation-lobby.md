@@ -210,3 +210,23 @@ reset on success; browser Playwright checks unchanged 304, 503, delayed
 next GET, then 404/401 with no background mutation. This reduces
 pressure during Redis failover but does not replace observability,
 monitoring and HA deployment requirements in #21.
+
+
+## Verifica di creazione lobby Production prima del 201 — #181
+
+La room con iniziale quota Redis atomica viene restituita al browser
+**solo dopo** che un Lua read-only conferma lo snapshot esatto e la
+presenza della stessa room nei due indici quota (globale e creator).
+Ogni indice deve condividere l'expiry assoluta Redis della room:
+una entry mancante o stale non è un nuovo invito valido.
+Create e conferma condividono un solo budget di 2s e il check
+non incrementa revisioni, rinnova TTL o scrive stato.
+
+Su fallimento della conferma la risposta è un generico
+**503/no-store** senza invito/Location né roster, non un
+`409` da interpretare come conflitto gameplay. Una ripetizione
+della richiesta utente può allocare una *diversa* stanza: non viene
+eseguito alcun retry nascosto in caso di esito Redis incerto.
+Quote, team, eroi e sessioni guest non cambiano. Il controllo non
+dimostra atomicità cross-replica, né la produzione con ingress
+multi-pod non ancora verificata dalla #21.
