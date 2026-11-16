@@ -737,6 +737,203 @@ public sealed class RedisTlsProductionTestsKestrel
     }
 
     [Fact]
+    public async Task RealNginxSignedGuestCookieAffinityPreservesNegotiateAndWssUpgrade()
+    {
+        var redis = Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_TLS");
+        if (string.IsNullOrWhiteSpace(redis))
+            return; // Only the Redis TLS + Docker CI job runs this test.
+        var certs = Environment.GetEnvironmentVariable("SHIROKURO_TLS_CERT_DIR");
+        Assert.False(string.IsNullOrWhiteSpace(certs));
+        Assert.True(File.Exists(Path.Combine(certs!, "ca.crt")));
+        Assert.True(File.Exists(Path.Combine(certs!, "server.crt")));
+        Assert.True(File.Exists(Path.Combine(certs!, "server.key")));
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(150));
+        var scratch = Directory.CreateTempSubdirectory("shirokuro-nginx-affinity-ci-");
+        try
+        {
+            var pfx = Path.Combine(scratch.FullName, "kestrel.pfx");
+            var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+            using (var pem = X509Certificate2.CreateFromPemFile(
+                       Path.Combine(certs!, "server.crt"),
+                       Path.Combine(certs, "server.key")))
+                File.WriteAllBytes(pfx, pem.Export(X509ContentType.Pkcs12, password));
+            if (OperatingSystem.IsLinux())
+                File.SetUnixFileMode(pfx, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+            var portA = ReserveUnusedLoopbackPort();
+            var portB = ReserveUnusedLoopbackPort();
+            while (portB == portA)
+                portB = ReserveUnusedLoopbackPort();
+            var edgePort = ReserveUnusedLoopbackPort();
+            while (edgePort == portA || edgePort == portB)
+                edgePort = ReserveUnusedLoopbackPort();
+
+            var api = ApiAssembly();
+            var dp = TestDataProtectionConfiguration.Values;
+            await using var nodeA = StartKestrel(portA, api, pfx,
+                password, dp, redis, trustedEdgePort: edgePort);
+            using var directA = Http(portA);
+            await ReadyAsync(directA, nodeA, timeout.Token);
+            // Serialize DP-key initialization across distinct processes.
+            var (alice, aliceCookie) = await LoginAsync(directA, timeout.Token);
+            await using var nodeB = StartKestrel(portB, api, pfx,
+                password, dp, redis, trustedEdgePort: edgePort);
+            using var directB = Http(portB);
+            await ReadyAsync(directB, nodeB, timeout.Token);
+
+            await using var nginx = await StartNginxAsync(
+                edgePort, portA, portB, certs!, scratch.FullName,
+                timeout.Token, affinityByGuestCookie: true);
+            using var edge = Http(edgePort);
+            using (var ready = await edge.GetAsync("/api/ready", timeout.Token))
+                Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
+
+            var (bob, bobCookie) = await LoginAsync(edge, timeout.Token);
+            Assert.True(!string.Equals(alice, bob, StringComparison.Ordinal),
+                "Two guests must have independent signed sessions.");
+            using var aliceEdge = Http(edgePort, aliceCookie);
+            using var bobEdge = Http(edgePort, bobCookie);
+            using var aliceWithUnrelatedCookie =
+                Http(edgePort, aliceCookie + "; unrelated=test-cookie");
+
+            var (aliceToken, aliceUpstream) = await NegotiateThroughEdgeAsync(
+                aliceEdge, timeout.Token);
+            var (bobToken, bobUpstream) = await NegotiateThroughEdgeAsync(
+                bobEdge, timeout.Token);
+            var (extraCookieToken, extraCookieUpstream) = await NegotiateThroughEdgeAsync(
+                aliceWithUnrelatedCookie, timeout.Token);
+
+            // An unrelated Cookie entry cannot change Alice's route.
+            // Nginx hashes only the Shirokuro.Session ticket, NOT the
+            // entire Cookie header or a client-supplied node hint.
+            Assert.Equal(aliceUpstream, extraCookieUpstream);
+            var upstreams = new HashSet<string>(StringComparer.Ordinal)
+            {
+                $"127.0.0.1:{portA}", $"127.0.0.1:{portB}"
+            };
+            Assert.Contains(aliceUpstream, upstreams);
+            Assert.Contains(bobUpstream, upstreams);
+
+            // This invocation now uses a *negotiated* SignalR token,
+            // unlike #167's WebSocket-only/skip-negotiation route.
+            using var aliceSocket = await NegotiatedWssAsync(
+                edgePort, aliceCookie, aliceToken, timeout.Token);
+            using var aliceExtraSocket = await NegotiatedWssAsync(
+                edgePort, aliceCookie + "; unrelated=test-cookie",
+                extraCookieToken, timeout.Token);
+            using var bobSocket = await NegotiatedWssAsync(
+                edgePort, bobCookie, bobToken, timeout.Token);
+
+            string room;
+            using (var create = Mutation(HttpMethod.Post, aliceEdge,
+                       "/api/lobbies",
+                       new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+            using (var created = await aliceEdge.SendAsync(create, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+                using var json = JsonDocument.Parse(
+                    await created.Content.ReadAsStringAsync(timeout.Token));
+                room = json.RootElement.GetProperty("lobbyId").GetString()!;
+            }
+
+            var denied = await RosterAsync(
+                bobSocket, room, "affinity-outsider", timeout.Token);
+            var absent = await RosterAsync(bobSocket,
+                "room-00000000000000000000000000000000",
+                "affinity-missing", timeout.Token);
+            AssertOpaque(denied, room, alice, bob);
+            AssertOpaque(absent, room, alice, bob);
+            Assert.Equal(denied.GetProperty("error").GetString(),
+                absent.GetProperty("error").GetString());
+
+            using (var join = Mutation(HttpMethod.Post, bobEdge,
+                       "/api/lobbies/" + room + "/join",
+                       new { teamId = "black", expectedRevision = 1L }))
+            using (var joined = await bobEdge.SendAsync(join, timeout.Token))
+                Assert.Equal(HttpStatusCode.OK, joined.StatusCode);
+
+            foreach (var (socket, invocation) in new[]
+            {
+                (aliceSocket, "affinity-alice"),
+                (aliceExtraSocket, "affinity-alice-extra"),
+                (bobSocket, "affinity-bob")
+            })
+            {
+                var completion = await RosterAsync(
+                    socket, room, invocation, timeout.Token);
+                Assert.False(completion.TryGetProperty("error", out _),
+                    "Authenticated negotiated WSS may read member-only roster.");
+                var roster = completion.GetProperty("result");
+                Assert.True(string.Equals(
+                    room, roster.GetProperty("lobbyId").GetString(),
+                    StringComparison.Ordinal),
+                    "Negotiated WSS must return the authorized room only.");
+                Assert.Equal(2L, roster.GetProperty("revision").GetInt64());
+                var members = roster.GetProperty("participants").EnumerateArray()
+                    .Select(x => x.GetProperty("playerId").GetString()).ToArray();
+                Assert.Equal(2, members.Length);
+                Assert.True(members.Contains(alice, StringComparer.Ordinal) &&
+                            members.Contains(bob, StringComparer.Ordinal),
+                    "Negotiated WSS must only show the current members.");
+            }
+
+            // Auth is not cached by Nginx affinity: a real logout on the
+            // edge makes *existing* negotiated SignalR sockets deny reads.
+            using (var logout = Mutation(
+                       HttpMethod.Delete, aliceEdge, "/api/sessions/guest"))
+            using (var signedOut = await aliceEdge.SendAsync(logout, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
+                Assert.True(signedOut.Headers.CacheControl?.NoStore == true);
+            }
+
+            AssertOpaque(await RosterAsync(aliceSocket,
+                room, "affinity-alice-revoked", timeout.Token), room, alice, bob);
+            AssertOpaque(await RosterAsync(aliceExtraSocket,
+                room, "affinity-extra-revoked", timeout.Token), room, alice, bob);
+            foreach (var client in new[] { aliceEdge, Http(portA, aliceCookie),
+                         Http(portB, aliceCookie) })
+            {
+                using (client == aliceEdge ? null : client)
+                using (var session = await client.GetAsync(
+                    "/api/sessions/me", timeout.Token))
+                {
+                    Assert.Equal(HttpStatusCode.Unauthorized, session.StatusCode);
+                    Assert.True(session.Headers.CacheControl?.NoStore == true);
+                }
+            }
+            using (var rejected = Mutation(HttpMethod.Post, aliceEdge,
+                       "/hubs/lobbies/negotiate?negotiateVersion=1"))
+            using (var response = await aliceEdge.SendAsync(rejected, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+                Assert.True(response.Headers.CacheControl?.NoStore == true);
+                Assert.False(response.Headers.Contains("Set-Cookie"));
+            }
+
+            var surviving = await RosterAsync(
+                bobSocket, room, "affinity-survivor", timeout.Token);
+            Assert.False(surviving.TryGetProperty("error", out _));
+            var survivor = surviving.GetProperty("result");
+            Assert.Equal(3L, survivor.GetProperty("revision").GetInt64());
+            Assert.True(string.Equals(
+                bob, Assert.Single(survivor.GetProperty("participants")
+                    .EnumerateArray()).GetProperty("playerId").GetString(),
+                StringComparison.Ordinal), "Surviving negotiated socket must only see Bob.");
+            Assert.False(surviving.GetRawText().Contains(alice, StringComparison.Ordinal),
+                "Survivor view must not disclose the revoked player.");
+            using var bobStillActive = await bobEdge.GetAsync(
+                "/api/sessions/me", timeout.Token);
+            Assert.Equal(HttpStatusCode.OK, bobStillActive.StatusCode);
+        }
+        finally
+        {
+            Directory.Delete(scratch.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task TwoRealProductionKestrelProcessesShareTlsGuestSessionsAndWssRevocation()
     {
         var redis = Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS_TLS");
