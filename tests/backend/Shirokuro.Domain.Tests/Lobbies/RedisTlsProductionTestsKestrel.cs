@@ -336,7 +336,7 @@ public sealed class RedisTlsProductionTestsKestrel
         // All headers from a possible hostile client are REPLACED, not
         // appended. X-Forwarded-Host is explicitly cleared, never trusted.
         // Never write access logs/cookies or private request URLs to disk.
-        File.WriteAllText(config, $"""
+        File.WriteAllText(config, """
         worker_processes 1;
         pid /tmp/shirokuro-nginx.pid;
         events { worker_connections 256; }
@@ -349,11 +349,11 @@ public sealed class RedisTlsProductionTestsKestrel
                 '' close;
             }
             upstream shirokuro_backend {
-                server 127.0.0.1:{{nodeA}};
-                server 127.0.0.1:{{nodeB}};
+                server 127.0.0.1:@@NODE_A@@;
+                server 127.0.0.1:@@NODE_B@@;
             }
             server {
-                listen 127.0.0.1:{{edgePort}} ssl;
+                listen 127.0.0.1:@@EDGE_PORT@@ ssl;
                 server_name localhost;
                 ssl_certificate /certs/server.crt;
                 ssl_certificate_key /certs/server.key;
@@ -381,13 +381,15 @@ public sealed class RedisTlsProductionTestsKestrel
                 }
             }
         }
-        """);
+        """.Replace("@@NODE_A@@", nodeA.ToString(System.Globalization.CultureInfo.InvariantCulture))
+           .Replace("@@NODE_B@@", nodeB.ToString(System.Globalization.CultureInfo.InvariantCulture))
+           .Replace("@@EDGE_PORT@@", edgePort.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         var name = "shirokuro-nginx-ci-" + Guid.NewGuid().ToString("N")[..12];
         var ok = await DockerAsync([
             "run", "-d", "--rm",
             "--network", "host", "--name", name,
             "--log-driver", "none",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--security-opt", "no-new-privileges",
             "-v", config + ":/etc/nginx/nginx.conf:ro",
             "-v", certificates + ":/certs:ro",
             "nginx:1.27-alpine"
