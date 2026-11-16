@@ -234,6 +234,7 @@ public static class MultiplayerMetrics
         {
             ReadinessProbeStage.Success => "ok",
             ReadinessProbeStage.RedisWrite => "redis-write",
+            ReadinessProbeStage.LobbyRead => "lobby-read",
             ReadinessProbeStage.SessionRead => "session-read",
             ReadinessProbeStage.KeyRing => "key-ring",
             ReadinessProbeStage.Timeout => "timeout",
@@ -384,6 +385,7 @@ public enum ReadinessProbeStage
 {
     Success,
     RedisWrite,
+    LobbyRead,
     SessionRead,
     KeyRing,
     Timeout

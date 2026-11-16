@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -322,6 +323,144 @@ public sealed class DeploymentReadinessTests
         Assert.Equal(2, store.StoredKeyCount);
         Assert.Equal(2, store.Writes);
         Assert.Equal(2, store.Reads);
+    }
+
+
+    // A deterministic fake lobby connector: the guest cache remains healthy
+    // while an acknowledged Redis SET can fail to persist or a GET can fail.
+    // This is impossible to model with a normally healthy Redis service.
+    public class FaultyLobbyDatabase : DispatchProxy
+    {
+        private readonly ConcurrentDictionary<string, string> _values =
+            new(StringComparer.Ordinal);
+        private readonly ConcurrentQueue<string> _attemptedNonces = new();
+        private int _reads;
+        private int _writes;
+        public int Reads => Volatile.Read(ref _reads);
+        public int Writes => Volatile.Read(ref _writes);
+        public string[] AttemptedNonces => _attemptedNonces.ToArray();
+        public bool IgnoreWrites { get; set; }
+        public string ReadFault { get; set; } = "";
+        public TaskCompletionSource<RedisValue> BlockedRead { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            if (method?.Name == "StringSetAsync" &&
+                method.ReturnType == typeof(Task<bool>))
+            {
+                var key = args![0]!.ToString()!;
+                var value = args[1]!.ToString()!;
+                Assert.StartsWith("shirokuro:readiness:write-probe-v3:", key);
+                Assert.Matches("^[0-9a-f]{32}$", value);
+                Assert.Equal(TimeSpan.FromSeconds(10),
+                    Assert.IsType<TimeSpan>(args[2]));
+                _attemptedNonces.Enqueue(value);
+                Interlocked.Increment(ref _writes);
+                if (!IgnoreWrites) _values[key] = value;
+                return Task.FromResult(true); // Pretend SET succeeded.
+            }
+            if (method?.Name == "StringGetAsync" &&
+                method.ReturnType == typeof(Task<RedisValue>))
+            {
+                var key = args![0]!.ToString()!;
+                Interlocked.Increment(ref _reads);
+                return ReadFault switch
+                {
+                    "missing" => Task.FromResult(RedisValue.Null),
+                    "corrupt" => Task.FromResult((RedisValue)"wrong-nonce"),
+                    "throw" => Task.FromException<RedisValue>(
+                        new IOException("secret lobby Redis endpoint")),
+                    "blocked" => BlockedRead.Task,
+                    _ => Task.FromResult(_values.TryGetValue(key, out var stored)
+                        ? (RedisValue)stored : RedisValue.Null)
+                };
+            }
+            throw new InvalidOperationException(
+                "Unexpected Redis command in readiness test: " + method?.Name);
+        }
+    }
+
+    public class FaultyLobbyMultiplexer : DispatchProxy
+    {
+        public IDatabase? Database { get; set; }
+        protected override object? Invoke(MethodInfo? method, object?[]? args) =>
+            method?.Name switch
+            {
+                "GetDatabase" => Database ?? throw new InvalidOperationException(),
+                "Dispose" => null,
+                _ => throw new InvalidOperationException(
+                    "Unexpected lobby connection method: " + method?.Name)
+            };
+    }
+
+    private static (IConnectionMultiplexer Connection, FaultyLobbyDatabase Database)
+        FakeLobbyConnector()
+    {
+        var database = DispatchProxy.Create<IDatabase, FaultyLobbyDatabase>();
+        var connection = DispatchProxy.Create<IConnectionMultiplexer,
+            FaultyLobbyMultiplexer>();
+        ((FaultyLobbyMultiplexer)(object)connection).Database = database;
+        return (connection, (FaultyLobbyDatabase)(object)database);
+    }
+
+    [Theory]
+    [InlineData("ignored")]
+    [InlineData("missing")]
+    [InlineData("corrupt")]
+    [InlineData("throw")]
+    [InlineData("blocked")]
+    public async Task LobbyReadbackDeniesAcknowledgedButUnconfirmedWritesAndRecovers(
+        string fault)
+    {
+        var (redis, lobby) = FakeLobbyConnector();
+        var sessions = new ToggleSessionStore();
+        var clock = new ManualClock();
+        using var server = Production(redis, sessions, clock);
+        using var client = Client(server);
+        using var metrics = new MultiplayerMetricCapture();
+
+        using (var ready = await client.GetAsync("/api/ready"))
+            await AssertStatus(ready, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, sessions.Reads);
+        Assert.Equal(1, sessions.Writes);
+        Assert.Equal(1, lobby.Reads);
+        Assert.Equal(1, lobby.Writes);
+        var originalNonce = Assert.Single(lobby.AttemptedNonces);
+
+        lobby.IgnoreWrites = fault == "ignored";
+        lobby.ReadFault = fault == "ignored" ? "" : fault;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var unavailable = await client.GetAsync("/api/ready")
+            .WaitAsync(TimeSpan.FromSeconds(8)))
+            await AssertStatus(unavailable,
+                HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(2, lobby.Reads);
+        Assert.Equal(2, lobby.Writes);
+        Assert.NotEqual(originalNonce, lobby.AttemptedNonces[1]);
+        Assert.Equal(2, sessions.Writes);
+        Assert.Equal(1, sessions.Reads); // Lobby failed before guest read.
+        if (fault == "blocked")
+            Assert.False(lobby.BlockedRead.Task.IsCompleted);
+
+        using (var alive = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, alive.StatusCode);
+        Assert.Contains(metrics.ForDurations(
+            MultiplayerMetrics.ReadinessDurationSecondsName),
+            duration => duration.Tags["stage"] ==
+                (fault == "blocked" ? "timeout" : "lobby-read") &&
+                duration.Tags["outcome"] == "unavailable");
+
+        lobby.IgnoreWrites = false;
+        lobby.ReadFault = "";
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(3, lobby.Reads);
+        Assert.Equal(3, lobby.Writes);
+        Assert.Equal(2, sessions.Reads);
+        Assert.Equal(3, sessions.Writes);
+        Assert.Equal(3, lobby.AttemptedNonces.Distinct().Count());
     }
 
     [Fact]

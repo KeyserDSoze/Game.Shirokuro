@@ -121,14 +121,17 @@ public sealed class RedisDeploymentReadiness(
         {
             // PING/GET alone would incorrectly report read-only replicas
             // ready. Both independent Production connectors must be writable.
-            // A fresh nonce prevents an old cache result from certifying a
-            // silently ignored SET; other nodes use distinct probe keys.
-            // The nonce is technical only and is never logged or returned.
-            var nonce = RandomNumberGenerator.GetBytes(16);
-            Task<bool> lobbyWrite = redis.GetDatabase().StringSetAsync(
-                _lobbyProbeKey, "1", expiry: ProbeTtl);
+            // A fresh nonce for EACH connector prevents an old probe from
+            // certifying a silently ignored write. Neither value or key is
+            // logged, returned to the browser, or used as session authority.
+            var sessionNonce = RandomNumberGenerator.GetBytes(16);
+            var lobbyNonce = Convert.ToHexStringLower(
+                RandomNumberGenerator.GetBytes(16));
+            var lobbyDb = redis.GetDatabase();
+            Task<bool> lobbyWrite = lobbyDb.StringSetAsync(
+                _lobbyProbeKey, lobbyNonce, expiry: ProbeTtl);
             Task cacheWrite = guestSessions.SetAsync(
-                _cacheProbeKey, nonce,
+                _cacheProbeKey, sessionNonce,
                 new DistributedCacheEntryOptions
                 {
                     AbsoluteExpirationRelativeToNow = ProbeTtl
@@ -137,10 +140,21 @@ public sealed class RedisDeploymentReadiness(
             if (!await lobbyWrite)
                 throw new InvalidOperationException("Lobby probe write denied.");
 
+            // StringSetAsync(true) is only an acknowledgement: confirm the
+            // precise new value on the lobby connector as well. In particular
+            // a stale replica/read or an adapter dropping writes must not
+            // advertise this node as writable.
+            stage = ReadinessProbeStage.LobbyRead;
+            var observedLobby = await lobbyDb.StringGetAsync(_lobbyProbeKey)
+                .WaitAsync(timeout.Token);
+            if (!string.Equals((string?)observedLobby, lobbyNonce,
+                    StringComparison.Ordinal))
+                throw new InvalidOperationException("Lobby probe write unreadable.");
+
             stage = ReadinessProbeStage.SessionRead;
             var observed = await guestSessions.GetAsync(
                 _cacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
-            if (observed is null || !observed.AsSpan().SequenceEqual(nonce))
+            if (observed is null || !observed.AsSpan().SequenceEqual(sessionNonce))
                 throw new InvalidOperationException("Session probe write unreadable.");
 
             // The configured, shared encrypted key ring must be usable too.
