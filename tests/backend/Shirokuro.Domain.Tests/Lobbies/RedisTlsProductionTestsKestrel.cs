@@ -505,6 +505,31 @@ public sealed class RedisTlsProductionTestsKestrel
         Assert.Fail("Both Kestrel backends must serve HTTPS through real nginx.");
     }
 
+    private static async Task WaitForNginxEdgeReadyAsync(
+        HttpClient edge, ChildProcess a, ChildProcess b, CancellationToken token)
+    {
+        // A successful detached docker run precedes the nginx master
+        // binding its loopback listener. Do not race the first request.
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.False(a.HasExited || b.HasExited,
+                "An isolated backend process exited before ingress readiness.");
+            try
+            {
+                using var response = await edge.GetAsync("/api/ready", token);
+                if (response.StatusCode == HttpStatusCode.OK)
+                {
+                    Assert.True(response.Headers.CacheControl?.NoStore == true);
+                    return;
+                }
+            }
+            catch (HttpRequestException) { } // nginx not listening yet.
+            await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+        }
+        Assert.Fail("The cookie-affinity nginx edge did not become ready.");
+    }
+
     [Fact]
     public async Task RealNginxTlsEdgeBalancesProductionKestrelHttpAndPrivateWss()
     {
@@ -786,8 +811,8 @@ public sealed class RedisTlsProductionTestsKestrel
                 edgePort, portA, portB, certs!, scratch.FullName,
                 timeout.Token, affinityByGuestCookie: true);
             using var edge = Http(edgePort);
-            using (var ready = await edge.GetAsync("/api/ready", timeout.Token))
-                Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
+            await WaitForNginxEdgeReadyAsync(
+                edge, nodeA, nodeB, timeout.Token);
 
             var (bob, bobCookie) = await LoginAsync(edge, timeout.Token);
             Assert.True(!string.Equals(alice, bob, StringComparison.Ordinal),
