@@ -260,15 +260,22 @@ check/increment: a fixed 60-second TTL starting on the first request
 is never extended by later successful or rejected requests.
 Since #184, the versioned `v2` Redis bucket is a hash containing a
 validated `count` and one cryptographically random, request-specific
-`proof:` field per admitted action. Each positive Lua reply must be
-confirmed by `HGET` of **that exact receipt** on the same Redis
-connection before a permit is granted. Concurrent nodes leave each
-other's receipts intact; a lost write, missing/altered read, timeout or
-cancellation fails closed with 503/no-store. The script and read-back
-share one 2-second deadline; no automatic retry/reimbursement is made
-when a command might already have consumed quota. Denied 429 requests
-create no receipt and do not perform the read-back. Receipts hold no
-guest token, IP, invite or room ID and expire with the bucket.
+`proof:` field per admitted action. #185 closes the partial-write gap:
+the mutating Lua checks `HLEN == count + 1` before every increment.
+A positive result includes the resulting ordinal. A second **read-only
+Lua** script atomically verifies the exact receipt, canonical count
+`>= ordinal` and `<= policy limit`, matching `HLEN`, and a valid
+remaining 1–60s TTL. A count higher than the original ordinal is valid
+when another node has concurrently consumed a permit. Receipt-only
+writes, stale counters, missing/extra proof fields, lost TTL, malformed
+hashes or read-back failures cannot produce an authenticated admission.
+The two Lua calls use the SAME connector and share one 2-second
+deadline. Neither read nor deny requests extend the fixed window;
+denied 429 requests never perform the confirmation. No automatic
+retry/refund is made when a Lua mutation might have consumed quota.
+All errors fail closed as 503/no-store, with no cookie or new room.
+Receipts hold no guest token, IP, invite or room ID and expire with
+the bucket; client output never includes the ordinal or receipt.
 The v2 namespace intentionally differs from v1 string counters; a
 **rolling mixed-version rollout would have independent quotas** and
 must be avoided or externally gated. Real deployment coordination,
