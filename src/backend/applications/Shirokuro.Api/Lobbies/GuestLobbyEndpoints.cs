@@ -123,9 +123,22 @@ public static class GuestLobbyEndpoints
         HttpContext context, Func<Task<LobbyRosterView>> execute, bool created = false)
     {
         var roster = await execute();
+        // preStop may begin while the awaited command is committing in Redis.
+        // A draining node cannot publish even a previously authorized roster
+        // or the freshly created room's Location. Avoid a guest Redis read
+        // entirely when the drain is already observable after the command.
+        var drain = context.RequestServices
+            .GetRequiredService<IReadinessDrainSignal>();
+        if (drain.IsDraining)
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
         var status = await context.RequestServices
             .GetRequiredService<GuestSessionRegistry>()
             .CheckAuthorityAsync(context.User, context.RequestAborted);
+        // preStop can also begin during the second, awaited authority check.
+        // An Active ticket is NOT permission to emit bytes after node drain.
+        if (drain.IsDraining)
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         if (status != GuestSessionAuthorityStatus.Active)
             return Results.StatusCode(
                 status == GuestSessionAuthorityStatus.Inactive
