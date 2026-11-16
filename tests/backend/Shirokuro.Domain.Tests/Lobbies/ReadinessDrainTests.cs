@@ -121,6 +121,52 @@ public sealed class ReadinessDrainTests
     }
 
     [Fact]
+    public void HostShutdownWithoutPreStopDoesNotPublishPreStopEvent()
+    {
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var notification = (IPreStopDrainNotification)signal;
+        var callbacks = 0;
+        using var registration = notification.PreStopStarted.Register(
+            () => Interlocked.Increment(ref callbacks));
+
+        Assert.False(signal.IsDraining);
+        Assert.False(notification.PreStopStarted.IsCancellationRequested);
+        lifetime.StopApplication();
+
+        Assert.True(signal.IsDraining); // Host shutdown always drains.
+        Assert.False(notification.PreStopStarted.IsCancellationRequested);
+        Assert.Equal(0, callbacks); // Never implies preStop itself fired.
+    }
+
+    [Fact]
+    public void PreStopTransitionNotifiesSubscribersExactlyOnce()
+    {
+        using var lifetime = new FakeLifetime();
+        using var signal = new HostLifetimeReadinessDrainSignal(lifetime);
+        var notification = (IPreStopDrainNotification)signal;
+        var callbacks = 0;
+        using var registration = notification.PreStopStarted.Register(
+            () => Interlocked.Increment(ref callbacks));
+
+        signal.BeginPreStopDrain();
+        Assert.True(signal.IsDraining);
+        Assert.True(notification.PreStopStarted.IsCancellationRequested);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+        Assert.Equal(1, callbacks);
+
+        signal.BeginPreStopDrain();
+        lifetime.StopApplication();
+        Assert.Equal(1, callbacks);
+        Assert.True(signal.IsDraining);
+
+        // Subscribers installed after the transition cannot miss it.
+        using var late = notification.PreStopStarted.Register(
+            () => Interlocked.Increment(ref callbacks));
+        Assert.Equal(2, callbacks);
+    }
+
+    [Fact]
     public void PreStopIsMonotonicAndDoesNotTriggerHostShutdown()
     {
         using var lifetime = new FakeLifetime();
