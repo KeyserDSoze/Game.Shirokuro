@@ -1,4 +1,13 @@
+using System.IO;
+using System.Net;
+using System.Reflection;
 using System.Security.Cryptography;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using System.Text;
 using Shirokuro.Api.Lobbies;
 using Shirokuro.Api.Security;
@@ -128,6 +137,220 @@ public sealed class RedisGuestRevocationFenceTests
         Assert.Equal(1, await first.RemovePlayerFromAllRoomsAsync(owner));
         Assert.Null(await index.ReadAsync(initial.LobbyId));
         Assert.NotNull(await index.ReadAsync(other.LobbyId));
+    }
+
+
+    /// <summary>
+    /// This deterministic Redis double reports completed SET NX even when
+    /// the write is discarded. Real healthy Redis cannot model this fault.
+    /// No player ID, token or key is ever included in exception text.
+    /// </summary>
+    public class FaultyFenceDatabase : DispatchProxy
+    {
+        private readonly Dictionary<string, (string Marker, TimeSpan? Ttl)> _stored =
+            new(StringComparer.Ordinal);
+        public bool IgnoreWrites { get; set; }
+        public bool FalseWithoutKey { get; set; }
+        public string ReadFault { get; set; } = "";
+        public int SetCalls { get; private set; }
+        public int GetCalls { get; private set; }
+        public int SuccessfulWrites { get; private set; }
+        public string? LastKey { get; private set; }
+        public TimeSpan? LastWrittenTtl { get; private set; }
+        public TaskCompletionSource<RedisValue> PendingRead { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            if (method?.Name == "StringSetAsync" &&
+                method.ReturnType == typeof(Task<bool>))
+            {
+                SetCalls++;
+                var key = args![0]!.ToString()!;
+                var marker = args[1]!.ToString()!;
+                var ttl = (TimeSpan?)args[2];
+                var when = (When)args[3]!;
+                LastKey = key;
+                if (FalseWithoutKey)
+                    return Task.FromResult(false);
+                if (_stored.ContainsKey(key) && when == When.NotExists)
+                    return Task.FromResult(false);
+                if (!IgnoreWrites)
+                {
+                    _stored[key] = (marker, ttl);
+                    LastWrittenTtl = ttl;
+                    SuccessfulWrites++;
+                }
+                return Task.FromResult(true);
+            }
+            if (method?.Name == "StringGetAsync" &&
+                method.ReturnType == typeof(Task<RedisValue>))
+            {
+                GetCalls++;
+                var key = args![0]!.ToString()!;
+                return ReadFault switch
+                {
+                    "missing" => Task.FromResult(RedisValue.Null),
+                    "corrupt" => Task.FromResult((RedisValue)"corrupt"),
+                    "throw" => Task.FromException<RedisValue>(
+                        new IOException("secret Redis host and credentials")),
+                    "blocked" => PendingRead.Task,
+                    _ => Task.FromResult(_stored.TryGetValue(key, out var record)
+                        ? (RedisValue)record.Marker : RedisValue.Null)
+                };
+            }
+            throw new InvalidOperationException(
+                "Unexpected fence test Redis operation.");
+        }
+
+        public string? ReadStoredMarker(string key) =>
+            _stored.TryGetValue(key, out var record) ? record.Marker : null;
+    }
+
+    private static (IDatabase Database, FaultyFenceDatabase Fake)
+        SimulatedFenceStore()
+    {
+        var database = DispatchProxy.Create<IDatabase, FaultyFenceDatabase>();
+        return (database, (FaultyFenceDatabase)(object)database);
+    }
+
+    [Theory]
+    [InlineData("ignored")]
+    [InlineData("false-without-key")]
+    [InlineData("missing")]
+    [InlineData("corrupt")]
+    [InlineData("throw")]
+    [InlineData("blocked")]
+    public async Task FenceRequiresConfirmedMarkerAndRecoversWithoutSlidingTtl(
+        string fault)
+    {
+        var (database, fake) = SimulatedFenceStore();
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var player = GuestSessions.NewPlayerId();
+        fake.IgnoreWrites = fault == "ignored";
+        fake.FalseWithoutKey = fault == "false-without-key";
+        fake.ReadFault = fault is "ignored" or "false-without-key" ? "" : fault;
+
+        var pending = store.FenceGuestAsync(player);
+        Assert.Same(pending, await Task.WhenAny(
+            pending, Task.Delay(TimeSpan.FromSeconds(8))));
+        var failure = await Record.ExceptionAsync(() => pending);
+        Assert.NotNull(failure);
+        Assert.DoesNotContain(player, failure.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("secret Redis", failure.ToString(), StringComparison.Ordinal);
+        Assert.Equal(1, fake.SetCalls);
+        Assert.Equal(1, fake.GetCalls);
+        Assert.StartsWith("shirokuro:lobby:{rooms}:v2:revoked:", fake.LastKey!);
+        Assert.DoesNotContain(player, fake.LastKey!, StringComparison.Ordinal);
+        if (fault == "blocked")
+            Assert.False(fake.PendingRead.Task.IsCompleted);
+
+        fake.IgnoreWrites = false;
+        fake.FalseWithoutKey = false;
+        fake.ReadFault = "";
+        await store.FenceGuestAsync(player);
+        Assert.Equal("1", fake.ReadStoredMarker(fake.LastKey!));
+        Assert.Equal(RedisLobbySnapshotStore.RevocationFenceTtl,
+            fake.LastWrittenTtl);
+        var written = fake.SuccessfulWrites;
+        await store.FenceGuestAsync(player); // Existing marker: NX=false.
+        Assert.Equal(written, fake.SuccessfulWrites);
+        Assert.Equal(RedisLobbySnapshotStore.RevocationFenceTtl,
+            fake.LastWrittenTtl);
+        Assert.Equal(3, fake.SetCalls);
+        Assert.Equal(3, fake.GetCalls);
+    }
+
+    [Fact]
+    public async Task CancelledFenceNeverDispatchesRedisAndCancelledReadCannotSucceed()
+    {
+        var (database, fake) = SimulatedFenceStore();
+        var store = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        var guest = GuestSessions.NewPlayerId();
+        using var preCancelled = new CancellationTokenSource();
+        preCancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => store.FenceGuestAsync(guest, preCancelled.Token));
+        Assert.Equal(0, fake.SetCalls);
+
+        fake.ReadFault = "blocked";
+        using var requestAbort = new CancellationTokenSource();
+        var pending = store.FenceGuestAsync(guest, requestAbort.Token);
+        Assert.Equal(1, fake.SetCalls);
+        Assert.Equal(1, fake.GetCalls);
+        requestAbort.Cancel();
+        Assert.Same(pending, await Task.WhenAny(
+            pending, Task.Delay(TimeSpan.FromSeconds(5))));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.False(fake.PendingRead.Task.IsCompleted);
+        Assert.Equal(1, fake.SetCalls);
+        Assert.Equal(1, fake.GetCalls);
+    }
+
+    [Fact]
+    public async Task ProductionLogoutDoesNotClaimSuccessfulFenceWhenRedisDropsWrite()
+    {
+        var (database, fake) = SimulatedFenceStore();
+        fake.IgnoreWrites = true;
+        var fence = new RedisLobbySnapshotStore(database, TimeProvider.System);
+        using var server = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseEnvironment("Production");
+                TestDataProtectionConfiguration.Apply(builder);
+                TestGuestSessionRedisConfiguration.Apply(builder);
+                builder.ConfigureAppConfiguration((_, configuration) =>
+                    configuration.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["AllowedHosts"] = "game.example",
+                        ["Security:AllowedOrigins:0"] = "https://game.example"
+                    }));
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IGuestRevocationFence>();
+                    services.AddSingleton<IGuestRevocationFence>(fence);
+                });
+            });
+        using var client = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://game.example"),
+            AllowAutoRedirect = false,
+            HandleCookies = false
+        });
+        using var issue = new HttpRequestMessage(HttpMethod.Post,
+            "/api/sessions/guest");
+        issue.Headers.TryAddWithoutValidation("Origin", "https://game.example");
+        issue.Headers.TryAddWithoutValidation("X-Shirokuro-Request", "1");
+        using var issued = await client.SendAsync(issue);
+        Assert.Equal(HttpStatusCode.OK, issued.StatusCode);
+        var cookie = Assert.Single(issued.Headers.GetValues("Set-Cookie"))
+            .Split(';')[0];
+        using var member = server.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://game.example"),
+            AllowAutoRedirect = false,
+            HandleCookies = false
+        });
+        member.DefaultRequestHeaders.Add("Cookie", cookie);
+
+        using var logout = new HttpRequestMessage(HttpMethod.Delete,
+            "/api/sessions/guest");
+        logout.Headers.TryAddWithoutValidation("Origin", "https://game.example");
+        logout.Headers.TryAddWithoutValidation("X-Shirokuro-Request", "1");
+        using var result = await member.SendAsync(logout);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, result.StatusCode);
+        Assert.Equal("no-store", result.Headers.CacheControl?.ToString());
+        Assert.Equal(1, fake.SetCalls);
+        Assert.Equal(1, fake.GetCalls);
+        Assert.False(result.Headers.Contains("Retry-After"));
+        var responseBody = await result.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("guest-", responseBody, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Redis", responseBody, StringComparison.OrdinalIgnoreCase);
+
+        // Ticket authority was revoked before fencing was attempted.
+        // A copied cookie cannot regain access even on the same API node.
+        using var replay = await member.GetAsync("/api/sessions/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, replay.StatusCode);
     }
 
     [Fact]

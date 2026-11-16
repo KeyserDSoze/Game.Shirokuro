@@ -173,11 +173,27 @@ public sealed class RedisLobbySnapshotStore(
             throw new ArgumentException("Invalid trusted guest identity.",
                 nameof(trustedGuestId));
 
-        // No raw identity/session token in either key or value.
-        await AwaitRedisAsync(() => database.StringSetAsync(
-            RevokedGuestKey(trustedGuestId), "1",
-            expiry: RevocationFenceTtl, when: When.NotExists),
+        // SET NX=false means that a prior fence may already exist; SET
+        // NX=true alone does not prove persistence. Confirm the exact
+        // immutable marker through the same authoritative Redis connector
+        // before any caller can acknowledge a protected logout or ack expiry.
+        // Keep the old TTL: never renew an already installed fence.
+        // SET and read-back share ONE bounded deadline. Cancellation before
+        // the read must not dispatch a late GET on a dropped request.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
+        timeout.CancelAfter(CommandTimeout);
+        var key = RevokedGuestKey(trustedGuestId);
+        await database.StringSetAsync(
+                key, "1", expiry: RevocationFenceTtl, when: When.NotExists)
+            .WaitAsync(timeout.Token);
+        timeout.Token.ThrowIfCancellationRequested();
+        var confirmed = await database.StringGetAsync(key)
+            .WaitAsync(timeout.Token);
+        if (!string.Equals((string?)confirmed, "1", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Guest revocation fence write was not confirmed.");
+        timeout.Token.ThrowIfCancellationRequested();
     }
 
     /// <summary>Unindexed low-level create retained for #34 compatibility.</summary>
