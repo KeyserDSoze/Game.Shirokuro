@@ -1,4 +1,5 @@
 using System.Net;
+using System.Reflection;
 using System.IO;
 using Microsoft.AspNetCore.Http;
 using System.Net.Http.Json;
@@ -281,6 +282,227 @@ public sealed class DistributedGuestRateLimitTests
                 .AcquireAsync(policy, ip)).Allowed);
             Assert.Equal("1", (string?)await db.HashGetAsync(key, "count"));
             Assert.Equal(2, await db.HashLengthAsync(key));
+        }
+    }
+
+    [Theory]
+    [InlineData("unknown-field")]
+    [InlineData("uppercase-hex")]
+    [InlineData("short-proof")]
+    [InlineData("uppercase-prefix")]
+    [InlineData("wrong-value")]
+    [InlineData("empty-value")]
+    [InlineData("oversized-field")]
+    [InlineData("oversized-value")]
+    public async Task MalformedProofWithCorrectCardinalityFailsClosedAndPreservesBucket(
+        string corruption)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::1");
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            Assert.True(await db.HashSetAsync(key, "count", "3"));
+            for (var i = 0; i < 2; i++)
+                Assert.True(await db.HashSetAsync(
+                    key, "proof:" + i.ToString("x32"), "1"));
+
+            var name = corruption switch
+            {
+                "unknown-field" => "unknown:" + new string('f', 32),
+                "uppercase-hex" => "proof:" + new string('A', 32),
+                "short-proof" => "proof:" + new string('f', 31),
+                "uppercase-prefix" => "Proof:" + new string('f', 32),
+                "oversized-field" => "proof:" + new string('f', 4096),
+                _ => "proof:" + 2.ToString("x32")
+            };
+            var value = corruption switch
+            {
+                "wrong-value" => "2",
+                "empty-value" => "",
+                "oversized-value" => new string('x', 4096),
+                _ => "1"
+            };
+            Assert.True(await db.HashSetAsync(key, name, value));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(35)));
+            var before = await db.HashGetAllAsync(key);
+            var ttlBefore = await db.KeyTimeToLiveAsync(key);
+
+            foreach (var limiter in new[]
+                     {
+                         new RedisGuestMutationLimiter(a.GetDatabase()),
+                         new RedisGuestMutationLimiter(b.GetDatabase())
+                     })
+            {
+                var exception = await Assert.ThrowsAsync<InvalidDataException>(
+                    () => limiter.AcquireAsync(policy, ip));
+                Assert.Equal("Invalid distributed limit result.", exception.Message);
+                Assert.Null(exception.InnerException);
+            }
+            Assert.Equal(4, await db.HashLengthAsync(key));
+            foreach (var entry in before)
+                Assert.Equal(entry.Value, await db.HashGetAsync(key, entry.Name));
+            var ttlAfter = await db.KeyTimeToLiveAsync(key);
+            Assert.True(ttlAfter > TimeSpan.Zero && ttlAfter <= ttlBefore);
+
+            // Operator repair is explicit, never an automatic quota reset.
+            Assert.True(await db.KeyDeleteAsync(key));
+            Assert.True((await new RedisGuestMutationLimiter(b.GetDatabase())
+                .AcquireAsync(policy, ip)).Allowed);
+        }
+    }
+
+    [Fact]
+    public async Task FullQuotaWithCorruptProofIsUnavailableNotMisleading429()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::2");
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            Assert.True(await db.HashSetAsync(key, "count", "8"));
+            for (var i = 0; i < 8; i++)
+                Assert.True(await db.HashSetAsync(
+                    key, "proof:" + i.ToString("x32"), i == 7 ? "invalid" : "1"));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30)));
+
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new RedisGuestMutationLimiter(b.GetDatabase())
+                    .AcquireAsync(policy, ip));
+            Assert.Equal("Invalid distributed limit result.", exception.Message);
+            Assert.Equal("8", (string?)await db.HashGetAsync(key, "count"));
+            Assert.Equal("invalid", (string?)await db.HashGetAsync(
+                key, "proof:" + 7.ToString("x32")));
+        }
+    }
+
+    public class CorruptPriorProofAfterLuaDatabase : DispatchProxy
+    {
+        public IDatabase Inner { get; set; } = null!;
+        public RedisValue ExistingProof { get; set; }
+        public bool Corrupted { get; private set; }
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            if (method?.Name == "ScriptEvaluateAsync" &&
+                method.ReturnType == typeof(Task<RedisResult>) &&
+                args is { Length: >= 3 } &&
+                args[2] is RedisValue[] values && values.Length == 3)
+                return EvaluateAndCorruptAsync(
+                    (string)args[0]!, (RedisKey[])args[1]!, values);
+
+            return method?.Invoke(Inner, args) ??
+                throw new InvalidOperationException("Unexpected test Redis call.");
+        }
+
+        private async Task<RedisResult> EvaluateAndCorruptAsync(
+            string script, RedisKey[] keys, RedisValue[] values)
+        {
+            var result = await Inner.ScriptEvaluateAsync(script, keys, values);
+            var fields = (RedisResult[])result!;
+            if ((long)fields[0] == 1)
+            {
+                // A replica/failover returns positive Lua but corrupts a
+                // PRIOR receipt, while the newly issued one stays intact.
+                await Inner.HashSetAsync(keys[0], ExistingProof, "corrupted");
+                Corrupted = true;
+            }
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task ConfirmationRejectsOldProofCorruptedAfterSuccessfulLua()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var policy = new GuestMutationRateLimit(GuestMutationKind.RoomCreation);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::3");
+            var original = new RedisGuestMutationLimiter(a.GetDatabase());
+            Assert.True((await original.AcquireAsync(policy, ip)).Allowed);
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = a.GetDatabase();
+            var prior = Assert.Single((await db.HashKeysAsync(key))
+                .Where(field => field.ToString().StartsWith(
+                    "proof:", StringComparison.Ordinal)));
+
+            var wrapped = DispatchProxy.Create<IDatabase, CorruptPriorProofAfterLuaDatabase>();
+            var controller = (CorruptPriorProofAfterLuaDatabase)(object)wrapped;
+            controller.Inner = b.GetDatabase();
+            controller.ExistingProof = prior;
+            var failed = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                new RedisGuestMutationLimiter(wrapped).AcquireAsync(policy, ip));
+
+            Assert.Equal("Distributed permit not confirmed.", failed.Message);
+            Assert.True(controller.Corrupted);
+            Assert.Equal("2", (string?)await db.HashGetAsync(key, "count"));
+            Assert.Equal(3, await db.HashLengthAsync(key));
+            Assert.Equal("corrupted", (string?)await db.HashGetAsync(key, prior));
+            // A failed confirmation must not reimburse a potentially consumed
+            // quota or silently repair the corrupt bucket.
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                original.AcquireAsync(policy, ip));
+        }
+    }
+
+    [Fact]
+    public async Task MalformedProofProductionAdmissionReturnsSanitized503()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var services = new ServiceCollection();
+            services.AddDistributedMemoryCache();
+            using var provider = services.BuildServiceProvider();
+            using var server = Server(
+                provider.GetRequiredService<IDistributedCache>(), a);
+            var ip = IPAddress.Parse("2001:db8:" +
+                Guid.NewGuid().ToString("N")[..4] + "::4");
+            var policy = new GuestMutationRateLimit(GuestMutationKind.SessionIssuance);
+            var key = RedisGuestMutationLimiter.Key(policy, ip);
+            var db = b.GetDatabase();
+            Assert.True(await db.HashSetAsync(key, "count", "1"));
+            Assert.True(await db.HashSetAsync(
+                key, "proof:" + new string('f', 32), "bad"));
+            Assert.True(await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30)));
+
+            Task<HttpContext> Issue() => server.Server.SendAsync(context =>
+            {
+                context.Connection.RemoteIpAddress = ip;
+                context.Request.Method = "POST";
+                context.Request.Path = "/api/sessions/guest";
+                context.Request.Scheme = "https";
+                context.Request.Host = new HostString("game.example");
+                context.Request.Headers["Origin"] = "https://game.example";
+                context.Request.Headers["X-Shirokuro-Request"] = "1";
+            });
+
+            var denied = await Issue();
+            Assert.Equal(503, denied.Response.StatusCode);
+            Assert.Equal("no-store", denied.Response.Headers.CacheControl.ToString());
+            Assert.False(denied.Response.Headers.ContainsKey("Set-Cookie"));
+            Assert.Equal("1", (string?)await db.HashGetAsync(key, "count"));
+
+            Assert.True(await db.KeyDeleteAsync(key));
+            var recovered = await Issue();
+            Assert.Equal(200, recovered.Response.StatusCode);
+            Assert.True(recovered.Response.Headers.ContainsKey("Set-Cookie"));
         }
     }
 
