@@ -436,9 +436,9 @@ public sealed class DistributedGuestRateLimitTests
             Assert.True((await original.AcquireAsync(policy, ip)).Allowed);
             var key = RedisGuestMutationLimiter.Key(policy, ip);
             var db = a.GetDatabase();
-            var prior = Assert.Single((await db.HashKeysAsync(key))
-                .Where(field => field.ToString().StartsWith(
-                    "proof:", StringComparison.Ordinal)));
+            var prior = Assert.Single(await db.HashKeysAsync(key),
+                field => field.ToString().StartsWith(
+                    "proof:", StringComparison.Ordinal));
 
             var wrapped = DispatchProxy.Create<IDatabase, CorruptPriorProofAfterLuaDatabase>();
             var controller = (CorruptPriorProofAfterLuaDatabase)(object)wrapped;
