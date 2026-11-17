@@ -269,6 +269,15 @@ remaining 1–60s TTL. A count higher than the original ordinal is valid
 when another node has concurrently consumed a permit. Receipt-only
 writes, stale counters, missing/extra proof fields, lost TTL, malformed
 hashes or read-back failures cannot produce an authenticated admission.
+Since #186, both Lua phases also validate the **complete bounded set**
+of stored receipts: every field other than `count` must be precisely
+`proof:` followed by 32 lowercase hex characters, with the exact
+value `1`. `HLEN == count + 1` and `count <= 12` are checked **before**
+`HGETALL`, so the per-bucket inspection cannot traverse unbounded
+numbers of Redis fields. A damaged prior proof fails closed, even if
+the newly issued receipt, counter, cardinality and TTL all look valid;
+a corrupt full bucket does not masquerade as a normal 429. Corruption
+does not trigger automatic repair or a free permit.
 The two Lua calls use the SAME connector and share one 2-second
 deadline. Neither read nor deny requests extend the fixed window;
 denied 429 requests never perform the confirmation. No automatic
