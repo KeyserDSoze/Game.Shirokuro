@@ -41,6 +41,8 @@ public sealed class RedisGuestMutationReceiptTests
                 var values = (RedisValue[])args![2]!;
                 if (values.Length == 3)
                 {
+                    Assert.Contains("HGETALL", (string)args[0]!);
+                    Assert.Contains("proof:[0-9a-f]", (string)args[0]!);
                     LuaCalls++;
                     IssuedKey = ((RedisKey[])args[1]!)[0];
                     IssuedReceipt = values[2].ToString();
@@ -56,6 +58,8 @@ public sealed class RedisGuestMutationReceiptTests
                     ReadKey = ((RedisKey[])args[1]!)[0];
                     ReadReceipt = values[0].ToString();
                     Assert.Contains("HLEN", (string)args[0]!);
+                    Assert.Contains("HGETALL", (string)args[0]!);
+                    Assert.Contains("proof:[0-9a-f]", (string)args[0]!);
                     Assert.Contains("PTTL", (string)args[0]!);
                     Assert.Equal(LuaOrdinal, (long)values[1]);
                     Assert.Equal(12, (long)values[2]);
