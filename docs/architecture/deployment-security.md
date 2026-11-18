@@ -3754,6 +3754,16 @@ aggregate-only: no hostname, URL, cookies, tokens, IPs, Redis secrets,
 response body or exception information. It verifies a finite window,
 **not** permanent monotonicity.
 
+Both staging CLIs now install the **same explicit empty urllib
+`ProxyHandler({})`** in their shared HTTPS opener. This prevents environment
+or system proxy configuration (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`)
+from silently routing purported *direct-node* checks through an HTTP proxy
+or load balancer. The system default certificate and hostname verification
+remain mandatory; the runner fails if the node cannot be reached directly.
+Tests set proxy environment variables and verify the opener ignores them,
+retains verified HTTPS and refuses redirects. Direct reachability still
+does **not** prove that a DNS name belongs to a distinct pod.
+
 The watcher cannot measure LB withdrawal time from the actual SIGUSR1
 because the operator initiates it externally, nor prove the origin is
 routed to a distinct pod. Validate pod identity/ingress updates and
