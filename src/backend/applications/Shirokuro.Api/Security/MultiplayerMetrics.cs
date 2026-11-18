@@ -23,6 +23,8 @@ public static class MultiplayerMetrics
         "shirokuro.signalr.drain_abort_attempts";
     public const string ReadinessDurationSecondsName = "shirokuro.readiness.duration";
     public const string RedisConnectionEventsName = "shirokuro.redis.connection.events";
+    public const string LobbyQuotaIntegrityRejectionsName =
+        "shirokuro.redis.lobby_quota.integrity_rejections";
     public const string RedisReplicationObservationsName =
         "shirokuro.redis.replication.observations";
     public const string RedisConnectedReplicasName =
@@ -61,6 +63,10 @@ public static class MultiplayerMetrics
     private static readonly Counter<long> RedisConnectionEvents =
         Meter.CreateCounter<long>(RedisConnectionEventsName, unit: "{event}",
             description: "Production Redis connector lifecycle events; no endpoint or identity labels.");
+    private static readonly Counter<long> LobbyQuotaIntegrityRejections =
+        Meter.CreateCounter<long>(LobbyQuotaIntegrityRejectionsName,
+            unit: "{rejection}",
+            description: "Authoritative Redis lobby quota-index integrity denials by fixed operation; not distinct rooms or all 503 errors.");
     private static readonly Counter<long> RedisReplicationObservations =
         Meter.CreateCounter<long>(RedisReplicationObservationsName, unit: "{observation}",
             description: "Explicit INFO replication probe result, including failed polls.");
@@ -274,6 +280,28 @@ public static class MultiplayerMetrics
     }
 
     /// <summary>
+    /// Only count a definite integrity-denial code returned by the Redis
+    /// lobby mutation Lua (-4 on CREATE, -2 on CAS/DELETE). Ordinary quota
+    /// limits, stale revisions, guest fences, timeouts, unknown command
+    /// outcomes and failed post-write confirmation are NOT integrity samples.
+    /// There are exactly three allowed operation labels, never room keys,
+    /// creator identities, IPs or arbitrary exception strings.
+    /// </summary>
+    public static void RecordLobbyQuotaIntegrityRejection(
+        LobbyQuotaOperation operation)
+    {
+        var label = operation switch
+        {
+            LobbyQuotaOperation.Create => "create",
+            LobbyQuotaOperation.CompareExchange => "cas",
+            LobbyQuotaOperation.Delete => "delete",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+        LobbyQuotaIntegrityRejections.Add(1,
+            new KeyValuePair<string, object?>("operation", label));
+    }
+
+    /// <summary>
     /// Record one read-only INFO replication poll. The report can contain
     /// sensitive replica IPs and authentication context, but NONE of its
     /// string fields can become a metric dimension. Missing/failed samples
@@ -390,6 +418,9 @@ public enum ReadinessProbeStage
     KeyRing,
     Timeout
 }
+
+/// <summary>Internal quota-mutating Redis commands, not player actions.</summary>
+public enum LobbyQuotaOperation { Create, CompareExchange, Delete }
 
 public enum RedisConnector { Lobby, GuestSessions }
 
