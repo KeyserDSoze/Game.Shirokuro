@@ -603,7 +603,7 @@ public sealed class RedisLobbyQuotaStoreTests
             var ownerHash = Convert.ToHexStringLower(
                 SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
             var creatorIndex = indexPrefix + "creator:" + ownerHash;
-            RedisKey roomKey = Assert.Single(
+            var roomKey = Assert.Single(
                 await db.SortedSetRangeByRankAsync(globalIndex)).ToString();
             var expected = (await two.ReadAsync(id))!;
             var originalGlobal = await db.SortedSetScoreAsync(globalIndex, roomKey);
@@ -658,7 +658,7 @@ public sealed class RedisLobbyQuotaStoreTests
             var db = a.GetDatabase();
             var globalIndex = "shirokuro:lobby:{" + ns +
                 "}:v2:capacity:all";
-            RedisKey roomKey = Assert.Single(
+            var roomKey = Assert.Single(
                 await db.SortedSetRangeByRankAsync(globalIndex)).ToString();
             var read = (await two.ReadAsync(id))!;
             Assert.True(await db.KeyPersistAsync(roomKey));
