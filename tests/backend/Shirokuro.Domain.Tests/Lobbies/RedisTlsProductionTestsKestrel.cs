@@ -1063,13 +1063,13 @@ public sealed class RedisTlsProductionTestsKestrel
                 Assert.Equal(HttpStatusCode.OK, live.StatusCode);
             using (var negotiate = Mutation(HttpMethod.Post, drainingDirect,
                        "/hubs/lobbies/negotiate?negotiateVersion=1"))
-            using (var denied = await drainingDirect.SendAsync(
+            using (var deniedNegotiate = await drainingDirect.SendAsync(
                        negotiate, timeout.Token))
             {
-                Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
-                Assert.True(denied.Headers.CacheControl?.NoStore == true);
-                Assert.False(denied.Headers.Contains("Set-Cookie"));
-                Assert.False(denied.Headers.Contains("Location"));
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, deniedNegotiate.StatusCode);
+                Assert.True(deniedNegotiate.Headers.CacheControl?.NoStore == true);
+                Assert.False(deniedNegotiate.Headers.Contains("Set-Cookie"));
+                Assert.False(deniedNegotiate.Headers.Contains("Location"));
             }
             await AssertSocketAbortedByDrainAsync(bobSocket, timeout.Token);
 
@@ -1109,14 +1109,14 @@ public sealed class RedisTlsProductionTestsKestrel
             var restored = await RosterAsync(reconnectedSocket, room,
                 "post-drain-authorized", timeout.Token);
             Assert.False(restored.TryGetProperty("error", out _));
-            var roster = restored.GetProperty("result");
+            var recoveredRoster = restored.GetProperty("result");
             Assert.True(string.Equals(
-                room, roster.GetProperty("lobbyId").GetString(),
+                room, recoveredRoster.GetProperty("lobbyId").GetString(),
                 StringComparison.Ordinal));
-            Assert.Equal(3L, roster.GetProperty("revision").GetInt64());
-            Assert.True(string.Equals(bob, Assert.Single(
-                roster.GetProperty("participants").EnumerateArray())
-                    .GetProperty("playerId").GetString(), StringComparison.Ordinal),
+            Assert.Equal(3L, recoveredRoster.GetProperty("revision").GetInt64());
+            Assert.True(string.CompareOrdinal(bob, Assert.Single(
+                recoveredRoster.GetProperty("participants").EnumerateArray())
+                    .GetProperty("playerId").GetString()) == 0,
                 "Reconnected WSS receives Bob's current roster, not a cached one.");
             Assert.False(restored.GetRawText().Contains(alice, StringComparison.Ordinal),
                 "The drained-node reconciliation must not reveal Alice.");
