@@ -141,10 +141,59 @@ public sealed class RedisLobbySnapshotStore(
            not dueEntriesAreOrphans(KEYS[3], tonumber(ARGV[4])) then
             return -4
         end
-        -- Both indices have passed validation. Redis Lua is atomic, so no
-        -- other writer can add a new due entry between check and prune.
+
+        -- A missing physical room can leave a FUTURE ZSET deadline after
+        -- out-of-band Redis eviction/restore. When a quota is apparently
+        -- full even after removing due entries, inspect a bounded window
+        -- BEFORE mutating either index. Never fetch private room bytes.
+        -- A live room with a mismatched index score is corrupted, NOT an
+        -- orphan; fail closed rather than silently clear its quota.
+        local function collectMissingRooms(index, requestedLimit)
+            local limit = math.min(requestedLimit, 256)
+            local entries = redis.call('ZRANGE', index, 0, limit,
+                                       'WITHSCORES')
+            if #entries > limit * 2 then return nil end
+            local missing = {}
+            for i = 1, #entries, 2 do
+                local member, score = entries[i], tonumber(entries[i + 1])
+                if #member ~= #KEYS[1] or
+                   string.sub(member, 1, #roomPrefix) ~= roomPrefix or
+                   not string.match(string.sub(member, #roomPrefix + 1),
+                                    '^[0-9a-f]+$') then
+                    return nil
+                end
+                local physicalDeadline = redis.call('PEXPIRETIME', member)
+                if physicalDeadline == -2 then
+                    missing[#missing + 1] = member
+                elseif physicalDeadline <= 0 or score ~= physicalDeadline then
+                    return nil
+                end
+            end
+            return missing
+        end
+        local globalMissing, creatorMissing = {}, {}
+        if redis.call('ZCARD', KEYS[2]) -
+           redis.call('ZCOUNT', KEYS[2], '-inf', now) >= tonumber(ARGV[3]) then
+            globalMissing = collectMissingRooms(KEYS[2], tonumber(ARGV[3]))
+            if not globalMissing then return -4 end
+        end
+        if redis.call('ZCARD', KEYS[3]) -
+           redis.call('ZCOUNT', KEYS[3], '-inf', now) >= tonumber(ARGV[4]) then
+            creatorMissing = collectMissingRooms(KEYS[3], tonumber(ARGV[4]))
+            if not creatorMissing then return -4 end
+        end
+
+        -- ALL due and future-index validation has succeeded. Redis Lua is
+        -- atomic, so other writers cannot change a verified room or score
+        -- until both index cleanups and the capacity decision are finished.
         redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
         redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+        for _,member in ipairs(globalMissing) do
+            redis.call('ZREM', KEYS[2], member)
+        end
+        for _,member in ipairs(creatorMissing) do
+            redis.call('ZREM', KEYS[3], member)
+        end
 
         if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then
             return -1
