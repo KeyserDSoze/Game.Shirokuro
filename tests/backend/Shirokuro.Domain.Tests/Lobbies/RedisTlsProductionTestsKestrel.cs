@@ -402,6 +402,41 @@ public sealed class RedisTlsProductionTestsKestrel
         }
     }
 
+    // A successful negotiate creates a connection token local to one
+    // Kestrel child. If the subsequent upgrade falls into an old nginx
+    // worker during reload, the failed token must NOT be reused. A fresh
+    // negotiation + upgrade pair is CI-only and bounded to four attempts.
+    // No game HTTP mutation, token or invitation is ever replayed/logged.
+    private static async Task<ClientWebSocket> ReconnectAfterNginxDrainAsync(
+        int edgePort, string cookie, HttpClient client,
+        string expectedUpstream, CancellationToken token)
+    {
+        const int maxUpgradeAttempts = 4;
+        for (var attempt = 0; attempt < maxUpgradeAttempts; attempt++)
+        {
+            var (connectionToken, upstream) = await NegotiateThroughEdgeAsync(
+                client, token, afterNginxDrainReload: true);
+            Assert.Equal(expectedUpstream, upstream);
+            try
+            {
+                return await NegotiatedWssAsync(
+                    edgePort, cookie, connectionToken, token);
+            }
+            catch (InvalidOperationException failure)
+                when (attempt + 1 < maxUpgradeAttempts &&
+                      failure.Message ==
+                      "Negotiated SignalR WSS upgrade did not complete at the sticky upstream.")
+            {
+                // All transport errors are sanitized by NegotiatedWssAsync;
+                // the socket has been disposed. Never retry an HTTP roster
+                // command or continue with a potentially consumed token.
+                await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+            }
+        }
+        throw new InvalidOperationException(
+            "The edge did not complete negotiated WSS after bounded post-drain convergence.");
+    }
+
     private static async Task WaitForNodeDrainAsync(
         HttpClient direct, ChildProcess node, CancellationToken token)
     {
@@ -1123,6 +1158,18 @@ public sealed class RedisTlsProductionTestsKestrel
                 Assert.False(deniedNegotiate.Headers.Contains("Location"));
             }
             await AssertSocketAbortedByDrainAsync(bobSocket, timeout.Token);
+            // Release the old edge's long-lived transports and keep-alive
+            // clients before reload. An nginx worker with open WebSockets
+            // may otherwise remain alive long after its upstream is marked
+            // down and still own old routing state.
+            aliceSocket.Dispose();
+            aliceExtraSocket.Dispose();
+            bobSocket.Dispose();
+            bobStillActive.Dispose();
+            aliceWithUnrelatedCookie.Dispose();
+            aliceEdge.Dispose();
+            bobEdge.Dispose();
+            edge.Dispose();
 
             // The edge, not the player, removes a not-ready node from its
             // upstream and reloads. Nginx keeps cookie affinity among the
@@ -1152,12 +1199,9 @@ public sealed class RedisTlsProductionTestsKestrel
             Assert.False(drainingNode.HasExited,
                 "The preStop node remains alive until the orchestrator terminates it.");
 
-            var (reconnectedToken, reconnectedUpstream) =
-                await NegotiateThroughEdgeAsync(recovered, timeout.Token,
-                    afterNginxDrainReload: true);
-            Assert.Equal($"127.0.0.1:{survivingPort}", reconnectedUpstream);
-            using var reconnectedSocket = await NegotiatedWssAsync(
-                edgePort, bobCookie, reconnectedToken, timeout.Token);
+            using var reconnectedSocket = await ReconnectAfterNginxDrainAsync(
+                edgePort, bobCookie, recovered,
+                $"127.0.0.1:{survivingPort}", timeout.Token);
             var restored = await RosterAsync(reconnectedSocket, room,
                 "post-drain-authorized", timeout.Token);
             Assert.False(restored.TryGetProperty("error", out _));
@@ -1179,12 +1223,9 @@ public sealed class RedisTlsProductionTestsKestrel
             var (outsiderId, outsiderCookie) = await LoginAsync(
                 visitorAfterDrain, timeout.Token);
             using var outsiderClient = Http(edgePort, outsiderCookie);
-            var (outsiderToken, outsiderUpstream) =
-                await NegotiateThroughEdgeAsync(outsiderClient, timeout.Token,
-                    afterNginxDrainReload: true);
-            Assert.Equal($"127.0.0.1:{survivingPort}", outsiderUpstream);
-            using var outsiderSocket = await NegotiatedWssAsync(
-                edgePort, outsiderCookie, outsiderToken, timeout.Token);
+            using var outsiderSocket = await ReconnectAfterNginxDrainAsync(
+                edgePort, outsiderCookie, outsiderClient,
+                $"127.0.0.1:{survivingPort}", timeout.Token);
             var blocked = await RosterAsync(outsiderSocket, room,
                 "post-drain-outsider", timeout.Token);
             var absentAfterDrain = await RosterAsync(outsiderSocket,
