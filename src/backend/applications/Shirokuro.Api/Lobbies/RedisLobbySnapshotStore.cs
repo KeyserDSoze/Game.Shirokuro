@@ -37,9 +37,16 @@ public sealed class RedisLobbySnapshotStore(
         if not current or current ~= ARGV[1] then return 0 end
 
         if ARGV[5] == '1' then
-            if not redis.call('ZSCORE', KEYS[2], KEYS[1]) or
-               not redis.call('ZSCORE', KEYS[3], KEYS[1]) then
-                return 0
+            -- The existing quota indices MUST describe the actual room TTL,
+            -- not merely contain a membership. Do not silently repair or
+            -- erase corrupt scores while authenticating a guest mutation.
+            local deadline = redis.call('PEXPIRETIME', KEYS[1])
+            local global = redis.call('ZSCORE', KEYS[2], KEYS[1])
+            local creator = redis.call('ZSCORE', KEYS[3], KEYS[1])
+            if deadline <= 0 or not global or not creator or
+               tonumber(global) ~= deadline or
+               tonumber(creator) ~= deadline then
+                return -2
             end
         end
 
@@ -61,9 +68,16 @@ public sealed class RedisLobbySnapshotStore(
         local current = redis.call('GET', KEYS[1])
         if not current or current ~= ARGV[1] then return 0 end
         if ARGV[2] == '1' then
-            if not redis.call('ZSCORE', KEYS[2], KEYS[1]) or
-               not redis.call('ZSCORE', KEYS[3], KEYS[1]) then
-                return 0
+            -- Never turn a room with inconsistent quota metadata into an
+            -- acknowledged DELETE. A missing/early/late index score is
+            -- an unavailable authoritative store, not a CAS conflict.
+            local deadline = redis.call('PEXPIRETIME', KEYS[1])
+            local global = redis.call('ZSCORE', KEYS[2], KEYS[1])
+            local creator = redis.call('ZSCORE', KEYS[3], KEYS[1])
+            if deadline <= 0 or not global or not creator or
+               tonumber(global) ~= deadline or
+               tonumber(creator) ~= deadline then
+                return -2
             end
         end
         redis.call('DEL', KEYS[1])
@@ -432,6 +446,8 @@ public sealed class RedisLobbySnapshotStore(
         timeout.Token.ThrowIfCancellationRequested();
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
+        if (result == -2)
+            throw new LobbyMutationUnavailableException();
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
         if (result == 0)
@@ -476,6 +492,8 @@ public sealed class RedisLobbySnapshotStore(
         timeout.Token.ThrowIfCancellationRequested();
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
+        if (result == -2)
+            throw new LobbyMutationUnavailableException();
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
         if (result == 0)
