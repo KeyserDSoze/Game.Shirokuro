@@ -3626,6 +3626,19 @@ that the WSS upgrade works, and that an authenticated outsider receives
 the same private-safe denial as a missing room. xUnit tests encode this
 closed retry predicate independently.
 
+In an additional CI run, an HTTP 200 negotiate reached the healthy node
+but the following *new WSS upgrade* still raced an old Nginx worker.
+The fixture now releases its prior HTTP keep-alive and WebSocket clients
+before reload and permits up to **four fresh negotiate+WSS handshake
+pairs** while the old worker drains. A failed WSS upgrade disposes its
+socket: the old process-local SignalR token is **never replayed**.
+Every new negotiate still follows the 503/no-store-only rule above;
+every HTTP 200 must identify the surviving upstream, with strict TLS and
+the private roster authorization check still mandatory. A persistent
+WSS failure, a wrong upstream or any unexpected HTTP status fails the
+fixture. Only this CI reconnection handshake is retried: no room mutation
+or uncertain gameplay action is repeated.
+
 This is not automatic retries for lobby CREATE/JOIN/PATCH/DELETE,
 not an API/runtime change, and not proof that a real Kubernetes/ingress
 controller converges in 2 seconds. CI has ordinary strict TLS validation;
