@@ -110,6 +110,18 @@ public sealed class RedisLobbyQuotaStoreTests
             // explicit operator-side restoration; subsequent cleanup works.
             Assert.True(await db.StringSetAsync(
                 roomKey, original, TimeSpan.FromMinutes(30)));
+            // Repair restores both quota scores to the newly written
+            // room's physical deadline; rewriting bytes alone changes TTL.
+            var restoredDeadline = (long)await db.ExecuteAsync("PEXPIRETIME", roomKey);
+            Assert.True(restoredDeadline > 0);
+            var creatorHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var creatorIndex = "shirokuro:lobby:{" + ns +
+                "}:v2:capacity:creator:" + creatorHash;
+            Assert.False(await db.SortedSetAddAsync(indexKey, roomKey,
+                restoredDeadline));
+            Assert.False(await db.SortedSetAddAsync(creatorIndex, roomKey,
+                restoredDeadline));
             Assert.Equal(2, (await nodeB.ReadAsync(room.LobbyId))!
                 .Snapshot.State.Participants.Count);
             Assert.Equal(1, await apiA.RemovePlayerFromAllRoomsAsync(guest));
@@ -174,6 +186,21 @@ public sealed class RedisLobbyQuotaStoreTests
                 poisonedKey))!);
             Assert.True(await db.StringSetAsync(
                 poisonedKey, healthy, TimeSpan.FromMinutes(30)));
+            // An explicit operator restore must synchronize the physical
+            // TTL with both quota indices, not merely replace private JSON.
+            var restoredDeadline = (long)await db.ExecuteAsync(
+                "PEXPIRETIME", poisonedKey);
+            Assert.True(restoredDeadline > 0);
+            var creatorId = JsonNode.Parse(healthy)!.AsObject()["CreatorId"]!
+                .GetValue<string>();
+            var creatorHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(creatorId)));
+            var indexPrefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            Assert.False(await db.SortedSetAddAsync(
+                indexPrefix + "all", poisonedKey, restoredDeadline));
+            Assert.False(await db.SortedSetAddAsync(
+                indexPrefix + "creator:" + creatorHash,
+                poisonedKey, restoredDeadline));
             Assert.Equal(12, await apiB.RemovePlayerFromAllRoomsAsync(guest));
             foreach (var roomId in rooms)
             {
