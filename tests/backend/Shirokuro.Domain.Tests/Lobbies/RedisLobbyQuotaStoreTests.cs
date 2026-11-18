@@ -1196,6 +1196,44 @@ public sealed class RedisLobbyQuotaStoreTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FutureScoreForeignOrMalformedIndexMemberCannotBeReclaimed(
+        bool sameSlot)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-future-bad-member-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var index = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var key = sameSlot
+                ? "shirokuro:lobby:{" + ns + "}:v2:room:invalid"
+                : "foreign-slot-room-key";
+            var dueInFuture = (double)DateTimeOffset.UtcNow
+                .AddMinutes(20).ToUnixTimeMilliseconds();
+            var db = a.GetDatabase();
+            Assert.True(await db.SortedSetAddAsync(index, key, dueInFuture));
+
+            var attempted = Room("room-" + Guid.NewGuid().ToString("N"),
+                GuestSessions.NewPlayerId(), clock.GetUtcNow());
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(attempted, 1, 1));
+            Assert.Equal(dueInFuture,
+                await db.SortedSetScoreAsync(index, key));
+            Assert.Equal(1, await db.SortedSetLengthAsync(index));
+            Assert.Null(await one.ReadAsync(attempted.State.Definition.LobbyId));
+
+            Assert.True(await db.SortedSetRemoveAsync(index, key));
+            Assert.True(await one.CreateBoundedAsync(attempted, 1, 1));
+        }
+    }
+
     [Fact]
     public void V2SnapshotsRequireQuotaTrackingMetadata()
     {
