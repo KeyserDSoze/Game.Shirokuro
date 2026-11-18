@@ -340,6 +340,30 @@ public sealed class RedisTlsProductionTestsKestrel
             "Nginx post-drain converge check failed after bounded explicit 503 replies.");
     }
 
+    [Theory]
+    [InlineData(HttpStatusCode.ServiceUnavailable, true, false, false, true)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, false, false, false, false)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, true, true, false, false)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, true, false, true, false)]
+    [InlineData(HttpStatusCode.OK, true, false, false, false)]
+    [InlineData(HttpStatusCode.Unauthorized, true, false, false, false)]
+    [InlineData(HttpStatusCode.TooManyRequests, true, false, false, false)]
+    [InlineData(HttpStatusCode.BadGateway, true, false, false, false)]
+    public void OnlyExplicitNonCacheableCookieFree503MayRetryAfterNginxReload(
+        HttpStatusCode status, bool noStore, bool cookie, bool redirect,
+        bool expected)
+    {
+        using var response = new HttpResponseMessage(status);
+        if (noStore)
+            response.Headers.CacheControl =
+                new System.Net.Http.Headers.CacheControlHeaderValue { NoStore = true };
+        if (cookie)
+            response.Headers.TryAddWithoutValidation("Set-Cookie", "opaque=test");
+        if (redirect)
+            response.Headers.Location = new Uri("https://localhost/ignored");
+        Assert.Equal(expected, CanRetryPostDrainNegotiate(response));
+    }
+
     private static async Task<ClientWebSocket> NegotiatedWssAsync(
         int port, string cookie, string connectionToken,
         CancellationToken cancellationToken)
