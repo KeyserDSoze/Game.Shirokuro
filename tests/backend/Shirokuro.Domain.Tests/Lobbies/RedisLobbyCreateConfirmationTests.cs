@@ -51,6 +51,12 @@ public sealed class RedisLobbyCreateConfirmationTests
             var values = Assert.IsType<RedisValue[]>(args[2]);
             if (script.Contains("ZREMRANGEBYSCORE", StringComparison.Ordinal))
             {
+                // Preserve the bounded preflight before either ZSET is
+                // mutated; no room JSON/roster can leave Redis from Lua.
+                Assert.Contains("collectMissingRooms", script);
+                Assert.Contains("WITHSCORES", script);
+                Assert.Contains("PEXPIRETIME", script);
+                Assert.Contains("if not creatorMissing then return -4 end", script);
                 CreateCalls++;
                 Assert.Equal(4, keys.Length);
                 Assert.Equal(5, values.Length);
