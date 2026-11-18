@@ -6,7 +6,9 @@ mutation. It is NOT proof of a multi-pod or Redis failover deployment.
 """
 
 import argparse
+import ipaddress
 import json
+import math
 import ssl
 import sys
 import time
@@ -29,29 +31,42 @@ class DenyRedirect(HTTPRedirectHandler):
 
 
 def validate_base_urls(values):
-    """Accept only bare HTTPS origins; never a URL carrying a secret."""
-    if len(values) > MAX_TARGETS:
-        raise ProbeError("Too many staging targets")
+    """Accept only distinct bare HTTPS origins; never a URL carrying a secret.
+
+    Compare canonical host/port identities so case, explicit HTTPS default
+    port and expanded IPv6 notation cannot repeat the same probe target.
+    This is not DNS or Kubernetes pod identity attestation.
+    """
+    if not isinstance(values, (list, tuple)) or len(values) > MAX_TARGETS:
+        raise ProbeError("Invalid staging target list")
     origins = []
+    endpoints = set()
     for value in values:
-        if (not value or value != value.strip() or
+        if (not isinstance(value, str) or not value or
+                value != value.strip() or
                 any(c.isspace() for c in value) or
                 "?" in value or "#" in value):
             raise ProbeError("Invalid staging configuration")
         try:
             parsed = urlsplit(value)
             port = parsed.port
+            hostname = parsed.hostname
         except ValueError as exc:
             raise ProbeError("Invalid staging configuration") from exc
-        if (parsed.scheme != "https" or not parsed.hostname or
+        if (parsed.scheme != "https" or not hostname or
                 parsed.username is not None or parsed.password is not None or
                 parsed.path not in ("", "/") or parsed.query or parsed.fragment or
                 (port is not None and port < 1)):
             raise ProbeError("Invalid staging configuration")
-        origin = "https://" + parsed.netloc
-        if origin in origins:
+        try:
+            canonical_host = str(ipaddress.ip_address(hostname))
+        except ValueError:
+            canonical_host = hostname.lower()
+        endpoint = (canonical_host, port or 443)
+        if endpoint in endpoints:
             raise ProbeError("Duplicate staging target")
-        origins.append(origin)
+        endpoints.add(endpoint)
+        origins.append("https://" + parsed.netloc)
     if not origins:
         raise ProbeError("Missing staging target")
     return origins
@@ -127,11 +142,17 @@ def make_strict_opener():
 
 def run_checks(origins, expected_ready, samples, interval, timeout, *,
                opener=None, sleep=time.sleep):
-    if (not isinstance(samples, int) or not 1 <= samples <= MAX_SAMPLES or
-            not 0 <= interval <= 30 or not 0.25 <= timeout <= 10):
+    # run_checks is also a public Python entry point: callers must not be
+    # able to skip the CLI's HTTPS origin and finite-budget preflight.
+    if (type(samples) is not int or not 1 <= samples <= MAX_SAMPLES or
+            type(interval) not in (int, float) or
+            not math.isfinite(interval) or not 0 <= interval <= 30 or
+            type(timeout) not in (int, float) or
+            not math.isfinite(timeout) or not 0.25 <= timeout <= 10):
         raise ProbeError("Invalid staging probe bounds")
     if expected_ready not in ("ready", "unavailable"):
         raise ProbeError("Invalid readiness expectation")
+    origins = validate_base_urls(origins)
     if opener is None:
         opener = make_strict_opener()
     for index in range(samples):
