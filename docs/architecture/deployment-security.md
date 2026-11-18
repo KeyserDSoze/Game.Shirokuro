@@ -3826,3 +3826,43 @@ bounds remain. Output is aggregate, with no URLs, secrets or error bodies.
 The operational proof still requires real staging drain, load balancer
 withdrawal, authenticated SignalR reconnect, HA/failover metrics and
 privacy checks under [parent #21](https://github.com/KeyserDSoze/Game.Shirokuro/issues/21).
+
+## Loopback real TLS integration for public staging probes (#197)
+
+The existing external staging scripts `scripts/staging_probe.py` and
+`scripts/staging_drain_watch.py` reuse the same strict HTTPS opener.
+Their unit tests validate response contracts with a mocked transport.
+The new `scripts/tests/test_staging_probe_tls_integration.py` also
+exercises **real TLS sockets** in the CI's Python `unittest` job:
+
+- OpenSSL creates a temporary one-day self-signed certificate and private
+  key with SAN `DNS:localhost`. The key stays inside a disposable test
+  directory, is **never committed**, and is not logged or accepted as a
+  trust anchor outside the isolated test. Two Python HTTP servers listen
+  only on `127.0.0.1` and are shut down after the suite.
+- A fixture-only `SSL_CERT_FILE` points to this temporary certificate
+  for trusted test requests. The existing production helper
+  `ssl.create_default_context()` performs normal certificate and hostname
+  verification. Requests without the fixture trust anchor fail; requests
+  to the same socket using `127.0.0.1` instead of SAN `localhost` fail.
+  **No `verify=False`, custom permissive certificate callback, or
+  production TLS bypass is introduced.**
+- An intentionally invalid HTTPS/ALL proxy in the environment does not
+  intercept the direct-node GET because the shared opener uses
+  `ProxyHandler({})`. The actual `urllib` HTTP 503/no-store
+  response is accepted only with the exact `unavailable` schema.
+  Redirect responses, extra JSON fields and cached responses are rejected.
+- The paired #196 watcher is exercised over two independent loopback
+  TLS listener ports: both nodes must be 200/ready at baseline; a
+  fixture-owned callback flips only the draining listener to 503
+  after that baseline. The surviving listener must remain 200/ready
+  at every observation, including the last, or the watcher fails.
+
+The CI artwork job now requires the `openssl` executable explicitly
+before running Python tests, so absence of OpenSSL cannot silently skip
+the network integration suite. This is a **local, synthetic HTTP fixture**;
+the callback does not send SIGUSR1 or simulate a real OS rolling restart.
+The test does not prove authenticated WSS reconnect, edge TLS termination,
+Kubernetes pod identity, LB endpoint withdrawal or Redis HA/SLO. These
+remain operational prerequisites in parent #21. See
+[issue #197](https://github.com/KeyserDSoze/Game.Shirokuro/issues/197).
