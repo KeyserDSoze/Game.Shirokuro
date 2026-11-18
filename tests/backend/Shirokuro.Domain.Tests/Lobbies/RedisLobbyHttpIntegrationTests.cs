@@ -322,7 +322,7 @@ public sealed class RedisLobbyHttpIntegrationTests
 
                 var db = redisA.GetDatabase();
                 var index = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
-                var roomKey = Assert.Single(await db.SortedSetRangeByRankAsync(index));
+                RedisKey roomKey = Assert.Single(await db.SortedSetRangeByRankAsync(index)).ToString();
                 var deadline = await db.SortedSetScoreAsync(index, roomKey);
                 Assert.NotNull(deadline);
                 var existingRoom = (byte[])(await db.StringGetAsync(roomKey))!;
