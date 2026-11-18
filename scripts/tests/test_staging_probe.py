@@ -2,11 +2,13 @@
 
 import io
 import json
+import os
+import ssl
 import unittest
 from email.message import Message
 from unittest.mock import patch
 from urllib.error import HTTPError
-from urllib.request import Request
+from urllib.request import HTTPSHandler, ProxyHandler, Request
 
 from scripts import staging_probe as probe
 
@@ -151,7 +153,7 @@ class StagingProbeTests(unittest.TestCase):
                                      opener=FakeOpener())
 
     def test_never_exposes_failing_url_or_exception(self):
-        with patch.object(probe, "build_opener", return_value=FakeOpener(fail_at=1)):
+        with patch.object(probe, "make_strict_opener", return_value=FakeOpener(fail_at=1)):
             with patch("sys.stderr", new_callable=io.StringIO) as err:
                 result = probe.main(["--base-url", "https://internal.staging.example",
                                      "--samples", "1", "--interval", "0"])
@@ -159,6 +161,23 @@ class StagingProbeTests(unittest.TestCase):
         self.assertNotIn("internal.staging", err.getvalue())
         self.assertNotIn("SECRET", err.getvalue())
         self.assertNotIn("password", err.getvalue())
+
+    def test_default_https_transport_ignores_implicit_proxies_and_keeps_tls(self):
+        # Python urllib normally consults HTTPS_PROXY/ALL_PROXY, even when
+        # its caller uses a bare HTTPS origin. Direct-node health must not.
+        with patch.dict(os.environ, {
+            "HTTPS_PROXY": "http://hidden-proxy.example:3128",
+            "HTTP_PROXY": "http://hidden-proxy.example:3128",
+            "ALL_PROXY": "http://hidden-proxy.example:3128",
+        }, clear=True):
+            opener = probe.make_strict_opener()
+        self.assertFalse(any(isinstance(h, ProxyHandler) for h in opener.handlers))
+        tls = [h for h in opener.handlers if isinstance(h, HTTPSHandler)]
+        self.assertEqual(1, len(tls))
+        self.assertEqual(ssl.CERT_REQUIRED, tls[0]._context.verify_mode)
+        self.assertTrue(tls[0]._context.check_hostname)
+        redirects = [h for h in opener.handlers if isinstance(h, probe.DenyRedirect)]
+        self.assertEqual(1, len(redirects))
 
     def test_redirect_policy_never_follows(self):
         self.assertIsNone(probe.DenyRedirect().redirect_request(

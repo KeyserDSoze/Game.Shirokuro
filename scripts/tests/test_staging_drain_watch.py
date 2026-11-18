@@ -174,7 +174,7 @@ class DrainWatchTests(unittest.TestCase):
 
     def test_main_reports_no_origin_or_underlying_error(self):
         fake = ScriptedOpener(["ready"], throw_at=1)
-        with patch.object(watch, "build_opener", return_value=fake):
+        with patch.object(watch.probe, "make_strict_opener", return_value=fake):
             with patch("sys.stderr", new_callable=io.StringIO) as err:
                 result = watch.main(["--base-url", "https://private-node.staging.example",
                                      "--max-polls", "2", "--stable-samples", "2"])
@@ -182,6 +182,15 @@ class DrainWatchTests(unittest.TestCase):
         self.assertNotIn("private-node", err.getvalue())
         self.assertNotIn("secret", err.getvalue())
         self.assertNotIn("Redis", err.getvalue())
+
+    def test_watch_uses_shared_direct_node_https_opener_only_once(self):
+        transport = ScriptedOpener(["ready", "unavailable", "unavailable"])
+        with patch.object(watch.probe, "make_strict_opener",
+                          return_value=transport) as make:
+            watch.watch_drain(self.ORIGIN, 2, 2, 0.5, 1,
+                             sleep=lambda _: None)
+        make.assert_called_once_with()
+        self.assertEqual(6, len(transport.calls))
 
     def test_shared_probe_transport_rejects_invalid_path(self):
         with self.assertRaises(watch.probe.ProbeError):

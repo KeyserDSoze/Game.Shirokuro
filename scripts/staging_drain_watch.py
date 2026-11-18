@@ -8,10 +8,8 @@ multi-pod ingress test and must not be run after SIGTERM.
 
 import argparse
 import math
-import ssl
 import sys
 import time
-from urllib.request import HTTPSHandler, build_opener
 
 if __package__:
     from . import staging_probe as probe
@@ -57,9 +55,7 @@ def watch_drain(origin, max_polls=12, stable_samples=3,
     # room identifier, URL path, insecure origin or multi-target LB set.
     origin = probe.validate_base_urls([origin])[0]
     if opener is None:
-        opener = build_opener(
-            probe.DenyRedirect(),
-            HTTPSHandler(context=ssl.create_default_context()))
+        opener = probe.make_strict_opener()
 
     # A 503 before the initial 200 is not a verified transition. Do not
     # tell the operator to act until both public baseline responses pass.

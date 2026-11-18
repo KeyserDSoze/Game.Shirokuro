@@ -12,7 +12,7 @@ import sys
 import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 MAX_RESPONSE_BYTES = 1024
 MAX_SAMPLES = 30
@@ -113,6 +113,18 @@ def probe_one(opener, origin, path, timeout, expected_ready):
     return status
 
 
+def make_strict_opener():
+    """Direct HTTPS only: bypass implicit proxy environment and system config.
+
+    urllib's build_opener() automatically installs a ProxyHandler from
+    HTTPS_PROXY/ALL_PROXY unless one is explicitly provided. A preStop
+    test must observe the intended direct node, not a proxy or LB path.
+    Certificates and hostnames still use the default system trust policy.
+    """
+    return build_opener(ProxyHandler({}), DenyRedirect(),
+                        HTTPSHandler(context=ssl.create_default_context()))
+
+
 def run_checks(origins, expected_ready, samples, interval, timeout, *,
                opener=None, sleep=time.sleep):
     if (not isinstance(samples, int) or not 1 <= samples <= MAX_SAMPLES or
@@ -121,10 +133,7 @@ def run_checks(origins, expected_ready, samples, interval, timeout, *,
     if expected_ready not in ("ready", "unavailable"):
         raise ProbeError("Invalid readiness expectation")
     if opener is None:
-        # Default, strict certificate/hostname verification. Do NOT add an
-        # allow-untrusted-certificate option for staging or CI convenience.
-        opener = build_opener(DenyRedirect(),
-                              HTTPSHandler(context=ssl.create_default_context()))
+        opener = make_strict_opener()
     for index in range(samples):
         for origin in origins:
             probe_one(opener, origin, "/api/health", timeout, expected_ready)
