@@ -905,6 +905,101 @@ public sealed class RedisLobbyQuotaStoreTests
     }
 
     [Fact]
+    public async Task RealRedisEmitsThreePrivateSafeIntegrityDenialsNotNormalConflicts()
+    {
+        if (Address is null) return;
+        using var capture = new MultiplayerMetricCapture();
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-telemetry-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = GuestSessions.NewPlayerId();
+            var roomId = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(roomId, owner, clock.GetUtcNow()), 2, 1));
+
+            var nextOwnerRoom = Room("room-" + Guid.NewGuid().ToString("N"),
+                GuestSessions.NewPlayerId(), clock.GetUtcNow());
+            var sameOwnerRoom = Room("room-" + Guid.NewGuid().ToString("N"),
+                owner, clock.GetUtcNow());
+            // A real, ordinary quota denial is NOT evidence of corruption.
+            await Assert.ThrowsAsync<LobbyCapacityException>(() =>
+                two.CreateBoundedAsync(sameOwnerRoom, 2, 1));
+
+            var stale = (await two.ReadAsync(roomId))!;
+            clock.Advance(TimeSpan.FromSeconds(1));
+            var heartbeat = stale.Snapshot with
+            {
+                LastActivityUtc = clock.GetUtcNow()
+            };
+            Assert.True(await one.CompareExchangeAsync(stale, heartbeat));
+            Assert.False(await two.CompareExchangeAsync(stale, heartbeat));
+            Assert.False(await two.DeleteIfCurrentAsync(stale));
+
+            var actual = (await two.ReadAsync(roomId))!;
+            var db = a.GetDatabase();
+            var global = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(global)).ToString();
+            var originalScore = await db.SortedSetScoreAsync(global, roomKey);
+            Assert.NotNull(originalScore);
+            var damagedScore = (double)DateTimeOffset.UtcNow
+                .AddMinutes(-5).ToUnixTimeMilliseconds();
+            Assert.False(await db.SortedSetAddAsync(
+                global, roomKey, damagedScore));
+
+            // On the same actual Redis key, three distinct operations
+            // receive three distinct authoritative Lua integrity outcomes.
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(() =>
+                two.CreateBoundedAsync(nextOwnerRoom, 2, 1));
+            clock.Advance(TimeSpan.FromSeconds(1));
+            var updated = actual.Snapshot with
+            {
+                LastActivityUtc = clock.GetUtcNow()
+            };
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                one.CompareExchangeAsync(actual, updated));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                two.DeleteIfCurrentAsync(actual));
+
+            var events = capture.For(
+                MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+            foreach (var operation in new[] { "create", "cas", "delete" })
+                Assert.Contains(events, measurement =>
+                    measurement.Value == 1 &&
+                    measurement.Tags.Count == 1 &&
+                    measurement.Tags.TryGetValue("operation", out var value) &&
+                    value == operation);
+            Assert.All(events, measurement =>
+            {
+                Assert.Equal(1, measurement.Value);
+                Assert.Equal(new[] { "operation" }, measurement.Tags.Keys);
+                Assert.Contains(measurement.Tags["operation"],
+                    new[] { "create", "cas", "delete" });
+                foreach (var label in measurement.Tags.Values)
+                {
+                    Assert.DoesNotContain(roomId, label, StringComparison.Ordinal);
+                    Assert.DoesNotContain(owner, label, StringComparison.Ordinal);
+                    Assert.DoesNotContain(ns, label, StringComparison.Ordinal);
+                    Assert.DoesNotContain("password", label, StringComparison.OrdinalIgnoreCase);
+                }
+            });
+
+            // Operator repair restores normal CAS, DELETE and CREATE.
+            Assert.False(await db.SortedSetAddAsync(
+                global, roomKey, originalScore.Value));
+            Assert.True(await one.CompareExchangeAsync(actual, updated));
+            Assert.True(await two.DeleteIfCurrentAsync(
+                (await two.ReadAsync(roomId))!));
+            Assert.True(await one.CreateBoundedAsync(nextOwnerRoom, 2, 1));
+        }
+    }
+
+    [Fact]
     public void V2SnapshotsRequireQuotaTrackingMetadata()
     {
         var room = Room("room-required-metadata", "guest-alice",
