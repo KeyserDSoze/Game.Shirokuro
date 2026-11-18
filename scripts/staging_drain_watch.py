@@ -7,9 +7,11 @@ multi-pod ingress test and must not be run after SIGTERM.
 """
 
 import argparse
+import ipaddress
 import math
 import sys
 import time
+from urllib.parse import urlsplit
 
 if __package__:
     from . import staging_probe as probe
@@ -47,19 +49,46 @@ def read_state(opener, origin, timeout):
     return state
 
 
+def same_endpoint(first, second):
+    """Reject trivially identical direct targets; this is NOT pod attestation."""
+    def key(origin):
+        parsed = urlsplit(origin)
+        hostname = parsed.hostname
+        try:
+            hostname = str(ipaddress.ip_address(hostname))
+        except ValueError:
+            hostname = hostname.lower()
+        return hostname, parsed.port or 443
+    return key(first) == key(second)
+
+
 def watch_drain(origin, max_polls=12, stable_samples=3,
                 interval=2.0, timeout=3.0, *,
-                opener=None, sleep=time.sleep, notify=None):
+                opener=None, sleep=time.sleep, notify=None,
+                survivor_origin=None):
     validated_bounds(max_polls, stable_samples, interval, timeout)
-    # Exactly one direct-node HTTPS origin; never a query, bearer token,
-    # room identifier, URL path, insecure origin or multi-target LB set.
-    origin = probe.validate_base_urls([origin])[0]
+    # Optional second *direct* HTTPS origin, never an LB fallback. The same
+    # SSL-verified, no-environment-proxy opener is shared by both nodes.
+    targets = probe.validate_base_urls(
+        [origin] if survivor_origin is None else [origin, survivor_origin])
+    origin = targets[0]
+    survivor_origin = targets[1] if len(targets) == 2 else None
+    if survivor_origin is not None and same_endpoint(origin, survivor_origin):
+        raise probe.ProbeError("Duplicate node endpoint")
     if opener is None:
         opener = probe.make_strict_opener()
 
-    # A 503 before the initial 200 is not a verified transition. Do not
-    # tell the operator to act until both public baseline responses pass.
-    if read_state(opener, origin, timeout) != "ready":
+    def observe():
+        draining = read_state(opener, origin, timeout)
+        if survivor_origin is not None and (
+                read_state(opener, survivor_origin, timeout) != "ready"):
+            # A healthy drain is not evidence of availability if its only
+            # surviving node is also unready. Check even on the final sample.
+            raise probe.ProbeError("Surviving node unavailable")
+        return draining
+
+    # Both nodes must pass their baseline before prompting external preStop.
+    if observe() != "ready":
         raise probe.ProbeError("Missing ready baseline")
     if notify is not None:
         notify("Baseline verified. Initiate preStop externally; keep node alive.")
@@ -67,7 +96,7 @@ def watch_drain(origin, max_polls=12, stable_samples=3,
     consecutive_unavailable = 0
     for _ in range(max_polls):
         sleep(interval)
-        state = read_state(opener, origin, timeout)
+        state = observe()
         if state == "unavailable":
             consecutive_unavailable += 1
             if consecutive_unavailable == stable_samples:
@@ -83,7 +112,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Watch an external preStop through strict public HTTPS GETs")
     parser.add_argument("--base-url", required=True,
-                        help="One direct, certificate-verified node HTTPS origin")
+                        help="Direct, certificate-verified draining-node HTTPS origin")
+    parser.add_argument("--survivor-url",
+                        help="Optional separate direct survivor-node HTTPS origin")
     parser.add_argument("--max-polls", type=int, default=12)
     parser.add_argument("--stable-samples", type=int, default=3)
     parser.add_argument("--interval", type=float, default=2)
@@ -91,7 +122,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         watch_drain(args.base_url, args.max_polls, args.stable_samples,
-                    args.interval, args.timeout, notify=print)
+                    args.interval, args.timeout, notify=print,
+                    survivor_origin=args.survivor_url)
     except Exception:
         # No origin URL, HTTP body, response paths, cookie, bearer token,
         # TLS error or Redis details are ever reported.
