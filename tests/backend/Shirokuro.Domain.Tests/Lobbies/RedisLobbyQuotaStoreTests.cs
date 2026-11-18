@@ -999,6 +999,203 @@ public sealed class RedisLobbyQuotaStoreTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FutureDeadlineOrphanIsReclaimedOnlyWhenTheRelevantQuotaIsFull(
+        bool saturateGlobal)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-future-orphan-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = GuestSessions.NewPlayerId();
+            var globalLimit = saturateGlobal ? 1 : 2;
+            var ownerLimit = saturateGlobal ? 2 : 1;
+            var firstId = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(firstId, owner, clock.GetUtcNow()), globalLimit, ownerLimit));
+
+            var db = a.GetDatabase();
+            var prefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var global = prefix + "all";
+            var ownerHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var creator = prefix + "creator:" + ownerHash;
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(global)).ToString();
+            var futureDeadline = await db.SortedSetScoreAsync(global, roomKey);
+            Assert.NotNull(futureDeadline);
+            Assert.True(futureDeadline > DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            Assert.Equal(futureDeadline,
+                await db.SortedSetScoreAsync(creator, roomKey));
+            // Model early physical loss/eviction. The index STILL points
+            // to a future deadline; the old due-only pruning missed it.
+            Assert.True(await db.KeyDeleteAsync(roomKey));
+            Assert.Equal(futureDeadline,
+                await db.SortedSetScoreAsync(global, roomKey));
+            Assert.Equal(futureDeadline,
+                await db.SortedSetScoreAsync(creator, roomKey));
+
+            var second = Room("room-" + Guid.NewGuid().ToString("N"),
+                owner, clock.GetUtcNow());
+            Assert.True(await two.CreateBoundedAsync(
+                second, globalLimit, ownerLimit));
+            Assert.NotNull(await one.ReadAsync(second.State.Definition.LobbyId));
+            // The saturated index must release the lost room's quota.
+            var fullIndex = saturateGlobal ? global : creator;
+            Assert.Null(await db.SortedSetScoreAsync(fullIndex, roomKey));
+            Assert.Equal(1, await db.SortedSetLengthAsync(fullIndex));
+            // Another write with a physically healthy live room is a
+            // normal capacity denial, not a corrupt-index 503 or a bypass.
+            var third = Room("room-" + Guid.NewGuid().ToString("N"),
+                owner, clock.GetUtcNow());
+            await Assert.ThrowsAsync<LobbyCapacityException>(
+                () => one.CreateBoundedAsync(third, globalLimit, ownerLimit));
+
+            Assert.True(await one.DeleteIfCurrentAsync(
+                (await one.ReadAsync(second.State.Definition.LobbyId))!));
+            Assert.True(await two.CreateBoundedAsync(
+                third, globalLimit, ownerLimit));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FullIndexWithLiveBadDeadlineOrLostTtlFailsClosedBeforeAnyQuotaPrune(
+        bool removeTtl)
+    {
+        if (Address is null) return;
+        using var telemetry = new MultiplayerMetricCapture();
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-future-corrupt-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = GuestSessions.NewPlayerId();
+            var firstId = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(firstId, owner, clock.GetUtcNow()), 1, 1));
+            var db = a.GetDatabase();
+            var prefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var global = prefix + "all";
+            var creator = prefix + "creator:" +
+                Convert.ToHexStringLower(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(global)).ToString();
+            var existing = (byte[])(await db.StringGetAsync(roomKey))!;
+            var score = await db.SortedSetScoreAsync(global, roomKey);
+            Assert.NotNull(score);
+            var request = Room("room-" + Guid.NewGuid().ToString("N"),
+                owner, clock.GetUtcNow());
+            // First prove a legitimate full room returns 429, not 503.
+            await Assert.ThrowsAsync<LobbyCapacityException>(
+                () => two.CreateBoundedAsync(request, 1, 1));
+            if (removeTtl)
+                Assert.True(await db.KeyPersistAsync(roomKey));
+            else
+                Assert.False(await db.SortedSetAddAsync(
+                    global, roomKey, score!.Value + 3_600_000));
+
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(request, 1, 1));
+            Assert.Equal(existing, (byte[])(await db.StringGetAsync(roomKey))!);
+            Assert.Single(await db.SortedSetRangeByRankAsync(global));
+            Assert.Single(await db.SortedSetRangeByRankAsync(creator));
+            Assert.Equal(removeTtl ? score!.Value : score!.Value + 3_600_000,
+                await db.SortedSetScoreAsync(global, roomKey));
+            // The metric reflects one real corruption, not quota saturation.
+            Assert.Contains(telemetry.For(
+                MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName), sample =>
+                sample.Value == 1 && sample.Tags.Count == 1 &&
+                sample.Tags.TryGetValue("operation", out var op) && op == "create");
+
+            // Repair both deadline scores if the TTL changed; otherwise
+            // the quota is still legitimately full and should remain 429.
+            if (removeTtl)
+            {
+                Assert.True(await db.KeyExpireAsync(roomKey, TimeSpan.FromMinutes(30)));
+                var deadline = (long)await db.ExecuteAsync("PEXPIRETIME", roomKey);
+                Assert.True(deadline > 0);
+                Assert.False(await db.SortedSetAddAsync(global, roomKey, deadline));
+                Assert.False(await db.SortedSetAddAsync(creator, roomKey, deadline));
+            }
+            else
+                Assert.False(await db.SortedSetAddAsync(global, roomKey, score.Value));
+            await Assert.ThrowsAsync<LobbyCapacityException>(
+                () => one.CreateBoundedAsync(request, 1, 1));
+        }
+    }
+
+    [Fact]
+    public async Task GlobalOrphanPreflightNeverPartiallyPrunesBeforeCreatorCorruption()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-future-atomic-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var guestA = GuestSessions.NewPlayerId();
+            var guestB = GuestSessions.NewPlayerId();
+            var roomA = Room("room-" + Guid.NewGuid().ToString("N"),
+                guestA, clock.GetUtcNow());
+            var roomB = Room("room-" + Guid.NewGuid().ToString("N"),
+                guestB, clock.GetUtcNow());
+            Assert.True(await one.CreateBoundedAsync(roomA, 2, 1));
+            Assert.True(await two.CreateBoundedAsync(roomB, 2, 1));
+            var db = a.GetDatabase();
+            var prefix = "shirokuro:lobby:{" + ns + "}:v2:";
+            var global = prefix + "capacity:all";
+            var creatorB = prefix + "capacity:creator:" +
+                Convert.ToHexStringLower(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(guestB)));
+            var keyA = prefix + "room:" + Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(
+                    roomA.State.Definition.LobbyId)));
+            var keyB = prefix + "room:" + Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(
+                    roomB.State.Definition.LobbyId)));
+            Assert.True(await db.KeyDeleteAsync(keyA));
+            var healthyScore = await db.SortedSetScoreAsync(creatorB, keyB);
+            Assert.NotNull(healthyScore);
+            Assert.False(await db.SortedSetAddAsync(
+                creatorB, keyB, healthyScore!.Value + 3_600_000));
+
+            var attempted = Room("room-" + Guid.NewGuid().ToString("N"),
+                guestB, clock.GetUtcNow());
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(attempted, 2, 1));
+            Assert.NotNull(await db.SortedSetScoreAsync(global, keyA));
+            Assert.Equal(2, await db.SortedSetLengthAsync(global));
+            Assert.Equal(healthyScore.Value + 3_600_000,
+                await db.SortedSetScoreAsync(creatorB, keyB));
+            Assert.Null(await two.ReadAsync(attempted.State.Definition.LobbyId));
+            Assert.NotNull(await two.ReadAsync(roomB.State.Definition.LobbyId));
+
+            Assert.False(await db.SortedSetAddAsync(
+                creatorB, keyB, healthyScore.Value));
+            // Normal creator quota remains enforced after repair, even
+            // though the global orphan can now be safely reclaimed.
+            await Assert.ThrowsAsync<LobbyCapacityException>(
+                () => one.CreateBoundedAsync(attempted, 2, 1));
+            Assert.Null(await db.SortedSetScoreAsync(global, keyA));
+        }
+    }
+
     [Fact]
     public void V2SnapshotsRequireQuotaTrackingMetadata()
     {
