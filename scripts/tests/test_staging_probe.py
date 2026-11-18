@@ -75,12 +75,17 @@ class StagingProbeTests(unittest.TestCase):
     def test_rejects_untrusted_url_forms(self):
         for url in ("http://game.example", "https://user:secret@game.example",
                     "https://game.example/api/ready", "https://game.example/?ticket=x",
-                    "https://game.example/#secret", "https://game.example:bad",
+                    "https://game.example/#secret", "https://game.example?",
+                    "https://game.example#", "https://game.example:bad",
                     "https://", " https://game.example", "https://game.example\n"):
             with self.subTest(url=url), self.assertRaises(probe.ProbeError):
                 probe.validate_base_urls([url])
         with self.assertRaises(probe.ProbeError):
             probe.validate_base_urls(["https://a.example", "https://a.example/"])
+        with self.assertRaises(probe.ProbeError):
+            probe.validate_base_urls([
+                "https://node-" + str(i) + ".example" for i in range(9)
+            ])
 
     def test_exact_public_health_and_ready_contract(self):
         probe.validate_response("/api/health", 200, VALID_HEADERS(),

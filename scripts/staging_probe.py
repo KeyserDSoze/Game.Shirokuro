@@ -16,6 +16,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 MAX_RESPONSE_BYTES = 1024
 MAX_SAMPLES = 30
+MAX_TARGETS = 8
 
 
 class ProbeError(Exception):
@@ -29,9 +30,13 @@ class DenyRedirect(HTTPRedirectHandler):
 
 def validate_base_urls(values):
     """Accept only bare HTTPS origins; never a URL carrying a secret."""
+    if len(values) > MAX_TARGETS:
+        raise ProbeError("Too many staging targets")
     origins = []
     for value in values:
-        if not value or value != value.strip() or any(c.isspace() for c in value):
+        if (not value or value != value.strip() or
+                any(c.isspace() for c in value) or
+                "?" in value or "#" in value):
             raise ProbeError("Invalid staging configuration")
         try:
             parsed = urlsplit(value)
