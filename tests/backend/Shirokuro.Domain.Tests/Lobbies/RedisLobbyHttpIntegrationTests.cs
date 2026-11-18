@@ -301,6 +301,88 @@ public sealed class RedisLobbyHttpIntegrationTests
     }
 
     [Fact]
+    public async Task CorruptQuotaDeadlineReturnsProduction503Not409Or204ThenRecovers()
+    {
+        if (ConnectionString is null) return;
+        var (redisA, redisB) = await Redis();
+        using (redisA)
+        using (redisB)
+        {
+            var (sessionProvider, shared) = SharedSessions();
+            using (sessionProvider)
+            {
+                var ns = "api-deadline-" + Guid.NewGuid().ToString("N");
+                using var serverA = Server(shared, redisA, ns);
+                using var serverB = Server(shared, redisB, ns);
+                using var visitorA = Client(serverA);
+                var (_, cookie) = await Login(visitorA);
+                using var memberA = Client(serverA, cookie);
+                using var memberB = Client(serverB, cookie);
+                var (roomId, revision) = await Create(memberA);
+
+                var db = redisA.GetDatabase();
+                var index = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+                var roomKey = Assert.Single(await db.SortedSetRangeByRankAsync(index));
+                var deadline = await db.SortedSetScoreAsync(index, roomKey);
+                Assert.NotNull(deadline);
+                var existingRoom = (byte[])(await db.StringGetAsync(roomKey))!;
+                var damagedDeadline = deadline!.Value - 3_600_000d;
+                Assert.False(await db.SortedSetAddAsync(
+                    index, roomKey, damagedDeadline));
+
+                using (var patch = Write(HttpMethod.Patch,
+                    "/api/lobbies/" + roomId + "/hero",
+                    new { heroId = "kira", expectedRevision = revision }))
+                using (var denied = await memberB.SendAsync(patch))
+                {
+                    Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+                    Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+                    Assert.False(denied.Headers.Contains("Location"));
+                    Assert.Empty(await denied.Content.ReadAsByteArrayAsync());
+                }
+                using (var leave = Write(HttpMethod.Delete,
+                    "/api/lobbies/" + roomId + "/membership",
+                    new { expectedRevision = revision }))
+                using (var denied = await memberA.SendAsync(leave))
+                {
+                    Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+                    Assert.Equal("no-store", denied.Headers.CacheControl?.ToString());
+                    Assert.Empty(await denied.Content.ReadAsByteArrayAsync());
+                }
+
+                Assert.Equal(existingRoom, (byte[])(await db.StringGetAsync(roomKey))!);
+                Assert.Equal(damagedDeadline,
+                    await db.SortedSetScoreAsync(index, roomKey));
+                using (var peek = await memberA.GetAsync(
+                    "/api/lobbies/" + roomId + "/roster/peek"))
+                {
+                    Assert.Equal(HttpStatusCode.OK, peek.StatusCode);
+                    using var json = JsonDocument.Parse(
+                        await peek.Content.ReadAsStringAsync());
+                    Assert.Equal(revision,
+                        json.RootElement.GetProperty("revision").GetInt64());
+                }
+
+                // Explicitly restore the original index score, not a new
+                // room or guest session, before retrying the same command.
+                Assert.False(await db.SortedSetAddAsync(
+                    index, roomKey, deadline.Value));
+                using (var patch = Write(HttpMethod.Patch,
+                    "/api/lobbies/" + roomId + "/hero",
+                    new { heroId = "kira", expectedRevision = revision }))
+                using (var success = await memberB.SendAsync(patch))
+                    Assert.Equal(HttpStatusCode.OK, success.StatusCode);
+                using (var leave = Write(HttpMethod.Delete,
+                    "/api/lobbies/" + roomId + "/membership",
+                    new { expectedRevision = revision + 1 }))
+                using (var success = await memberA.SendAsync(leave))
+                    Assert.Equal(HttpStatusCode.NoContent, success.StatusCode);
+                Assert.False(await db.KeyExistsAsync(roomKey));
+            }
+        }
+    }
+
+    [Fact]
     public async Task ParallelJoinRevisionIsAtomicAndThirdInstanceRecoversRoster()
     {
         if (ConnectionString is null) return;
