@@ -1110,9 +1110,9 @@ public sealed class RedisTlsProductionTestsKestrel
                 "post-drain-authorized", timeout.Token);
             Assert.False(restored.TryGetProperty("error", out _));
             var recoveredRoster = restored.GetProperty("result");
-            Assert.True(string.Equals(
-                room, recoveredRoster.GetProperty("lobbyId").GetString(),
-                StringComparison.Ordinal));
+            Assert.True(string.CompareOrdinal(
+                room, recoveredRoster.GetProperty("lobbyId").GetString()) == 0,
+                "Recovered WSS did not return the requested private lobby.");
             Assert.Equal(3L, recoveredRoster.GetProperty("revision").GetInt64());
             Assert.True(string.CompareOrdinal(bob, Assert.Single(
                 recoveredRoster.GetProperty("participants").EnumerateArray())
