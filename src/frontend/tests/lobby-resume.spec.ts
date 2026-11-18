@@ -178,7 +178,9 @@ test('a persistent roster outage spends only one wake and preserves bounded back
   })
   await page.clock.fastForward(16_000)
   expect(reads).toBe(2)
-  await page.clock.fastForward(15_000)
+  // Failure #2 uses positive 0..20% jitter: a 60s base can run as
+  // late as 72s. Observe after the bounded upper limit, not at 61s.
+  await page.clock.fastForward(27_000)
   await expect.poll(() => reads).toBe(3)
   await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
   await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
@@ -256,8 +258,13 @@ test('an old-revision 200 after Redis outage preserves backoff and cannot rearm 
   })
   await page.clock.fastForward(15_100)
   await expect.poll(() => reads).toBe(2)
-  await page.clock.fastForward(60_100)
+  // The handler increments reads before its fetch response finishes. Give
+  // its finally a browser event-loop turn to install the next timer, then
+  // cross the *upper* 72s jittered retry bound (not the 60s minimum).
+  await page.clock.runFor(200)
+  await page.clock.fastForward(75_000)
   await expect.poll(() => reads).toBe(3)
+  await page.clock.runFor(200)
 
   // This third GET returned HTTP 200, but revision 3 is older than our
   // locally verified 4. Do not adopt its payload or claim recovery.
@@ -276,6 +283,9 @@ test('an old-revision 200 after Redis outage preserves backoff and cannot rearm 
   })
   await page.clock.fastForward(16_000)
   expect(reads).toBe(3)
+  // Failure #3 is capped at 120s regardless of jitter. All three
+  // windows together are >120s, but the 46s intermediate assertion
+  // above ensures repeated wake hints did not shorten the deadline.
   await page.clock.fastForward(74_000)
   await expect.poll(() => reads).toBe(4)
   await expect(page.getByTestId('lobby-revision')).toContainText('5')
