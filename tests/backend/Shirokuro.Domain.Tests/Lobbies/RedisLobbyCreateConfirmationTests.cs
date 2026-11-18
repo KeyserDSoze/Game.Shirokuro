@@ -185,8 +185,10 @@ public sealed class RedisLobbyCreateConfirmationTests
     [InlineData(-1)]
     [InlineData(-2)]
     [InlineData(-3)]
+    [InlineData(-4)]
     public async Task NonCreatedOrCapacityRejectedRoomDoesNotReadBack(long result)
     {
+        using var capture = new MultiplayerMetricCapture();
         var (database, fake) = Database();
         fake.CreateResult = result;
         var (store, room) = Scenario(database);
@@ -195,11 +197,24 @@ public sealed class RedisLobbyCreateConfirmationTests
         else if (result == -3)
             await Assert.ThrowsAsync<UnauthorizedAccessException>(
                 () => store.CreateBoundedAsync(room, 256, 8));
+        else if (result == -4)
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => store.CreateBoundedAsync(room, 256, 8));
         else
             await Assert.ThrowsAsync<LobbyCapacityException>(
                 () => store.CreateBoundedAsync(room, 256, 8));
         Assert.Equal(1, fake.CreateCalls);
         Assert.Equal(0, fake.ConfirmCalls);
+        var integrity = capture.For(MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+        if (result == -4)
+            Assert.Contains(integrity, m =>
+                m.Value == 1 && m.Tags.Count == 1 &&
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "create");
+        else
+            Assert.DoesNotContain(integrity, m =>
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "create");
     }
 
     [Fact]
