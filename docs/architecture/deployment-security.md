@@ -3557,3 +3557,46 @@ Production API TestServers verify a corrupt index produces the expected
 counter while preserving HTTP 503/no-store and explicit-repair recovery.
 See [issue #189](https://github.com/KeyserDSoze/Game.Shirokuro/issues/189);
 the final complete CI gate is recorded there. Parent #21 remains open.
+
+
+## Ingress preStop, upstream removal and negotiated reconnect (#190)
+
+The CI-only Production integration now exercises the previously separate
+Linux SIGUSR1 preStop and Nginx HTTPS edge paths as **one** lifecycle
+scenario. Two independent Kestrel OS processes share the same validated
+Redis TLS service and persisted Data Protection key ring. Nginx validates
+Kestrel HTTPS certificates and uses *only* the Shirokuro signed guest
+cookie (not arbitrary cookies, player IDs or request parameters) for
+consistent negotiate/WSS affinity. A guest negotiates SignalR, upgrades
+to WSS and reads their authorized room; a separate guest receives the same
+opaque denial as an unknown room.
+
+The test sends real SIGUSR1 only to the test Kestrel PID owning an active
+guest WebSocket, never the CI runner or Redis. It checks that this child
+**stays alive** and answers /api/health 200 but /api/ready **503/no-store**
+and refuses new SignalR negotiate. The previous WSS must close/abort.
+Next, the operator-side fixture marks that upstream `down` in the
+bind-mounted Nginx config, validates it using `nginx -t` and reloads the
+edge. This is an explicit simulated LB withdrawal: it does **not** rely
+on Nginx to replay uncertain POSTs, which could double-create a room.
+Only after removing the drained upstream does the browser simulation
+open a **new** negotiate+WSS connection via the same signed cookie and
+confirm that the other Kestrel process serves the current Redis-backed
+private roster. A new authenticated non-member still gets the same
+private-safe error for both an existing room and an unknown room.
+A subsequent logout on the surviving upstream revokes the recovered
+cookie and socket. The graceful preStop itself must **not** revoke a
+session or delete a room.
+
+This verifies the important *behavioral contract* of graceful drain
+and authenticated reconnect using real TCP/TLS, process signals, an
+actual Nginx proxy and Redis persistence. It is NOT a Kubernetes rollout,
+nor evidence that a real external ingress controller updates endpoints
+fast enough, that any client will automatically retry, or that a real
+multi-zone Redis failover will meet production SLOs. Production still
+requires operator validation of LB readiness polling, propagation delay,
+orchestrator grace periods and client reconnect policy in staging.
+The tests run without certificate-validation bypasses, public admin
+endpoints, test credentials stored in git, or logging cookies/room IDs.
+See [#190](https://github.com/KeyserDSoze/Game.Shirokuro/issues/190)
+for the final GitHub Actions SHA gate; parent #21 remains open.
