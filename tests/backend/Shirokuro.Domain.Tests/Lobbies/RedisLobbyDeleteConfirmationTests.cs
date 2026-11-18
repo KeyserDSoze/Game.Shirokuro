@@ -213,19 +213,34 @@ public sealed class RedisLobbyDeleteConfirmationTests
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
+    [InlineData(-2)]
     public async Task ConflictOrRevocationFenceCannotTriggerReadback(long code)
     {
+        using var capture = new MultiplayerMetricCapture();
         var (db, fake) = NewDatabase();
         var (store, current) = Scenario(db);
         fake.Seed(current.RawBytes, tracked: true);
         fake.DeleteResult = code;
         if (code == 0)
             Assert.False(await store.DeleteIfCurrentAsync(current));
-        else
+        else if (code == -1)
             await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => store.DeleteIfCurrentAsync(current, current.Snapshot.CreatorId));
+        else
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(
                 () => store.DeleteIfCurrentAsync(current, current.Snapshot.CreatorId));
         Assert.Equal(1, fake.Deletes);
         Assert.Equal(0, fake.Confirms);
+        var integrity = capture.For(MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+        if (code == -2)
+            Assert.Contains(integrity, m =>
+                m.Value == 1 && m.Tags.Count == 1 &&
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "delete");
+        else
+            Assert.DoesNotContain(integrity, m =>
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "delete");
         Assert.True(fake.RoomPresent);
         Assert.True(fake.GlobalPresent);
         Assert.True(fake.CreatorPresent);
