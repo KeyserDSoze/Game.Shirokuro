@@ -110,3 +110,78 @@ test('returning online after an outage advances only one verified roster read wi
   await expect(page.getByTestId('lobby-revision')).toContainText('2')
   expect(writes).toEqual([])
 })
+
+
+test('a persistent roster outage spends only one wake and preserves bounded backoff', async ({ page }) => {
+  test.setTimeout(60_000)
+  // Clock control exercises 30/60s backoff without sleeping for minutes.
+  await page.clock.install()
+  const code = 'room-' + 'f'.repeat(32)
+  const actor = 'guest-' + 'f'.repeat(32)
+  const original = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+  }
+  let signedIn = false
+  let reads = 0
+  let mutations = 0
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    mutations++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    mutations++
+    return route.fulfill({ status: 201, json: original })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
+    reads++
+    return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+      json: { status: 'unavailable' },
+    })
+  })
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  expect(mutations).toBe(2)
+
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(1)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+
+  // The first wake moves the pending 30s recovery retry forward, but
+  // cannot violate the 15s minimum since the previous attempted GET.
+  await page.evaluate(() => {
+    for (let i = 0; i < 40; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(2)
+
+  // A second set of hints after its 30s cooldown MUST NOT reduce the
+  // naturally scheduled 60s retry following the second 503.
+  await page.clock.fastForward(30_100)
+  await page.evaluate(() => {
+    for (let i = 0; i < 40; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(16_000)
+  expect(reads).toBe(2)
+  await page.clock.fastForward(15_000)
+  await expect.poll(() => reads).toBe(3)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(mutations).toBe(2) // never replay POST/PATCH/DELETE due to a hint
+})

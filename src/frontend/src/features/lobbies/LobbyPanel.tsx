@@ -10,7 +10,8 @@ import {
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
   classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
-  rosterCanHonorResumeHint, rosterResumeDelayMs, nextRosterSyncStatus,
+  rosterCanHonorResumeHint, rosterCanAdvanceOnWake,
+  rosterResumeDelayMs, nextRosterSyncStatus,
   type RosterSyncStatus,
 } from './rosterSync'
 import { sessionRecheckDelayMs } from './sessionRecheck'
@@ -220,6 +221,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let lastReadStartedAt = performance.now()
     let lastResumeHintAt: number | null = null
     let resumePending = false
+    // A single early wake helps recovery; after it also fails, focus/online
+    // storms cannot repeatedly bypass the 30/60/120-second retry budget.
+    let outageWakeUsed = false
 
     // A wake event can only move a previously scheduled read earlier.
     // Repeated focus/online/visibility hints cannot postpone its deadline
@@ -239,7 +243,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
 
     const resume = () => {
       if (!active || document.hidden || !navigator.onLine ||
-          busyRef.current) return
+          busyRef.current ||
+          !rosterCanAdvanceOnWake(transientFailures, outageWakeUsed)) return
       const now = performance.now()
       if (!rosterCanHonorResumeHint(lastResumeHintAt, now)) return
       lastResumeHintAt = now
@@ -249,6 +254,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         resumePending = true
         return
       }
+      if (transientFailures > 0) outageWakeUsed = true
       schedule(rosterResumeDelayMs(lastReadStartedAt, now))
     }
     const onVisible = () => {
@@ -289,6 +295,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // A member-authorized 304 is a successful no-change response.
         if (latest === null) {
           transientFailures = 0
+          outageWakeUsed = false
           setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'verified'))
           return
         }
@@ -304,6 +311,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // Valid, including a stale but well-formed revision, means the API
         // is responsive. Do not penalize an authorized no-change snapshot.
         transientFailures = 0
+        // Only an authoritative current/newer snapshot replenishes the
+        // one-off outage wake budget; stale replica data cannot do so.
+        if (latest.revision >= current.revision) outageWakeUsed = false
         // A lagging replica's older 200 cannot establish freshness, even
         // though it is well-formed and must not replace the local revision.
         if (result !== 'missing')
@@ -344,10 +354,17 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // An old request may have finished after a user mutation started.
         // Never apply its failure penalty to a newer user operation.
         if (active && !terminal) {
-          if (!stillCurrent()) transientFailures = 0
-          // A wake received during an in-flight read may produce one
-          // trailing probe, never a concurrent request or immediate retry.
-          const delay = resumePending
+          if (!stillCurrent()) {
+            transientFailures = 0
+            outageWakeUsed = false
+          }
+          // A hint delivered while a GET is in-flight must consume the
+          // same single outage allowance if the GET fails. All subsequent
+          // hints leave the existing exponential backoff intact.
+          const advance = resumePending &&
+            rosterCanAdvanceOnWake(transientFailures, outageWakeUsed)
+          if (advance && transientFailures > 0) outageWakeUsed = true
+          const delay = advance
             ? rosterResumeDelayMs(lastReadStartedAt, performance.now())
             : rosterPollDelayMs(transientFailures, Math.random())
           resumePending = false

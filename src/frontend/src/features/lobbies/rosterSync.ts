@@ -48,6 +48,21 @@ export function rosterPollDelayMs(
     Math.round(base * (1 + fraction * 0.2)))
 }
 
+/**
+ * A failing roster read can be advanced by one online/focus hint so a real
+ * network recovery is noticed promptly. Once that early read also fails,
+ * additional hints must NOT defeat the normal 30/60/120s backoff. The caller
+ * resets the allowance only after a verified authorized 200/304, or when
+ * the room/guest changes. Pure policy: no clock or mutation side effects.
+ */
+export function rosterCanAdvanceOnWake(
+  consecutiveFailures: number, outageWakeUsed: boolean,
+): boolean {
+  return Number.isSafeInteger(consecutiveFailures) &&
+    consecutiveFailures >= 0 &&
+    (consecutiveFailures === 0 || !outageWakeUsed)
+}
+
 export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing' | 'invalid'
 
 /**

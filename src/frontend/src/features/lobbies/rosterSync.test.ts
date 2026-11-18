@@ -6,7 +6,8 @@ import {
   LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS,
   classifyConflictRosterRefresh, classifyRosterPollFailure,
   isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
-  rosterCanHonorResumeHint, rosterResumeDelayMs, nextRosterSyncStatus,
+  rosterCanHonorResumeHint, rosterCanAdvanceOnWake,
+  rosterResumeDelayMs, nextRosterSyncStatus,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -134,6 +135,35 @@ describe('pre-match authenticated lobby polling', () => {
     expect(rosterCanHonorResumeHint(NaN, 100_000)).toBe(false)
     expect(rosterCanHonorResumeHint(null, Number.POSITIVE_INFINITY)).toBe(false)
     expect(rosterCanHonorResumeHint(null, Number.NaN)).toBe(false)
+  })
+
+  it('allows only one expedited wake per persistent outage episode', () => {
+    // A first failed GET must permit one bounded, 15-second-floor
+    // recovery read; a second failure consumes the allowance until an
+    // authorized 200/304 resets it. Failure count itself still controls
+    // the existing 30/60/120s retry/backoff policy.
+    expect(rosterCanAdvanceOnWake(0, false)).toBe(true)
+    expect(rosterCanAdvanceOnWake(1, false)).toBe(true)
+    expect(rosterCanAdvanceOnWake(2, false)).toBe(true)
+    expect(rosterCanAdvanceOnWake(3, false)).toBe(true)
+    expect(rosterCanAdvanceOnWake(1, true)).toBe(false)
+    expect(rosterCanAdvanceOnWake(2, true)).toBe(false)
+    expect(rosterCanAdvanceOnWake(3, true)).toBe(false)
+    expect(rosterCanAdvanceOnWake(1000, true)).toBe(false)
+    // Once the parent effect observes a verified response, it sets the
+    // failure count and used allowance to 0/false.
+    expect(rosterCanAdvanceOnWake(0, false)).toBe(true)
+    expect(rosterCanAdvanceOnWake(0, true)).toBe(true)
+  })
+
+  it('fails closed for malformed wake/backoff state', () => {
+    for (const failures of [-1, NaN, Infinity, -Infinity, 0.5, 2.5]) {
+      expect(rosterCanAdvanceOnWake(failures, false)).toBe(false)
+      expect(rosterCanAdvanceOnWake(failures, true)).toBe(false)
+    }
+    expect(rosterPollDelayMs(1, 0)).toBe(30_000)
+    expect(rosterPollDelayMs(2, 0)).toBe(60_000)
+    expect(rosterPollDelayMs(3, 0)).toBe(120_000)
   })
 
   it('never mistakes wake hints for server-authoritative guest revocation', () => {
