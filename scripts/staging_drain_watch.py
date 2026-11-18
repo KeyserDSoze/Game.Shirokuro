@@ -65,16 +65,24 @@ def same_endpoint(first, second):
 def watch_drain(origin, max_polls=12, stable_samples=3,
                 interval=2.0, timeout=3.0, *,
                 opener=None, sleep=time.sleep, notify=None,
-                survivor_origin=None):
+                survivor_origin=None, edge_origin=None):
     validated_bounds(max_polls, stable_samples, interval, timeout)
-    # Optional second *direct* HTTPS origin, never an LB fallback. The same
-    # SSL-verified, no-environment-proxy opener is shared by both nodes.
+    # A third public HTTPS ingress is meaningful only when we also check
+    # the actual surviving node. No hostname can attest Kubernetes pod
+    # identity: this only rejects trivially identical endpoint references.
+    if edge_origin is not None and survivor_origin is None:
+        raise probe.ProbeError("Edge requires a surviving node")
     targets = probe.validate_base_urls(
-        [origin] if survivor_origin is None else [origin, survivor_origin])
+        [origin] +
+        ([survivor_origin] if survivor_origin is not None else []) +
+        ([edge_origin] if edge_origin is not None else []))
+    if any(same_endpoint(first, second)
+           for i, first in enumerate(targets)
+           for second in targets[i + 1:]):
+        raise probe.ProbeError("Duplicate staging endpoint")
     origin = targets[0]
-    survivor_origin = targets[1] if len(targets) == 2 else None
-    if survivor_origin is not None and same_endpoint(origin, survivor_origin):
-        raise probe.ProbeError("Duplicate node endpoint")
+    survivor_origin = targets[1] if len(targets) > 1 else None
+    edge_origin = targets[2] if len(targets) > 2 else None
     if opener is None:
         opener = probe.make_strict_opener()
 
@@ -85,9 +93,14 @@ def watch_drain(origin, max_polls=12, stable_samples=3,
             # A healthy drain is not evidence of availability if its only
             # surviving node is also unready. Check even on the final sample.
             raise probe.ProbeError("Surviving node unavailable")
+        if edge_origin is not None and (
+                read_state(opener, edge_origin, timeout) != "ready"):
+            # An unready public edge is a failed continuity observation,
+            # even when both direct nodes behave exactly as intended.
+            raise probe.ProbeError("Public ingress unavailable")
         return draining
 
-    # Both nodes must pass their baseline before prompting external preStop.
+    # All requested targets must pass baseline before external preStop.
     if observe() != "ready":
         raise probe.ProbeError("Missing ready baseline")
     if notify is not None:
@@ -115,6 +128,8 @@ def main(argv=None):
                         help="Direct, certificate-verified draining-node HTTPS origin")
     parser.add_argument("--survivor-url",
                         help="Optional separate direct survivor-node HTTPS origin")
+    parser.add_argument("--edge-url",
+                        help="Optional public ingress HTTPS origin; requires survivor")
     parser.add_argument("--max-polls", type=int, default=12)
     parser.add_argument("--stable-samples", type=int, default=3)
     parser.add_argument("--interval", type=float, default=2)
@@ -123,7 +138,8 @@ def main(argv=None):
     try:
         watch_drain(args.base_url, args.max_polls, args.stable_samples,
                     args.interval, args.timeout, notify=print,
-                    survivor_origin=args.survivor_url)
+                    survivor_origin=args.survivor_url,
+                    edge_origin=args.edge_url)
     except Exception:
         # No origin URL, HTTP body, response paths, cookie, bearer token,
         # TLS error or Redis details are ever reported.

@@ -121,6 +121,7 @@ class RealStagingHttpsTests(unittest.TestCase):
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.load_cert_chain(str(cls.certificate), str(key))
             cls.nodes = [LocalTlsNode(tls), LocalTlsNode(tls)]
+            cls.edge = LocalTlsNode(tls)
         except Exception:
             cls.temporary.cleanup()
             raise
@@ -129,10 +130,11 @@ class RealStagingHttpsTests(unittest.TestCase):
     def tearDownClass(cls):
         for node in cls.nodes:
             node.close()
+        cls.edge.close()
         cls.temporary.cleanup()
 
     def setUp(self):
-        for node in self.nodes:
+        for node in [*self.nodes, self.edge]:
             node.reset()
 
     def trusted_opener(self, **environment):
@@ -213,6 +215,44 @@ class RealStagingHttpsTests(unittest.TestCase):
         self.assertEqual(1, len(announcements))
         self.assertEqual(6, drained.server.request_count)
         self.assertEqual(6, survivor.server.request_count)
+
+    def test_three_way_ingress_continuity_with_real_tls(self):
+        drained, survivor = self.nodes
+        edge = self.edge
+        opener = self.trusted_opener()
+        announcements = []
+
+        def external_drain(message):
+            announcements.append(message)
+            self.assertEqual(2, drained.server.request_count)
+            self.assertEqual(2, survivor.server.request_count)
+            self.assertEqual(2, edge.server.request_count)
+            drained.server.mode = "unavailable"
+
+        drain.watch_drain(drained.origin, 2, 2, .25, 2, opener=opener,
+                          sleep=lambda _: None, notify=external_drain,
+                          survivor_origin=survivor.origin,
+                          edge_origin=edge.origin)
+        self.assertEqual(1, len(announcements))
+        for node in (drained, survivor, edge):
+            self.assertEqual(6, node.server.request_count)
+
+    def test_three_way_ingress_503_at_final_sample_fails_real_tls(self):
+        drained, survivor = self.nodes
+        edge = self.edge
+        opener = self.trusted_opener()
+        edge.server.ready_sequence = ["ready", "ready", "unavailable"]
+
+        def external_drain(_):
+            drained.server.mode = "unavailable"
+
+        with self.assertRaises(probe.ProbeError):
+            drain.watch_drain(drained.origin, 2, 2, .25, 2, opener=opener,
+                              sleep=lambda _: None, notify=external_drain,
+                              survivor_origin=survivor.origin,
+                              edge_origin=edge.origin)
+        for node in (drained, survivor, edge):
+            self.assertEqual(6, node.server.request_count)
 
     def test_paired_watcher_rejects_survivor_503_on_final_sample(self):
         drained, survivor = self.nodes
