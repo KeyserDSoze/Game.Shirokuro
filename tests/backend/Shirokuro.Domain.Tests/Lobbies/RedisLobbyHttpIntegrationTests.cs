@@ -383,6 +383,73 @@ public sealed class RedisLobbyHttpIntegrationTests
     }
 
     [Fact]
+    public async Task ProductionCreateRejectsEarlyIndexPruningAcrossNodesUntilExplicitRepair()
+    {
+        if (ConnectionString is null) return;
+        var (redisA, redisB) = await Redis();
+        using (redisA)
+        using (redisB)
+        {
+            var (sessionProvider, shared) = SharedSessions();
+            using (sessionProvider)
+            {
+                var ns = "api-prune-live-" + Guid.NewGuid().ToString("N");
+                using var serverA = Server(shared, redisA, ns);
+                using var serverB = Server(shared, redisB, ns);
+                using var visitor = Client(serverA);
+                var (_, cookie) = await Login(visitor);
+                using var ownerA = Client(serverA, cookie);
+                using var ownerB = Client(serverB, cookie);
+                var (existingId, _) = await Create(ownerA);
+
+                var db = redisA.GetDatabase();
+                var global = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+                var roomKey = Assert.Single(
+                    await db.SortedSetRangeByRankAsync(global)).ToString();
+                var previousScore = await db.SortedSetScoreAsync(global, roomKey);
+                Assert.NotNull(previousScore);
+                var snapshot = (byte[])(await db.StringGetAsync(roomKey))!;
+                var previousTtl = await db.KeyTimeToLiveAsync(roomKey);
+                var staleScore = (double)DateTimeOffset.UtcNow
+                    .AddMinutes(-5).ToUnixTimeMilliseconds();
+                Assert.False(await db.SortedSetAddAsync(
+                    global, roomKey, staleScore));
+
+                using (var request = Write(HttpMethod.Post,
+                    "/api/lobbies",
+                    new { teamIds = new[] { "white", "black" },
+                          teamId = "white" }))
+                using (var blocked = await ownerB.SendAsync(request))
+                {
+                    Assert.Equal(HttpStatusCode.ServiceUnavailable,
+                        blocked.StatusCode);
+                    Assert.Equal("no-store", blocked.Headers.CacheControl?.ToString());
+                    Assert.False(blocked.Headers.Contains("Location"));
+                    Assert.Empty(await blocked.Content.ReadAsByteArrayAsync());
+                }
+
+                Assert.Equal(snapshot, (byte[])(await db.StringGetAsync(roomKey))!);
+                Assert.Equal(staleScore,
+                    await db.SortedSetScoreAsync(global, roomKey));
+                Assert.Single(await db.SortedSetRangeByRankAsync(global));
+                Assert.True(await db.KeyTimeToLiveAsync(roomKey) <= previousTtl);
+
+                using (var existing = await ownerB.GetAsync(
+                    "/api/lobbies/" + existingId + "/roster/peek"))
+                    Assert.Equal(HttpStatusCode.OK, existing.StatusCode);
+
+                // A repaired score restores normal CREATE without deleting
+                // the old lobby or relaxing the four-room creator limit.
+                Assert.False(await db.SortedSetAddAsync(
+                    global, roomKey, previousScore.Value));
+                var (newId, _) = await Create(ownerB);
+                Assert.NotEqual(existingId, newId);
+                Assert.Equal(2, await db.SortedSetLengthAsync(global));
+            }
+        }
+    }
+
+    [Fact]
     public async Task ParallelJoinRevisionIsAtomicAndThirdInstanceRecoversRoster()
     {
         if (ConnectionString is null) return;
