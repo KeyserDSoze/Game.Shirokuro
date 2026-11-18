@@ -89,6 +89,47 @@ class StagingProbeTests(unittest.TestCase):
                 "https://node-" + str(i) + ".example" for i in range(9)
             ])
 
+    def test_equivalent_https_origin_aliases_are_rejected(self):
+        # Repeated direct targets are not independent evidence of readiness.
+        for first, second in (
+                ("https://node.example", "https://NODE.EXAMPLE:443"),
+                ("https://node.example/", "https://node.example"),
+                ("https://[::1]:443", "https://[0:0:0:0:0:0:0:1]"),
+                ("https://127.0.0.1", "https://127.0.0.1:443")):
+            with self.subTest(first=first, second=second):
+                with self.assertRaises(probe.ProbeError):
+                    probe.validate_base_urls([first, second])
+
+    def test_direct_run_checks_validates_https_origins_before_any_io(self):
+        # A Python caller must receive the same guarantees as CLI main().
+        invalid_origins = (
+            None, [], "https://node.example", [42],
+            ["http://node.example"],
+            ["https://user:secret@node.example"],
+            ["https://node.example/api/health"],
+            ["https://node.example?ticket=x"],
+            ["https://node.example#token"],
+            ["https://node.example", "https://NODE.EXAMPLE:443"],
+            ["https://[::1]", "https://[0:0:0:0:0:0:0:1]:443"],
+            ["https://node-" + str(i) + ".example" for i in range(9)],
+        )
+        for origins in invalid_origins:
+            with self.subTest(origins=origins):
+                opener = FakeOpener()
+                sleeps = []
+                with self.assertRaises(probe.ProbeError):
+                    probe.run_checks(origins, "ready", 2, 0, 2,
+                                     opener=opener, sleep=sleeps.append)
+                self.assertEqual([], opener.calls)
+                self.assertEqual([], sleeps)
+
+    def test_invalid_direct_config_never_constructs_a_transport(self):
+        with patch.object(probe, "make_strict_opener",
+                          side_effect=AssertionError("no network transport")) as build:
+            with self.assertRaises(probe.ProbeError):
+                probe.run_checks(["http://node.example"], "ready", 1, 0, 2)
+        build.assert_not_called()
+
     def test_exact_public_health_and_ready_contract(self):
         probe.validate_response("/api/health", 200, VALID_HEADERS(),
                                 b'{"status":"ok","application":"Shirokuro"}', "ready")
@@ -142,15 +183,23 @@ class StagingProbeTests(unittest.TestCase):
                 self.assertTrue(all(v == 2 for _, v in opener.calls))
 
     def test_rejects_unbounded_configuration(self):
-        for count, interval, timeout in ((0, 0, 2), (31, 0, 2),
-                                         (1, -1, 2), (1, 31, 2),
-                                         (1, 0, 0), (1, 0, 11),
-                                         (1, float("nan"), 2)):
+        for count, interval, timeout in (
+                (0, 0, 2), (31, 0, 2), (True, 0, 2),
+                (1, -1, 2), (1, 31, 2),
+                (1, False, 2), (1, float("nan"), 2),
+                (1, float("inf"), 2), (1, -float("inf"), 2),
+                (1, 0, 0), (1, 0, 11), (1, 0, True),
+                (1, 0, float("nan")), (1, 0, float("inf")),
+                (1, 0, -float("inf"))):
             with self.subTest(config=(count, interval, timeout)):
+                opener = FakeOpener()
+                sleeps = []
                 with self.assertRaises(probe.ProbeError):
                     probe.run_checks(["https://game.example"], "ready",
                                      count, interval, timeout,
-                                     opener=FakeOpener())
+                                     opener=opener, sleep=sleeps.append)
+                self.assertEqual([], opener.calls)
+                self.assertEqual([], sleeps)
 
     def test_never_exposes_failing_url_or_exception(self):
         with patch.object(probe, "make_strict_opener", return_value=FakeOpener(fail_at=1)):
