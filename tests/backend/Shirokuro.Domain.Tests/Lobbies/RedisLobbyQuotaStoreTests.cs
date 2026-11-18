@@ -702,6 +702,208 @@ public sealed class RedisLobbyQuotaStoreTests
         }
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task EarlyQuotaScoreNeverEvictsLiveRoomDuringCreate(
+        bool corruptCreatorIndex, bool removePhysicalTtl)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "prune-live-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = "guest-alice";
+            var other = corruptCreatorIndex ? owner : "guest-bob";
+            var maxRooms = corruptCreatorIndex ? 2 : 1;
+            const int maxPerCreator = 1;
+            var firstId = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(firstId, owner, clock.GetUtcNow()), maxRooms, maxPerCreator));
+            var second = Room("room-" + Guid.NewGuid().ToString("N"),
+                other, clock.GetUtcNow());
+
+            var db = a.GetDatabase();
+            var indexPrefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var global = indexPrefix + "all";
+            var ownerHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var creator = indexPrefix + "creator:" + ownerHash;
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(global)).ToString();
+            var physicalDeadline = await db.SortedSetScoreAsync(global, roomKey);
+            Assert.NotNull(physicalDeadline);
+            Assert.Equal(physicalDeadline,
+                await db.SortedSetScoreAsync(creator, roomKey));
+            if (removePhysicalTtl)
+                Assert.True(await db.KeyPersistAsync(roomKey));
+            var ttlBefore = await db.KeyTimeToLiveAsync(roomKey);
+            var due = (double)DateTimeOffset.UtcNow
+                .AddMinutes(-5).ToUnixTimeMilliseconds();
+            var damagedIndex = corruptCreatorIndex ? creator : global;
+            Assert.False(await db.SortedSetAddAsync(
+                damagedIndex, roomKey, due));
+
+            var failure = await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(second, maxRooms, maxPerCreator));
+            Assert.Null(failure.InnerException);
+            Assert.Equal(due,
+                await db.SortedSetScoreAsync(damagedIndex, roomKey));
+            Assert.Single(await db.SortedSetRangeByRankAsync(global));
+            Assert.Single(await db.SortedSetRangeByRankAsync(creator));
+            Assert.NotNull(await one.ReadAsync(firstId));
+            Assert.Equal(ttlBefore is null, (await db.KeyTimeToLiveAsync(roomKey)) is null);
+            if (ttlBefore is not null)
+                Assert.True(await db.KeyTimeToLiveAsync(roomKey) <= ttlBefore);
+
+            // Only explicit operator repair may restore a corrupt quota.
+            // If the room lost TTL, restoring TTL also changes its absolute
+            // deadline: both ZSET scores must be synchronized.
+            if (removePhysicalTtl)
+            {
+                Assert.True(await db.KeyExpireAsync(roomKey, TimeSpan.FromMinutes(30)));
+                var newDeadline = (long)await db.ExecuteAsync("PEXPIRETIME", roomKey);
+                Assert.True(newDeadline > 0);
+                Assert.False(await db.SortedSetAddAsync(global, roomKey, newDeadline));
+                Assert.False(await db.SortedSetAddAsync(creator, roomKey, newDeadline));
+            }
+            else
+                Assert.False(await db.SortedSetAddAsync(
+                    damagedIndex, roomKey, physicalDeadline.Value));
+
+            await Assert.ThrowsAsync<LobbyCapacityException>(
+                () => two.CreateBoundedAsync(second, maxRooms, maxPerCreator));
+            Assert.True(await one.DeleteIfCurrentAsync((await one.ReadAsync(firstId))!));
+            Assert.True(await two.CreateBoundedAsync(
+                second, maxRooms, maxPerCreator));
+        }
+    }
+
+    [Fact]
+    public async Task PruningActuallyMissingRoomsFreesBothIndexesWithoutSweep()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "prune-orphan-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = "guest-alice";
+            var firstId = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(firstId, owner, clock.GetUtcNow()), 1, 1));
+            var db = a.GetDatabase();
+            var prefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var global = prefix + "all";
+            var creatorHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var creator = prefix + "creator:" + creatorHash;
+            var oldKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(global)).ToString();
+            Assert.True(await db.KeyDeleteAsync(oldKey));
+            var due = (double)DateTimeOffset.UtcNow
+                .AddMinutes(-5).ToUnixTimeMilliseconds();
+            Assert.False(await db.SortedSetAddAsync(global, oldKey, due));
+            Assert.False(await db.SortedSetAddAsync(creator, oldKey, due));
+
+            var fresh = Room("room-" + Guid.NewGuid().ToString("N"),
+                owner, clock.GetUtcNow());
+            Assert.True(await two.CreateBoundedAsync(fresh, 1, 1));
+            Assert.Equal(1, await db.SortedSetLengthAsync(global));
+            Assert.Equal(1, await db.SortedSetLengthAsync(creator));
+            Assert.Null(await db.SortedSetScoreAsync(global, oldKey));
+            Assert.Null(await db.SortedSetScoreAsync(creator, oldKey));
+            Assert.NotNull(await one.ReadAsync(fresh.State.Definition.LobbyId));
+        }
+    }
+
+    [Fact]
+    public async Task MalformedDueIndexKeyCannotBePrunedOrReadAcrossSlots()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "prune-invalid-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var db = a.GetDatabase();
+            var index = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
+            var invalidKey = "external-key-not-in-room-namespace";
+            var due = (double)DateTimeOffset.UtcNow
+                .AddMinutes(-5).ToUnixTimeMilliseconds();
+            Assert.True(await db.SortedSetAddAsync(index, invalidKey, due));
+            var fresh = Room("room-" + Guid.NewGuid().ToString("N"),
+                "guest-alice", clock.GetUtcNow());
+
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(fresh, 2, 1));
+            Assert.Equal(due, await db.SortedSetScoreAsync(index, invalidKey));
+            Assert.Single(await db.SortedSetRangeByRankAsync(index));
+
+            Assert.True(await db.SortedSetRemoveAsync(index, invalidKey));
+            Assert.True(await one.CreateBoundedAsync(fresh, 2, 1));
+        }
+    }
+
+    [Fact]
+    public async Task InvalidCreatorIndexDoesNotPartiallyPruneValidGlobalOrphan()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "prune-atomic-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var ownerA = "guest-alice";
+            var ownerB = "guest-bob";
+            var roomA = Room("room-" + Guid.NewGuid().ToString("N"),
+                ownerA, clock.GetUtcNow());
+            var roomB = Room("room-" + Guid.NewGuid().ToString("N"),
+                ownerB, clock.GetUtcNow());
+            Assert.True(await one.CreateBoundedAsync(roomA, 3, 1));
+            Assert.True(await two.CreateBoundedAsync(roomB, 3, 1));
+            var db = a.GetDatabase();
+            var prefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var global = prefix + "all";
+            var creatorB = prefix + "creator:" + Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(ownerB)));
+            var keyA = prefix[..(prefix.Length - "capacity:".Length)] + "room:" +
+                Convert.ToHexStringLower(SHA256.HashData(
+                    Encoding.UTF8.GetBytes(roomA.State.Definition.LobbyId)));
+            var keyB = prefix[..(prefix.Length - "capacity:".Length)] + "room:" +
+                Convert.ToHexStringLower(SHA256.HashData(
+                    Encoding.UTF8.GetBytes(roomB.State.Definition.LobbyId)));
+            Assert.True(await db.KeyDeleteAsync(keyA));
+            var due = (double)DateTimeOffset.UtcNow
+                .AddMinutes(-5).ToUnixTimeMilliseconds();
+            Assert.False(await db.SortedSetAddAsync(global, keyA, due));
+            Assert.False(await db.SortedSetAddAsync(creatorB, keyB, due));
+
+            var attempted = Room("room-" + Guid.NewGuid().ToString("N"),
+                ownerB, clock.GetUtcNow());
+            await Assert.ThrowsAsync<LobbyCreationUnavailableException>(
+                () => two.CreateBoundedAsync(attempted, 3, 1));
+            Assert.Equal(due, await db.SortedSetScoreAsync(global, keyA));
+            Assert.Equal(due, await db.SortedSetScoreAsync(creatorB, keyB));
+            Assert.Equal(2, await db.SortedSetLengthAsync(global));
+        }
+    }
+
     [Fact]
     public void V2SnapshotsRequireQuotaTrackingMetadata()
     {
