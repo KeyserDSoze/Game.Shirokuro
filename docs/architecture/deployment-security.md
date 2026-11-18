@@ -3645,3 +3645,23 @@ controller converges in 2 seconds. CI has ordinary strict TLS validation;
 no permissive callback or credential echo is introduced. Operators still
 need a staging soak and to define their actual ingress drain/convergence
 SLO. Parent #21 stays open.
+
+
+## Physical TTL confirmation for Redis room readiness probe (#193)
+
+Production readiness already writes and reads back a fresh random nonce on each
+independent Redis connector (#172). A successful room-key SET/GET is not proof
+that the probe key will expire: a lost expiry would leave permanent technical
+keys while misleadingly reporting the process as ready. Following the room
+nonce check, readiness now requires the Redis key's **actual remaining TTL** to
+be positive and no longer than the requested 10 seconds. Missing, expired,
+negative, extended or unreadable TTL, including timeout, means 503/no-store.
+
+The check is read-only, uses the same Redis connector and the **same 2-second
+shared deadline** as all other readiness steps; there are no mutation retries.
+No identifiers, Redis key, nonce, address or exception detail reach responses
+or telemetry. The existing 3-second coalescing/cache, encrypted key-ring
+validation, node drain and process liveness remain unchanged. This checks the
+room Redis connector only; the abstract `IDistributedCache` interface does
+not provide a physical TTL query for the separate guest-session store.
+This does not prove staging/multi-pod readiness: see issue #193 and parent #21.
