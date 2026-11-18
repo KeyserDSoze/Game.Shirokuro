@@ -39,6 +39,31 @@ public sealed class RedisTlsProductionTestsKestrel
 
         public bool HasExited => _process.HasExited;
 
+        public async Task SignalPreStopAsync(CancellationToken cancellationToken)
+        {
+            Assert.True(OperatingSystem.IsLinux(),
+                "SIGUSR1 preStop is a Linux-only operational fixture.");
+            Assert.False(HasExited, "Cannot preStop a terminated Kestrel node.");
+            // Target ONLY the disposable child PID. Never signal the runner,
+            // nginx container or a real API process. Suppress shell output.
+            var signal = new ProcessStartInfo("/bin/kill")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            };
+            signal.ArgumentList.Add("-USR1");
+            signal.ArgumentList.Add(_process.Id.ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
+            using var command = Process.Start(signal)
+                ?? throw new InvalidOperationException("Unable to signal CI child.");
+            var stdout = command.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
+            var stderr = command.StandardError.BaseStream.CopyToAsync(Stream.Null);
+            await command.WaitForExitAsync(cancellationToken);
+            await Task.WhenAll(stdout, stderr).WaitAsync(cancellationToken);
+            Assert.Equal(0, command.ExitCode);
+        }
+
         public async ValueTask DisposeAsync()
         {
             try
@@ -84,7 +109,7 @@ public sealed class RedisTlsProductionTestsKestrel
     private static ChildProcess StartKestrel(
         int port, string apiAssembly, string serverPfx, string password,
         (string Folder, string Pfx, string Password) keyRing, string redis,
-        int? trustedEdgePort = null)
+        int? trustedEdgePort = null, bool enablePreStopSignal = false)
     {
         var process = new ProcessStartInfo("dotnet")
         {
@@ -111,6 +136,8 @@ public sealed class RedisTlsProductionTestsKestrel
                 $"https://localhost:{trustedEdgePort.Value}";
             process.Environment["Security__KnownProxies__0"] = "127.0.0.1";
         }
+        if (enablePreStopSignal)
+            process.Environment["Security__PreStopDrain__EnableSigusr1"] = "true";
         process.Environment["Security__GuestSessions__RedisConnectionString"] = redis;
         process.Environment["Security__DataProtection__KeysDirectory"] = keyRing.Folder;
         process.Environment["Security__DataProtection__CertificatePath"] = keyRing.Pfx;
@@ -345,6 +372,29 @@ public sealed class RedisTlsProductionTestsKestrel
 
     private sealed class EphemeralNginxProxy(string containerName) : IAsyncDisposable
     {
+        public async Task RemoveUpstreamAsync(
+            string scratch, int drainedPort, CancellationToken cancellationToken)
+        {
+            var config = Path.Combine(scratch, "nginx.conf");
+            var original = File.ReadAllText(config);
+            var active = "server 127.0.0.1:" +
+                drainedPort.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                ";";
+            Assert.Equal(1, original.Split(active, StringSplitOptions.None).Length - 1);
+            // Update the SAME bind-mounted inode; replacing the file via
+            // File.Move would leave nginx seeing its old Docker mount.
+            File.WriteAllText(config, original.Replace(active,
+                active[..^1] + " down;", StringComparison.Ordinal));
+            // Test config before a reload; each CLI call discards stderr/stdout
+            // so no signed ticket or infrastructure secret enters CI logs.
+            Assert.True(await DockerAsync(
+                ["exec", containerName, "nginx", "-t"], cancellationToken),
+                "Draining upstream generated an invalid edge config.");
+            Assert.True(await DockerAsync(
+                ["exec", containerName, "nginx", "-s", "reload"],
+                cancellationToken), "Could not reload drained upstream config.");
+        }
+
         public async ValueTask DisposeAsync()
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
