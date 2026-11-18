@@ -1011,7 +1011,7 @@ public sealed class RedisLobbyQuotaStoreTests
         using (b)
         {
             var clock = new ManualClock();
-            var ns = "quota-future-orphan-" + Guid.NewGuid().ToString("N");
+            var ns = "f-orphan-" + Guid.NewGuid().ToString("N");
             var one = Store(a, clock, ns);
             var two = Store(b, clock, ns);
             var owner = GuestSessions.NewPlayerId();
@@ -1078,7 +1078,7 @@ public sealed class RedisLobbyQuotaStoreTests
         using (b)
         {
             var clock = new ManualClock();
-            var ns = "quota-future-corrupt-" + Guid.NewGuid().ToString("N");
+            var ns = "f-corrupt-" + Guid.NewGuid().ToString("N");
             var one = Store(a, clock, ns);
             var two = Store(b, clock, ns);
             var owner = GuestSessions.NewPlayerId();
@@ -1146,7 +1146,7 @@ public sealed class RedisLobbyQuotaStoreTests
         using (b)
         {
             var clock = new ManualClock();
-            var ns = "quota-future-atomic-" + Guid.NewGuid().ToString("N");
+            var ns = "f-atomic-" + Guid.NewGuid().ToString("N");
             var one = Store(a, clock, ns);
             var two = Store(b, clock, ns);
             var guestA = GuestSessions.NewPlayerId();
@@ -1208,7 +1208,7 @@ public sealed class RedisLobbyQuotaStoreTests
         using (b)
         {
             var clock = new ManualClock();
-            var ns = "quota-future-bad-member-" + Guid.NewGuid().ToString("N");
+            var ns = "f-bad-" + Guid.NewGuid().ToString("N");
             var one = Store(a, clock, ns);
             var two = Store(b, clock, ns);
             var index = "shirokuro:lobby:{" + ns + "}:v2:capacity:all";
