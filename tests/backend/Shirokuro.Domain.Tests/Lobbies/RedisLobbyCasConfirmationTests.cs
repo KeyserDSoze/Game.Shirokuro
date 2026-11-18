@@ -191,20 +191,36 @@ public sealed class RedisLobbyCasConfirmationTests
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
+    [InlineData(-2)]
     public async Task ConflictAndRevocationFenceNeverDispatchConfirmation(long result)
     {
+        using var capture = new MultiplayerMetricCapture();
         var (database, fake) = Fake();
         fake.CasStatus = result;
         var (store, before, updated) = Scenario(database);
         if (result == 0)
             Assert.False(await store.CompareExchangeAsync(
                 before, updated, before.Snapshot.CreatorId));
-        else
+        else if (result == -1)
             await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => store.CompareExchangeAsync(
+                    before, updated, before.Snapshot.CreatorId));
+        else
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(
                 () => store.CompareExchangeAsync(
                     before, updated, before.Snapshot.CreatorId));
         Assert.Equal(1, fake.CasCalls);
         Assert.Equal(0, fake.ConfirmCalls);
+        var integrity = capture.For(MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+        if (result == -2)
+            Assert.Contains(integrity, m =>
+                m.Value == 1 && m.Tags.Count == 1 &&
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "cas");
+        else
+            Assert.DoesNotContain(integrity, m =>
+                m.Tags.TryGetValue("operation", out var operation) &&
+                operation == "cas");
     }
 
     [Fact]
