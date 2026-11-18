@@ -66,6 +66,48 @@ internal sealed class MultiplayerMetricCapture : IDisposable
 
 public sealed class MultiplayerMetricsTests
 {
+    [Fact]
+    public void QuotaIntegrityCounterAllowsOnlyThreeFixedNonSensitiveOperationLabels()
+    {
+        using var capture = new MultiplayerMetricCapture();
+        foreach (var operation in new[] { LobbyQuotaOperation.Create,
+                     LobbyQuotaOperation.CompareExchange, LobbyQuotaOperation.Delete })
+            MultiplayerMetrics.RecordLobbyQuotaIntegrityRejection(operation);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MultiplayerMetrics.RecordLobbyQuotaIntegrityRejection(
+                (LobbyQuotaOperation)997));
+
+        var samples = capture.For(MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+        foreach (var name in new[] { "create", "cas", "delete" })
+            Assert.Contains(samples, sample =>
+                sample.Value == 1 && sample.Tags.Count == 1 &&
+                sample.Tags.TryGetValue("operation", out var actual) &&
+                actual == name);
+        Assert.All(samples, sample =>
+        {
+            Assert.Equal(1, sample.Value);
+            Assert.Equal(new[] { "operation" }, sample.Tags.Keys);
+            Assert.Contains(sample.Tags["operation"],
+                new[] { "create", "cas", "delete" });
+            Assert.DoesNotContain("guest-", sample.Tags["operation"],
+                StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("room-", sample.Tags["operation"],
+                StringComparison.OrdinalIgnoreCase);
+        });
+
+        using var listener = new MeterListener();
+        Instrument? observed = null;
+        listener.InstrumentPublished = (instrument, _) =>
+        {
+            if (instrument.Meter.Name == MultiplayerMetrics.MeterName &&
+                instrument.Name == MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName)
+                observed = instrument;
+        };
+        listener.Start();
+        var counter = Assert.IsType<Counter<long>>(observed);
+        Assert.Equal(MultiplayerMetrics.MeterVersion, counter.Meter.Version);
+        Assert.Equal("{rejection}", counter.Unit);
+    }
     private static string? Address =>
         Environment.GetEnvironmentVariable("SHIROKURO_TEST_REDIS");
 
@@ -419,6 +461,7 @@ public sealed class MultiplayerMetricsTests
             MultiplayerMetrics.GuestCookieAuthorityName,
             MultiplayerMetrics.ReadinessProbesName,
             MultiplayerMetrics.RedisConnectionEventsName,
+            MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName,
             MultiplayerMetrics.ExpirySweepsName,
             MultiplayerMetrics.ExpiryMembershipsRemovedName,
             MultiplayerMetrics.ExpiryUnreadableItemsName
@@ -433,6 +476,7 @@ public sealed class MultiplayerMetricsTests
                 MultiplayerMetrics.GuestCookieAuthorityName => new[] { "outcome" },
                 MultiplayerMetrics.ReadinessProbesName => new[] { "outcome" },
                 MultiplayerMetrics.RedisConnectionEventsName => new[] { "client", "event" },
+                MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName => new[] { "operation" },
                 MultiplayerMetrics.ExpirySweepsName => new[] { "mode", "outcome" },
                 MultiplayerMetrics.ExpiryUnreadableItemsName => [],
                 _ => new[] { "mode" }
@@ -453,6 +497,7 @@ public sealed class MultiplayerMetricsTests
                         "session-body" or "host" or "transport" or
                          "unknown-route" or "method-not-allowed",
                     "client" => value is "lobby" or "session",
+                    "operation" => value is "create" or "cas" or "delete",
                     "event" => value is "failed" or "restored" or "configuration-changed",
                     _ => false
                 };
