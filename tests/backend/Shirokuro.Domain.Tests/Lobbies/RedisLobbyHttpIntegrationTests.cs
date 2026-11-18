@@ -614,7 +614,7 @@ public sealed class RedisLobbyHttpIntegrationTests
             var (sessionProvider, shared) = SharedSessions();
             using (sessionProvider)
             {
-                var ns = "api-future-orphan-" + Guid.NewGuid().ToString("N");
+                var ns = "api-f-orphan-" + Guid.NewGuid().ToString("N");
                 using var serverA = Server(shared, redisA, ns);
                 using var serverB = Server(shared, redisB, ns);
                 using var visitor = Client(serverA);
