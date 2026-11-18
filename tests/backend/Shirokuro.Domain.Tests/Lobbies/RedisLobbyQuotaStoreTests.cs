@@ -566,10 +566,112 @@ public sealed class RedisLobbyQuotaStoreTests
             Assert.True(await a.GetDatabase().KeyDeleteAsync(keyName));
 
             clock.Advance(TimeSpan.FromSeconds(1));
-            Assert.False(await two.CompareExchangeAsync(rawRead,
-                rawRead.Snapshot with { LastActivityUtc = clock.GetUtcNow() }));
-            Assert.False(await one.DeleteIfCurrentAsync(rawRead));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                two.CompareExchangeAsync(rawRead,
+                    rawRead.Snapshot with { LastActivityUtc = clock.GetUtcNow() }));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                one.DeleteIfCurrentAsync(rawRead));
             Assert.NotNull(await two.ReadAsync(id));
+        }
+    }
+
+    [Theory]
+    [InlineData(false, -3_600_000)]
+    [InlineData(false, 3_600_000)]
+    [InlineData(true, -3_600_000)]
+    [InlineData(true, 3_600_000)]
+    public async Task MismatchedQuotaIndexDeadlineCannotAuthorizeCasOrDelete(
+        bool corruptCreatorIndex, long shiftMilliseconds)
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-deadline-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var owner = "guest-alice";
+            var id = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(id, owner, clock.GetUtcNow()), 3, 2));
+
+            var db = a.GetDatabase();
+            var indexPrefix = "shirokuro:lobby:{" + ns + "}:v2:capacity:";
+            var globalIndex = indexPrefix + "all";
+            var ownerHash = Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(owner)));
+            var creatorIndex = indexPrefix + "creator:" + ownerHash;
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(globalIndex));
+            var expected = (await two.ReadAsync(id))!;
+            var originalGlobal = await db.SortedSetScoreAsync(globalIndex, roomKey);
+            var originalCreator = await db.SortedSetScoreAsync(creatorIndex, roomKey);
+            Assert.NotNull(originalGlobal);
+            Assert.Equal(originalGlobal, originalCreator);
+
+            var corruptedIndex = corruptCreatorIndex ? creatorIndex : globalIndex;
+            var shiftedScore = originalGlobal!.Value + shiftMilliseconds;
+            Assert.False(await db.SortedSetAddAsync(corruptedIndex, roomKey,
+                shiftedScore)); // Existing member score changed, not inserted.
+
+            // Both operations must fail before any quota/room mutation.
+            clock.Advance(TimeSpan.FromSeconds(1));
+            var next = expected.Snapshot with { LastActivityUtc = clock.GetUtcNow() };
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                two.CompareExchangeAsync(expected, next));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                one.DeleteIfCurrentAsync(expected));
+
+            Assert.Equal(shiftedScore,
+                await db.SortedSetScoreAsync(corruptedIndex, roomKey));
+            Assert.Equal(expected.RawBytes,
+                (byte[])(await db.StringGetAsync(roomKey))!);
+            Assert.NotNull(await db.KeyTimeToLiveAsync(roomKey));
+
+            // Explicit operator repair restores the EXACT old index deadline.
+            Assert.False(await db.SortedSetAddAsync(corruptedIndex, roomKey,
+                originalGlobal.Value));
+            Assert.True(await two.CompareExchangeAsync(expected, next));
+            var repaired = (await one.ReadAsync(id))!;
+            Assert.True(await one.DeleteIfCurrentAsync(repaired));
+            Assert.False(await db.KeyExistsAsync(roomKey));
+        }
+    }
+
+    [Fact]
+    public async Task MissingPhysicalRoomTtlCannotAuthorizeIndexedCasOrDelete()
+    {
+        if (Address is null) return;
+        var (a, b) = await Connect();
+        using (a)
+        using (b)
+        {
+            var clock = new ManualClock();
+            var ns = "quota-no-ttl-" + Guid.NewGuid().ToString("N");
+            var one = Store(a, clock, ns);
+            var two = Store(b, clock, ns);
+            var id = "room-" + Guid.NewGuid().ToString("N");
+            Assert.True(await one.CreateBoundedAsync(
+                Room(id, "guest-alice", clock.GetUtcNow()), 3, 2));
+            var db = a.GetDatabase();
+            var globalIndex = "shirokuro:lobby:{" + ns +
+                "}:v2:capacity:all";
+            var roomKey = Assert.Single(
+                await db.SortedSetRangeByRankAsync(globalIndex));
+            var read = (await two.ReadAsync(id))!;
+            Assert.True(await db.KeyPersistAsync(roomKey));
+
+            clock.Advance(TimeSpan.FromSeconds(1));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                two.CompareExchangeAsync(read,
+                    read.Snapshot with { LastActivityUtc = clock.GetUtcNow() }));
+            await Assert.ThrowsAsync<LobbyMutationUnavailableException>(() =>
+                one.DeleteIfCurrentAsync(read));
+
+            Assert.Null(await db.KeyTimeToLiveAsync(roomKey));
+            Assert.Equal(read.RawBytes, (byte[])(await db.StringGetAsync(roomKey))!);
         }
     }
 
