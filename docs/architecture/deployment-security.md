@@ -3712,7 +3712,7 @@ The operator must trigger SIGUSR1, withdraw the ingress/LB endpoint and later
 send SIGTERM; **the runner never does any of these actions**. The preStop
 contract is health 200 / readiness 503 before the process terminates;
 after SIGTERM, health 200 is no longer expected, and this runner should not
-be invoked with that expectation. Sample bounds are 1–30, interval 0–30
+be invoked with that expectation. Target count is bounded to 1–8; sample count is 1–30, interval 0–30
 seconds, per-request timeout 0.25–10 seconds. No automatic retries.
 
 This does **not** verify that two URLs map to distinct pods, ingress endpoint
