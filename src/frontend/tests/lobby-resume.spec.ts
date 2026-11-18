@@ -235,7 +235,10 @@ test('an old-revision 200 after Redis outage preserves backoff and cannot rearm 
       status: 200, headers: { 'Cache-Control': 'no-store' }, json: newer,
     })
     // A verified authorized 304 clears the second outage episode.
-    return route.fulfill({ status: 304, headers: { 'Cache-Control': 'no-store' } })
+    return route.fulfill({
+      status: 304,
+      headers: { 'Cache-Control': 'no-store', ETag: '"rev-5"' },
+    })
   })
 
   await page.goto('/')
@@ -310,4 +313,97 @@ test('an old-revision 200 after Redis outage preserves backoff and cannot rearm 
     '"rev-4"', '"rev-4"', '"rev-4"', '"rev-4"', '"rev-5"', '"rev-5"',
   ])
   expect(mutations).toBe(2) // no POST/PATCH/DELETE retry during polling
+})
+
+
+test('mismatched 304 never confirms roster freshness or bypasses bounded outage backoff', async ({ page }) => {
+  test.setTimeout(65_000)
+  await page.clock.install()
+  const roomId = 'room-' + 'd'.repeat(32)
+  const actor = 'guest-' + 'd'.repeat(32)
+  const snapshot = {
+    lobbyId: roomId, revision: 4, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+  }
+  let signedIn = false
+  let reads = 0
+  let writes = 0
+  const validators: (string | undefined)[] = []
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { kind: 'guest', playerId: actor } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    writes++
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    writes++
+    return route.fulfill({ status: 201, json: snapshot })
+  })
+  await page.route('**/api/lobbies/' + roomId + '/roster/peek', route => {
+    reads++
+    validators.push(route.request().headers()['if-none-match'])
+    if (reads === 1) return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+      json: { status: 'unavailable' },
+    })
+    if (reads === 2) return route.fulfill({
+      status: 304, headers: {
+        ETag: '"rev-3"', 'Cache-Control': 'no-store',
+      },
+    })
+    return route.fulfill({
+      status: 304, headers: {
+        ETag: '"rev-4"', 'Cache-Control': 'no-store',
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+  expect(writes).toBe(2)
+
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(1)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await page.clock.runFor(200)
+
+  // Spend the one early wake on a wrong-revision 304. A 304 alone, even
+  // with valid Cache-Control, must not make the stale room current.
+  await page.evaluate(() => {
+    for (let i = 0; i < 30; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(2)
+  await page.clock.runFor(200)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+
+  // Invalid 304 increments the second-failure backoff to 60..72s.
+  // Subsequent focus bursts cannot bring it forward again.
+  await page.clock.fastForward(35_000)
+  await page.evaluate(() => {
+    for (let i = 0; i < 30; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_000)
+  expect(reads).toBe(2)
+  await page.clock.fastForward(25_000)
+  await expect.poll(() => reads).toBe(3)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(validators).toEqual(['"rev-4"', '"rev-4"', '"rev-4"'])
+  expect(writes).toBe(2)
 })

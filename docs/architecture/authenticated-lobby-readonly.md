@@ -142,3 +142,38 @@ after stale replica evidence, unchanged old-room ETag, preserved
 identity/invitation, eventual recovery and **no mutation replay**.
 This is local resilience logic; it does not validate real staging
 Redis replication lag or Kubernetes ingress (remaining in #21).
+
+
+## Conditional roster 304 requires an exact bound validator (#201)
+
+The server-only, member-authorized `/api/lobbies/{lobbyId}/roster/peek`
+emits a **strong** `ETag: "rev-<revision>"` and
+`Cache-Control: no-store` on both 200 and 304, and checks cookie,
+membership, revocation and drain state **before** issuing a 304.
+Previously the browser interpreted **any** 304 as a successful
+confirmation of cached roster freshness, even if the outgoing request
+had no valid `If-None-Match`, a proxy dropped ETag, the returned
+revision did not match the locally verified room, or the 304 was
+cacheable. Such a response is not sufficient evidence to clear a
+stale/outage badge or reset the 30/60/120-second retry budget.
+
+The frontend now accepts 304 as a no-change result only when the
+request sent a canonical nonnegative safe-integer revision validator,
+the response has an **exactly matching strong ETag**, and its
+Cache-Control includes the `no-store` token. A missing/weak/mismatched
+ETag, no-store substring without the token, cacheable response, or
+unsolicited 304 throws a generic, non-authenticating protocol error.
+The existing passive poll catches this as a transient failure:
+the last verified room and guest stay visible as **stale**, and
+bounded retry/backoff and the one-time wake budget remain in force.
+This does not convert the error into 401/404, grant membership, leak
+hidden PvP state, parse a 304 body or retry a mutation.
+
+Vitest checks the exact 304 contract and bad variants with no JSON
+read, while Playwright simulates `503 → wrong ETag 304 → exact ETag
+304` across an accelerated clock and focus storm, confirming stale
+retention, bounded backoff, session/room continuity and no writes.
+All legacy fake-304 test fixtures now mirror the actual .NET headers;
+the production server is unchanged. An ETag is not a replacement for
+TLS or authenticated membership, and the real multi-pod ingress/WSS
+validation is still tracked by parent #21.

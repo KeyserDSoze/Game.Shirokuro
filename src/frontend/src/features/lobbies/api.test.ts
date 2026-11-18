@@ -130,7 +130,10 @@ describe('guest lobby client boundaries', () => {
 
   it('handles 304 with no JSON parsing and preserves an already verified roster', async () => {
     const json = vi.fn(() => { throw new Error('A 304 must not parse private JSON') })
-    const mocked = vi.fn().mockResolvedValue({ ok: false, status: 304, json })
+    const mocked = vi.fn().mockResolvedValue({
+      ok: false, status: 304, json,
+      headers: new Headers({ ETag: '"rev-7"', 'Cache-Control': 'private, no-store' }),
+    })
     vi.stubGlobal('fetch', mocked)
     expect(await guestLobbyApi.peek(roomCode, 7)).toBeNull()
     expect(json).not.toHaveBeenCalled()
@@ -144,6 +147,31 @@ describe('guest lobby client boundaries', () => {
       }),
     )
   })
+
+  it.each([
+    ['no ETag', {}, 7],
+    ['wrong revision', { ETag: '"rev-6"', 'Cache-Control': 'no-store' }, 7],
+    ['weak validator', { ETag: 'W/"rev-7"', 'Cache-Control': 'no-store' }, 7],
+    ['extra ETag tokens', { ETag: '"rev-7", "rev-8"', 'Cache-Control': 'no-store' }, 7],
+    ['cacheable', { ETag: '"rev-7"', 'Cache-Control': 'max-age=60' }, 7],
+    ['no-store substring', { ETag: '"rev-7"', 'Cache-Control': 'x-no-store' }, 7],
+    ['missing cache policy', { ETag: '"rev-7"' }, 7],
+    ['no request validator', { ETag: '"rev-7"', 'Cache-Control': 'no-store' }, undefined],
+    ['invalid request validator', { ETag: '"rev-7"', 'Cache-Control': 'no-store' }, -1],
+  ])('rejects unverified 304: %s without changing guest or cached roster',
+    async (_reason, headers, knownRevision) => {
+      const mocked = vi.fn().mockResolvedValue({
+        ok: false, status: 304, headers: new Headers(headers),
+        json: vi.fn(() => { throw new Error('Never parse a 304 body') }),
+      })
+      vi.stubGlobal('fetch', mocked)
+      await expect(guestLobbyApi.peek(roomCode, knownRevision))
+        .rejects.toThrow('Unverified roster 304')
+      expect(mocked).toHaveBeenCalledOnce()
+      expect((mocked.mock.calls[0][1] as RequestInit).method).toBe('GET')
+      expect((mocked.mock.calls[0][1] as RequestInit).body).toBeUndefined()
+    },
+  )
 
   it.each([undefined, -1, 1.25, Number.NaN, Infinity, -Infinity])(
     'ignores invalid/unavailable revision validators (%s) without losing full 200', async revision => {
@@ -358,7 +386,10 @@ describe('bounded passive roster reads (#124)', () => {
     expect(LOBBY_PASSIVE_PEEK_TIMEOUT_MS).toBe(12_000)
     const mocked = vi.fn()
       .mockImplementationOnce(() => new Promise<Response>(() => {}))
-      .mockResolvedValueOnce({ status: 304, ok: false })
+      .mockResolvedValueOnce({
+        status: 304, ok: false,
+        headers: new Headers({ ETag: '"rev-4"', 'Cache-Control': 'no-store' }),
+      })
     vi.stubGlobal('fetch', mocked)
     const pending = guestLobbyApi.peek(roomCode, 4)
     const rejected = expect(pending).rejects.toThrow('Passive lobby roster read timed out')
@@ -419,7 +450,12 @@ describe('bounded passive roster reads (#124)', () => {
 
   it.each([304, 401, 503])('cleans the deadline after a completed HTTP %i', async status => {
     vi.useFakeTimers()
-    const mocked = vi.fn().mockResolvedValue({ ok: status === 200, status })
+    const mocked = vi.fn().mockResolvedValue({
+      ok: status === 200, status,
+      headers: new Headers({
+        ETag: '"rev-6"', 'Cache-Control': 'no-store',
+      }),
+    })
     vi.stubGlobal('fetch', mocked)
     if (status === 304) {
       await expect(guestLobbyApi.peek(roomCode, 6)).resolves.toBeNull()

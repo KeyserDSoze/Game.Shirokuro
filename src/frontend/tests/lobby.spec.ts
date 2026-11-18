@@ -1284,7 +1284,13 @@ test('409 refresh rejects malformed membership loss and only clears on verified 
   // with 404 after 15 seconds on a slower CI worker.
   await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
     expect(route.request().method()).toBe('GET')
-    return route.fulfill({ status: 304 })
+    // Mirror .NET's authenticated conditional 304 response contract.
+    const validator = route.request().headers()['if-none-match']
+    expect(validator).toMatch(/^"rev-\d+"$/)
+    return route.fulfill({
+      status: 304,
+      headers: { ETag: validator!, 'Cache-Control': 'no-store' },
+    })
   })
 
   await page.goto('/')
@@ -1417,7 +1423,12 @@ test('auto-sync rejects malformed 200, retains view on 503 and clears only on au
     validators.push(route.request().headers()['if-none-match'])
     await route.fulfill({
       status,
-      headers: { 'Cache-Control': 'no-store' },
+      headers: {
+        'Cache-Control': 'no-store',
+        ...(status === 304
+          ? { ETag: route.request().headers()['if-none-match'] ?? '' }
+          : {}),
+      },
       ...(status === 304 ? {} : status === 200
         ? { json: {
           ...roster, revision: 2, secretRoute: 'must-not-enter-private-state',

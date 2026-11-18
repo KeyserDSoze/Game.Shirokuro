@@ -136,8 +136,9 @@ export const guestLobbyApi = {
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/join', 'POST', { teamId }),
   read: (code: string) =>
     request<LobbyRoster>('/lobbies/' + parseInviteCode(code) + '/roster'),
-  // 304 is a successful *authorized* no-change result, not a network
-  // failure. The validator contains only the last verified room revision,
+  // Only a 304 with matching strong ETag and no-store is a successful,
+  // *authorized* no-change result; every other 304 is an outage. The
+  // validator contains only the last verified room revision,
   // never an invite, player ID, cookie or hidden match information.
   peek: async (code: string, knownRevision?: number, signal?: AbortSignal): Promise<LobbyRoster | null> => {
     const room = parseInviteCode(code)
@@ -172,7 +173,22 @@ export const guestLobbyApi = {
         headers: tag,
         signal: controller.signal,
       })
-      if (response.status === 304) return null
+      if (response.status === 304) {
+        // Only the member-authorized server 304 for the *exact revision
+        // requested* can verify a cached roster. A broken edge/proxy may
+        // emit a naked, weak, wrong-revision or cacheable 304; never treat
+        // that as session/membership authority or healthy Redis recovery.
+        // The production .NET roster endpoint sets both headers after its
+        // auth/guest-authority checks. An invalid 304 is a transient
+        // protocol failure (stale + bounded backoff), never a 401/404.
+        const expected = tag['If-None-Match']
+        const cacheControl = response.headers?.get('Cache-Control')
+        const noStore = cacheControl?.split(',').some(value =>
+          value.trim().toLowerCase() === 'no-store') ?? false
+        if (!expected || response.headers?.get('ETag') !== expected || !noStore)
+          throw new Error('Unverified roster 304')
+        return null
+      }
       if (!response.ok) throw new LobbyHttpError(response.status)
       return response.json() as Promise<LobbyRoster>
     })()
