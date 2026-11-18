@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text;
 using Shirokuro.Application.Lobbies;
+using Shirokuro.Api.Security;
 using StackExchange.Redis;
 
 namespace Shirokuro.Api.Lobbies;
@@ -346,7 +347,11 @@ public sealed class RedisLobbySnapshotStore(
         if (result == -3)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result == -4)
+        {
+            MultiplayerMetrics.RecordLobbyQuotaIntegrityRejection(
+                LobbyQuotaOperation.Create);
             throw new LobbyCreationUnavailableException();
+        }
         if (result is -1 or -2)
             throw new LobbyCapacityException();
         if (result is not (0 or 1))
@@ -478,7 +483,11 @@ public sealed class RedisLobbySnapshotStore(
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result == -2)
+        {
+            MultiplayerMetrics.RecordLobbyQuotaIntegrityRejection(
+                LobbyQuotaOperation.CompareExchange);
             throw new LobbyMutationUnavailableException();
+        }
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
         if (result == 0)
@@ -524,7 +533,11 @@ public sealed class RedisLobbySnapshotStore(
         if (result == -1)
             throw new UnauthorizedAccessException("Lobby unavailable.");
         if (result == -2)
+        {
+            MultiplayerMetrics.RecordLobbyQuotaIntegrityRejection(
+                LobbyQuotaOperation.Delete);
             throw new LobbyMutationUnavailableException();
+        }
         if (result is not (0 or 1))
             throw new InvalidDataException("Invalid Redis lobby result.");
         if (result == 0)
