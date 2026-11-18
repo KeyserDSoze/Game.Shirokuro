@@ -209,6 +209,24 @@ refreshed. Both windows are checked **before** either
 never fetched as private roster bytes. Genuinely expired room keys can
 still be reclaimed without a sweep; room creation and the post-create
 exact snapshot/index confirmation remain atomic and bounded.
+
+Since #191, Redis quota CREATE also handles an **early physically missing
+room whose index score remains in the future**. Only when a quota would
+otherwise remain saturated *after due-entry removal*, Lua checks the
+bounded entire relevant ZSET (up to 256 global or 4 creator members plus
+one sentinel), without retrieving roster/snapshot bytes. For each entry
+the key must be a canonical room key in the same Redis hash slot. A live
+room must have `PEXPIRETIME > 0` and its index score must equal that
+physical expiry. A truly absent room (`PEXPIRETIME == -2`) no longer
+occupies capacity, even when its recorded ZSET score is future-dated.
+Both due and full-index checks execute **before either index is pruned**.
+Any bad live TTL, mismatched score, malformed/out-of-slot member or
+over-limit index returns `-4` → HTTP `503/no-store`, preserving the
+indices untouched. A healthy full index still returns the ordinary
+`429`. A valid orphan is reclaimed with `ZREM`, and the existing
+read-only exact CREATE confirmation, guest revocation fence and 2-second
+shared deadline remain unchanged. No auto-repair of live room deadlines
+or public Redis inspection is introduced.
 This protects against accidental index corruption; operational Redis
 integrity and network access control remain necessary. 
 [CI #42747294057](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/42747294057)
