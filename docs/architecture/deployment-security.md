@@ -3769,3 +3769,21 @@ because the operator initiates it externally, nor prove the origin is
 routed to a distinct pod. Validate pod identity/ingress updates and
 authenticated WSS reconnect independently in real staging under #21.
 CI continues to require .NET xUnit, Redis TLS/HA, Vitest and Playwright.
+
+## Direct-node proxy isolation (#195)
+
+Both staging Python CLIs now use the same strict HTTPS opener,
+explicitly configured with `urllib.request.ProxyHandler({})`.
+That disables the implicit proxy discovery otherwise inherited from
+`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and system proxy settings.
+The direct-node baseline/drain drill must not silently traverse a proxy
+that may send consecutive requests to different nodes. The existing
+hostname/certificate verification and deny-redirect policy remain
+mandatory; there is no insecure TLS switch or secret-bearing URL.
+
+The Python tests verify proxy bypass with environment variables set,
+TLS `CERT_REQUIRED`, hostname checking, and that the watcher uses the
+same opener as the snapshot probe. This change only affects the
+operator's local probes, **not** the ASP.NET guest/session/runtime API.
+Bypassing proxies still does not prove that DNS resolves to a distinct
+pod; confirm actual node/ingress topology out of band under #21.
