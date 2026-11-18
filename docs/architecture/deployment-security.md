@@ -3600,3 +3600,35 @@ The tests run without certificate-validation bypasses, public admin
 endpoints, test credentials stored in git, or logging cookies/room IDs.
 See [#190](https://github.com/KeyserDSoze/Game.Shirokuro/issues/190)
 for the final GitHub Actions SHA gate; parent #21 remains open.
+
+
+## Bounded negotiate convergence after Nginx reload (#192)
+
+The real-edge CI exercise #190 explicitly removes the drained Kestrel
+upstream with `nginx -t` plus `nginx -s reload`. A previously established
+connection can still overlap an old Nginx worker while the new routing
+configuration is being installed. In [#192](https://github.com/KeyserDSoze/Game.Shirokuro/issues/192),
+one such transient was observed: Bob had successfully renegotiated WSS on
+the healthy node, but the *first* negotiated connection for a new outsider
+received a **503** from the drained/old routing path, even though its
+guest issuance had succeeded.
+
+Only inside this **isolated test helper**, and only after a successful
+edge reload, a SignalR `negotiate` request may be retried up to eight
+total times with 250 ms between attempts, **iff** its reply is an
+explicit HTTP **503** with `Cache-Control: no-store`, no `Set-Cookie`
+and no `Location`. An HTTP 200 is consumed once, and other responses
+(401, 429, 502, 503 without that evidence, etc.) fail immediately.
+A bounded series of 503 replies fails with a static message that includes
+neither connection token nor guest/room IDs. The test still verifies that
+each successful negotiate is served by the **surviving** Kestrel backend,
+that the WSS upgrade works, and that an authenticated outsider receives
+the same private-safe denial as a missing room. xUnit tests encode this
+closed retry predicate independently.
+
+This is not automatic retries for lobby CREATE/JOIN/PATCH/DELETE,
+not an API/runtime change, and not proof that a real Kubernetes/ingress
+controller converges in 2 seconds. CI has ordinary strict TLS validation;
+no permissive callback or credential echo is introduced. Operators still
+need a staging soak and to define their actual ingress drain/convergence
+SLO. Parent #21 stays open.
