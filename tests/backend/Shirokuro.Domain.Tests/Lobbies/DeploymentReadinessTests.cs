@@ -337,12 +337,16 @@ public sealed class DeploymentReadinessTests
         private readonly ConcurrentQueue<string> _attemptedKeys = new();
         private int _reads;
         private int _writes;
+        private int _ttlReads;
+        public int TtlReads => Volatile.Read(ref _ttlReads);
         public int Reads => Volatile.Read(ref _reads);
         public int Writes => Volatile.Read(ref _writes);
         public string[] AttemptedNonces => _attemptedNonces.ToArray();
         public string[] AttemptedKeys => _attemptedKeys.ToArray();
         public bool IgnoreWrites { get; set; }
         public string ReadFault { get; set; } = "";
+        public string TtlFault { get; set; } = "";
+        public TaskCompletionSource<TimeSpan?> BlockedTtl { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<RedisValue> BlockedRead { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -376,6 +380,22 @@ public sealed class DeploymentReadinessTests
                     "blocked" => BlockedRead.Task,
                     _ => Task.FromResult(_values.TryGetValue(key, out var stored)
                         ? (RedisValue)stored : RedisValue.Null)
+                };
+            }
+            if (method?.Name == "KeyTimeToLiveAsync" &&
+                method.ReturnType == typeof(Task<TimeSpan?>))
+            {
+                Assert.Contains(args![0]!.ToString()!, _attemptedKeys);
+                Interlocked.Increment(ref _ttlReads);
+                return TtlFault switch
+                {
+                    "missing" => Task.FromResult<TimeSpan?>(null),
+                    "zero" => Task.FromResult<TimeSpan?>(TimeSpan.Zero),
+                    "negative" => Task.FromResult<TimeSpan?>(TimeSpan.FromMilliseconds(-1)),
+                    "extended" => Task.FromResult<TimeSpan?>(TimeSpan.FromSeconds(11)),
+                    "throw" => Task.FromException<TimeSpan?>(new IOException("secret Redis expiry")),
+                    "blocked" => BlockedTtl.Task,
+                    _ => Task.FromResult<TimeSpan?>(TimeSpan.FromSeconds(9))
                 };
             }
             throw new InvalidOperationException(
@@ -472,6 +492,49 @@ public sealed class DeploymentReadinessTests
         Assert.Equal(2, sessions.Reads);
         Assert.Equal(3, sessions.Writes);
         Assert.Equal(3, lobby.AttemptedNonces.Distinct().Count());
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("zero")]
+    [InlineData("negative")]
+    [InlineData("extended")]
+    [InlineData("throw")]
+    [InlineData("blocked")]
+    public async Task LobbyProbeTtlFailureIsUnavailableAndRecovers(string fault)
+    {
+        var (redis, lobby) = FakeLobbyConnector();
+        var clock = new ManualClock();
+        var sessions = new ToggleSessionStore();
+        using var server = Production(redis, sessions, clock);
+        using var client = Client(server);
+        using var metrics = new MultiplayerMetricCapture();
+
+        using (var ready = await client.GetAsync("/api/ready"))
+            await AssertStatus(ready, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, lobby.TtlReads);
+
+        lobby.TtlFault = fault;
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var denied = await client.GetAsync("/api/ready")
+            .WaitAsync(TimeSpan.FromSeconds(8)))
+            await AssertStatus(denied, HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(2, lobby.TtlReads);
+        Assert.Equal(1, sessions.Reads);
+        Assert.Contains(metrics.ForDurations(MultiplayerMetrics.ReadinessDurationSecondsName),
+            x => x.Tags["stage"] == (fault == "blocked" ? "timeout" : "lobby-read") &&
+                 x.Tags["outcome"] == "unavailable");
+        if (fault == "blocked")
+            Assert.False(lobby.BlockedTtl.Task.IsCompleted);
+
+        using (var health = await client.GetAsync("/api/health"))
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        lobby.TtlFault = "";
+        clock.Advance(TimeSpan.FromSeconds(4));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(3, lobby.TtlReads);
+        Assert.Equal(2, sessions.Reads);
     }
 
     [Fact]
