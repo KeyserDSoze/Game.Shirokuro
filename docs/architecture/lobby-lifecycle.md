@@ -187,6 +187,17 @@ clients, 48 concurrent creates per identity, both capacity limits,
 creator departure, stale delete, heartbeat, physical TTL and recovery
 without a worker. Version-2 snapshots require explicit quota metadata,
 and loss of a quota index causes tracked updates/deletes to fail closed.
+Since #187, a tracked room's **existing** global/creator index scores must
+also match the absolute `PEXPIRETIME` of its exact stored room snapshot
+**before** either CAS or DELETE changes Redis. Atomic Lua compares both
+scores, and a missing, early, late or non-expiring index/room state returns
+a distinct unavailable outcome (`503`/no-store) rather than a normal
+stale-revision conflict (`409`). The corrupt room and its index remain
+untouched for explicit repair. Successful CAS and DELETE still perform the
+exact post-write confirmations of #182/#183 with one shared 2s deadline;
+untracked legacy low-level test rooms do not use quota index checks.
+This check is not a substitute for separate index-pruning protections on
+CREATE or actual multi-pod ingress/failover verification (#21).
 This protects against accidental index corruption; operational Redis
 integrity and network access control remain necessary. 
 [CI #42747294057](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/42747294057)
