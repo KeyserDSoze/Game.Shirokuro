@@ -196,8 +196,19 @@ stale-revision conflict (`409`). The corrupt room and its index remain
 untouched for explicit repair. Successful CAS and DELETE still perform the
 exact post-write confirmations of #182/#183 with one shared 2s deadline;
 untracked legacy low-level test rooms do not use quota index checks.
-This check is not a substitute for separate index-pruning protections on
-CREATE or actual multi-pod ingress/failover verification (#21).
+Since #188, opportunistic CREATE pruning checks **both** global and
+creator sorted sets in read-only preflight, before removing any entry:
+only due entries whose canonical `room:` SHA-256 key is in the same Redis
+hash slot AND whose physical room is absent (`PEXPIRETIME == -2`) may
+be pruned. A live room with an early/corrupt index score, a room that
+lost its physical TTL, an invalid/foreign index member or an oversized
+due window stops the entire create with `503`/no-store. Neither index,
+the room, nor any surviving quota is silently repaired, deleted or
+refreshed. Both windows are checked **before** either
+`ZREMRANGEBYSCORE`; at most 257 candidates per index are inspected,
+never fetched as private roster bytes. Genuinely expired room keys can
+still be reclaimed without a sweep; room creation and the post-create
+exact snapshot/index confirmation remain atomic and bounded.
 This protects against accidental index corruption; operational Redis
 integrity and network access control remain necessary. 
 [CI #42747294057](https://github.com/KeyserDSoze/Game.Shirokuro/actions/runs/42747294057)
