@@ -3787,3 +3787,42 @@ same opener as the snapshot probe. This change only affects the
 operator's local probes, **not** the ASP.NET guest/session/runtime API.
 Bypassing proxies still does not prove that DNS resolves to a distinct
 pod; confirm actual node/ingress topology out of band under #21.
+
+
+## Paired preStop staging verification: draining and surviving nodes (#196)
+
+The existing `scripts/staging_drain_watch.py` accepts an **optional**
+`--survivor-url` containing another bare, directly reachable HTTPS origin.
+When omitted, the original one-node behavior is unchanged.
+
+```sh
+python scripts/staging_drain_watch.py \
+  --base-url https://node-a.staging.example.invalid \
+  --survivor-url https://node-b.staging.example.invalid \
+  --max-polls 12 --stable-samples 3 --interval 2 --timeout 3
+```
+
+Before prompting the operator to initiate preStop **outside the CLI**, the
+watcher requires both nodes to return exact, no-store HTTP 200 health and
+HTTP 200 readiness. Each subsequent bounded sample checks both nodes:
+the draining target remains live while its readiness switches monotonically
+to HTTP 503/unavailable for the required consecutive observations, **and the
+surviving node remains HTTP 200/ready and HTTP 200/health on every sample**.
+A failed survivor probe rejects the entire observation, including when it
+occurs on the final consecutive 503 of the drained node. This avoids a false
+"successful drain" signal when the other instance is also unavailable.
+
+Both targets reuse the same no-proxy, no-cookie, no-redirect, strict
+certificate/hostname-validated HTTPS opener. The two origins cannot be
+trivially identical (including hostname case, default HTTPS port or textual
+IPv6 address aliases). Still, **different hostnames cannot certify two
+different Kubernetes pods**: verify DNS, routing and pod identity
+independently. The script sends only public GET requests and never starts
+preStop, changes Redis, replays lobby mutations or observes private WSS
+connections. Maximal cost is 4 GET per round across both nodes, with at
+most one baseline and 30 polls; the existing 0.25–10s timeout/interval
+bounds remain. Output is aggregate, with no URLs, secrets or error bodies.
+
+The operational proof still requires real staging drain, load balancer
+withdrawal, authenticated SignalR reconnect, HA/failover metrics and
+privacy checks under [parent #21](https://github.com/KeyserDSoze/Game.Shirokuro/issues/21).
