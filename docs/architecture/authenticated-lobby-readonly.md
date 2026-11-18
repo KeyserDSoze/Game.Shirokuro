@@ -64,3 +64,46 @@ xUnit includes direct coordinator/reader tests, validated principal
 identity tests, and WebApplicationFactory/TestServer HTTP/SignalR negotiate
 integration tests for authenticated/anonymous clients, spoofing, room
 nonmembers, missing or duplicate claims and wire-format redaction.
+
+
+## Browser roster wake hints versus outage backoff (#199)
+
+The authenticated pre-match browser uses member-only, read-only
+`GET /api/lobbies/{room}/roster/peek` at a normal 15-second cadence
+(conditional `If-None-Match` can return a verified 304). During Redis,
+edge or network failure it already uses jittered 30/60/120-second
+exponential backoff; **no passive GET can renew room inactivity**.
+
+Online/focus/visibility hints used to reschedule the poll to the
+15-second floor on *every* accepted hint, even when the Redis service
+had already failed for several 503 responses. Since hints have their
+own 30-second cooldown, a page could repeatedly bypass the 120-second
+outage backoff and increase load when Redis was most fragile.
+
+The #199 client now allows **at most one wake-triggered expedited
+read per consecutive outage episode**, never closer than 15 seconds
+from its previous attempt. If that extra GET also fails, later
+focus/visibility/online signals do **not** shorten the scheduled
+30/60/120s retries. A hint delivered **while** a read is in flight
+consumes the same one-off allowance when that attempt fails: it cannot
+create concurrent reads or a second early poll. A verified, member-
+authorized HTTP 304 or valid current/newer HTTP 200 replenishes
+the allowance; old-revision 200, HTTP 429/503, rejected DTOs and
+timeouts do not. New guest/room effects start a fresh budget.
+
+The browser keeps displaying the **last verified** member roster
+as stale through transient outages. Only a server-confirmed 401/404
+or fully validated *newer* roster missing the member can clear the
+guest/room; hints are never authorization or a reason to mutate a
+lobby. The manual Refresh button remains an explicit player GET,
+distinct from unattended polling. No POST/PATCH/DELETE is replayed.
+
+The policy is a small pure TypeScript function
+`rosterCanAdvanceOnWake(failures, used)` covered by Vitest
+(including invalid clocks/counters). Playwright checks that a wake
+still helps recovery once, but repeated hints under consecutive 503
+cannot overtake the 60-second scheduled retry; it retains the
+authenticated roster and issues no additional mutations. Existing
+.NET xUnit Redis TLS/HA and all frontend tests remain mandatory
+CI gates. This load-shedding is **per browser tab**, not a substitute
+for server-authoritative rate limiting or multi-pod staging under #21.
