@@ -3665,3 +3665,59 @@ validation, node drain and process liveness remain unchanged. This checks the
 room Redis connector only; the abstract `IDistributedCache` interface does
 not provide a physical TTL query for the separate guest-session store.
 This does not prove staging/multi-pod readiness: see issue #193 and parent #21.
+
+
+## Staging HTTPS public probe runbook (#194)
+
+The reusable \`scripts/staging_probe.py\` is a **read-only external** Python
+standard-library smoke for existing production \`GET /api/health\` and
+\`GET /api/ready\` contracts. It is not an actuator for pod drain, Redis,
+guest-session issuance, SignalR or gameplay. All targets must be separately
+supplied as **bare HTTPS origins** (no URL paths, query, fragment, userinfo,
+credentials or insecure HTTP). TLS certificate and hostname verification use
+the normal system trust store; redirects are never followed.
+
+For each configured target/sampling round, \`/api/health\` must return HTTP
+200 with the exact JSON object \`{"status":"ok","application":"Shirokuro"}\`.
+\`/api/ready\` must return exactly either 200 + \`{"status":"ready"}\`
+or 503 + \`{"status":"unavailable"}\` as requested by the operator.
+Both must have \`Cache-Control: no-store\` and a JSON Content-Type, with
+no \`Set-Cookie\`, \`Location\` or \`Retry-After\`. Extra/duplicate JSON fields,
+unexpected HTTP statuses, oversized responses (over 1024 bytes), invalid
+UTF-8/JSON, redirects, timeout, TLS and network failures are hard failures;
+the tool never prints URL, response contents, error text, credentials or
+identity. No cookie or Authorization header is sent.
+
+Baseline examples (replace the .invalid placeholders with **actual** staging
+origins that resolve and have valid TLS certificates):
+
+\`\`\`sh
+python scripts/staging_probe.py \
+  --base-url https://node-a.staging.example.invalid \
+  --base-url https://node-b.staging.example.invalid \
+  --expected-ready ready --samples 6 --interval 5 --timeout 3
+\`\`\`
+
+For a real **separately orchestrated** preStop, while the draining process is
+still alive and reachable via its own HTTPS origin:
+
+\`\`\`sh
+python scripts/staging_probe.py \
+  --base-url https://draining-node.staging.example.invalid \
+  --expected-ready unavailable --samples 4 --interval 2 --timeout 3
+\`\`\`
+
+Check the surviving node with \`--expected-ready ready\` independently.
+The operator must trigger SIGUSR1, withdraw the ingress/LB endpoint and later
+send SIGTERM; **the runner never does any of these actions**. The preStop
+contract is health 200 / readiness 503 before the process terminates;
+after SIGTERM, health 200 is no longer expected, and this runner should not
+be invoked with that expectation. Sample bounds are 1–30, interval 0–30
+seconds, per-request timeout 0.25–10 seconds. No automatic retries.
+
+This does **not** verify that two URLs map to distinct pods, ingress endpoint
+propagation, signed-cookie affinity, authenticated WSS reconnection, Redis
+failover/SLO, guest revocation or match privacy. The operator must provide
+separate deployment topology, browser reconnect and Redis HA evidence under
+parent #21. The existing GitHub Actions suite still covers .NET xUnit,
+real Nginx/Kestrel fixtures, Redis TLS/ACL/HA, Vitest and Playwright.
