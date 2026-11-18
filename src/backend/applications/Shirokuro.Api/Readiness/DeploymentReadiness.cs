@@ -151,6 +151,16 @@ public sealed class RedisDeploymentReadiness(
                     StringComparison.Ordinal))
                 throw new InvalidOperationException("Lobby probe write unreadable.");
 
+            // A correct nonce alone is not enough if the physical key expiry
+            // was lost: the probe could accumulate permanent Redis keys.
+            // Check the actual room Redis TTL within the same 2s deadline.
+            var observedLobbyTtl = await lobbyDb.KeyTimeToLiveAsync(
+                    _lobbyProbeKey).WaitAsync(timeout.Token);
+            if (observedLobbyTtl is null ||
+                observedLobbyTtl.Value <= TimeSpan.Zero ||
+                observedLobbyTtl.Value > ProbeTtl)
+                throw new InvalidOperationException("Lobby probe expiry not confirmed.");
+
             stage = ReadinessProbeStage.SessionRead;
             var observed = await guestSessions.GetAsync(
                 _cacheProbeKey, timeout.Token).WaitAsync(timeout.Token);
