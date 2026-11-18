@@ -92,18 +92,25 @@ def validate_response(path, status, headers, body, expected_ready):
         raise ProbeError("Unexpected probe response schema")
 
 
-def probe_one(opener, origin, path, timeout, expected_ready):
+def fetch_public_probe(opener, origin, path, timeout):
+    """One read-only GET; do not follow redirects or expose response internals."""
+    if path not in ("/api/health", "/api/ready"):
+        raise ProbeError("Invalid public probe path")
     request = Request(origin + path, method="GET", headers={"Accept": "application/json"})
     try:
         response = opener.open(request, timeout=timeout)
     except HTTPError as error:
-        # An expected 503 readiness is a real HTTP error in urllib. Inspect
-        # only its strict public contract; never print the error or URL.
+        # urllib represents legitimate unready 503 as HTTPError. Always
+        # validate its complete public contract before accepting it.
         response = error
     with response:
-        status = response.getcode()
-        body = response.read(MAX_RESPONSE_BYTES + 1)
-        validate_response(path, status, response.headers, body, expected_ready)
+        return response.getcode(), response.headers, response.read(MAX_RESPONSE_BYTES + 1)
+
+
+def probe_one(opener, origin, path, timeout, expected_ready):
+    status, headers, body = fetch_public_probe(opener, origin, path, timeout)
+    validate_response(path, status, headers, body, expected_ready)
+    return status
 
 
 def run_checks(origins, expected_ready, samples, interval, timeout, *,
