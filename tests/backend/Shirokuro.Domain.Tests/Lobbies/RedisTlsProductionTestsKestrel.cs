@@ -351,6 +351,53 @@ public sealed class RedisTlsProductionTestsKestrel
         }
     }
 
+    private static async Task WaitForNodeDrainAsync(
+        HttpClient direct, ChildProcess node, CancellationToken token)
+    {
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.False(node.HasExited,
+                "SIGUSR1 must mark a Kestrel child draining, not terminate it.");
+            using var ready = await direct.GetAsync("/api/ready", token);
+            if (ready.StatusCode == HttpStatusCode.ServiceUnavailable)
+            {
+                Assert.True(ready.Headers.CacheControl?.NoStore == true);
+                return;
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+        Assert.Fail("A SIGUSR1 Kestrel child never became not-ready.");
+    }
+
+    private static async Task AssertSocketAbortedByDrainAsync(
+        ClientWebSocket socket, CancellationToken token)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(TimeSpan.FromSeconds(12));
+        var buffer = new byte[4096];
+        try
+        {
+            while (true)
+            {
+                var result = await socket.ReceiveAsync(
+                    new ArraySegment<byte>(buffer), deadline.Token);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return;
+                // A SignalR ping before drain is not proof of closure.
+            }
+        }
+        catch (WebSocketException)
+        {
+            // Server-side Abort() can tear down TCP without a WebSocket
+            // close frame. This is still a drained old connection.
+        }
+        catch (IOException)
+        {
+            // Equivalent underlying socket teardown, not a timeout.
+        }
+    }
+
     private static void AssertOpaque(
         JsonElement completion, string room, string alice, string bob)
     {
@@ -847,13 +894,15 @@ public sealed class RedisTlsProductionTestsKestrel
             var api = ApiAssembly();
             var dp = TestDataProtectionConfiguration.Values;
             await using var nodeA = StartKestrel(portA, api, pfx,
-                password, dp, redis, trustedEdgePort: edgePort);
+                password, dp, redis, trustedEdgePort: edgePort,
+                enablePreStopSignal: true);
             using var directA = Http(portA);
             await ReadyAsync(directA, nodeA, timeout.Token);
             // Serialize DP-key initialization across distinct processes.
             var (alice, aliceCookie) = await LoginAsync(directA, timeout.Token);
             await using var nodeB = StartKestrel(portB, api, pfx,
-                password, dp, redis, trustedEdgePort: edgePort);
+                password, dp, redis, trustedEdgePort: edgePort,
+                enablePreStopSignal: true);
             using var directB = Http(portB);
             await ReadyAsync(directB, nodeB, timeout.Token);
 
@@ -999,6 +1048,117 @@ public sealed class RedisTlsProductionTestsKestrel
             using var bobStillActive = await bobEdge.GetAsync(
                 "/api/sessions/me", timeout.Token);
             Assert.Equal(HttpStatusCode.OK, bobStillActive.StatusCode);
+
+            // The live Bob WebSocket was sticky to this exact Production
+            // Kestrel child. Simulate orchestrator preStop at that child
+            // without issuing SIGTERM, and without revoking Bob's ticket.
+            var drainingPort = bobUpstream == $"127.0.0.1:{portA}" ? portA : portB;
+            var survivingPort = drainingPort == portA ? portB : portA;
+            var drainingNode = drainingPort == portA ? nodeA : nodeB;
+            using var drainingDirect = Http(drainingPort, bobCookie);
+            await drainingNode.SignalPreStopAsync(timeout.Token);
+            await WaitForNodeDrainAsync(drainingDirect, drainingNode, timeout.Token);
+            using (var live = await drainingDirect.GetAsync(
+                "/api/health", timeout.Token))
+                Assert.Equal(HttpStatusCode.OK, live.StatusCode);
+            using (var negotiate = Mutation(HttpMethod.Post, drainingDirect,
+                       "/hubs/lobbies/negotiate?negotiateVersion=1"))
+            using (var denied = await drainingDirect.SendAsync(
+                       negotiate, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, denied.StatusCode);
+                Assert.True(denied.Headers.CacheControl?.NoStore == true);
+                Assert.False(denied.Headers.Contains("Set-Cookie"));
+                Assert.False(denied.Headers.Contains("Location"));
+            }
+            await AssertSocketAbortedByDrainAsync(bobSocket, timeout.Token);
+
+            // The edge, not the player, removes a not-ready node from its
+            // upstream and reloads. Nginx keeps cookie affinity among the
+            // remaining healthy nodes, without replaying uncertain POSTs.
+            await nginx.RemoveUpstreamAsync(
+                scratch.FullName, drainingPort, timeout.Token);
+            using var recovered = Http(edgePort, bobCookie);
+            var relocated = false;
+            for (var attempt = 0; attempt < 60; attempt++)
+            {
+                timeout.Token.ThrowIfCancellationRequested();
+                using var me = await recovered.GetAsync(
+                    "/api/sessions/me", timeout.Token);
+                if (me.StatusCode == HttpStatusCode.OK &&
+                    me.Headers.TryGetValues(
+                        "X-Shirokuro-CI-Upstream", out var upstream) &&
+                    upstream.Single() == $"127.0.0.1:{survivingPort}")
+                {
+                    Assert.True(me.Headers.CacheControl?.NoStore == true);
+                    relocated = true;
+                    break;
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(100), timeout.Token);
+            }
+            Assert.True(relocated,
+                "A still-valid guest ticket must reach the surviving node.");
+            Assert.False(drainingNode.HasExited,
+                "The preStop node remains alive until the orchestrator terminates it.");
+
+            var (reconnectedToken, reconnectedUpstream) =
+                await NegotiateThroughEdgeAsync(recovered, timeout.Token);
+            Assert.Equal($"127.0.0.1:{survivingPort}", reconnectedUpstream);
+            using var reconnectedSocket = await NegotiatedWssAsync(
+                edgePort, bobCookie, reconnectedToken, timeout.Token);
+            var restored = await RosterAsync(reconnectedSocket, room,
+                "post-drain-authorized", timeout.Token);
+            Assert.False(restored.TryGetProperty("error", out _));
+            var roster = restored.GetProperty("result");
+            Assert.True(string.Equals(
+                room, roster.GetProperty("lobbyId").GetString(),
+                StringComparison.Ordinal));
+            Assert.Equal(3L, roster.GetProperty("revision").GetInt64());
+            Assert.True(string.Equals(bob, Assert.Single(
+                roster.GetProperty("participants").EnumerateArray())
+                    .GetProperty("playerId").GetString(), StringComparison.Ordinal),
+                "Reconnected WSS receives Bob's current roster, not a cached one.");
+            Assert.False(restored.GetRawText().Contains(alice, StringComparison.Ordinal),
+                "The drained-node reconciliation must not reveal Alice.");
+
+            // An independent guest on the surviving node is still NOT
+            // allowed to observe the room, even through new affinity.
+            using var visitorAfterDrain = Http(edgePort);
+            var (outsiderId, outsiderCookie) = await LoginAsync(
+                visitorAfterDrain, timeout.Token);
+            using var outsiderClient = Http(edgePort, outsiderCookie);
+            var (outsiderToken, outsiderUpstream) =
+                await NegotiateThroughEdgeAsync(outsiderClient, timeout.Token);
+            Assert.Equal($"127.0.0.1:{survivingPort}", outsiderUpstream);
+            using var outsiderSocket = await NegotiatedWssAsync(
+                edgePort, outsiderCookie, outsiderToken, timeout.Token);
+            var blocked = await RosterAsync(outsiderSocket, room,
+                "post-drain-outsider", timeout.Token);
+            var absentAfterDrain = await RosterAsync(outsiderSocket,
+                "room-00000000000000000000000000000000",
+                "post-drain-unknown", timeout.Token);
+            AssertOpaque(blocked, room, bob, outsiderId);
+            AssertOpaque(absentAfterDrain, room, bob, outsiderId);
+            Assert.Equal(blocked.GetProperty("error").GetString(),
+                absentAfterDrain.GetProperty("error").GetString());
+
+            // Revocation on the surviving server is authoritative for
+            // reconnects and current WSS; preStop did not revoke the
+            // session or alter membership prior to the actual logout.
+            using (var logout = Mutation(
+                HttpMethod.Delete, recovered, "/api/sessions/guest"))
+            using (var signedOutAgain = await recovered.SendAsync(
+                logout, timeout.Token))
+            {
+                Assert.Equal(HttpStatusCode.NoContent, signedOutAgain.StatusCode);
+                Assert.True(signedOutAgain.Headers.CacheControl?.NoStore == true);
+            }
+            AssertOpaque(await RosterAsync(reconnectedSocket, room,
+                "post-drain-revoked", timeout.Token), room, bob, outsiderId);
+            using var revoked = await recovered.GetAsync(
+                "/api/sessions/me", timeout.Token);
+            Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+            Assert.True(revoked.Headers.CacheControl?.NoStore == true);
         }
         finally
         {
