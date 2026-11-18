@@ -70,8 +70,17 @@ def validate_response(path, status, headers, body, expected_ready):
         raise ProbeError("Unexpected probe headers")
     if len(body) > MAX_RESPONSE_BYTES:
         raise ProbeError("Oversized probe response")
+    def unique_fields(pairs):
+        document = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("Duplicate JSON member")
+            document[key] = value
+        return document
+
     try:
-        parsed = json.loads(body.decode("utf-8"))
+        parsed = json.loads(body.decode("utf-8"),
+                            object_pairs_hook=unique_fields)
     except (ValueError, UnicodeDecodeError) as exc:
         raise ProbeError("Invalid probe JSON") from exc
     if type(parsed) is not dict or parsed != expected_body:
