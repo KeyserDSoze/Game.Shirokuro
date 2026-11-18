@@ -311,6 +311,7 @@ public sealed class RedisLobbyHttpIntegrationTests
             var (sessionProvider, shared) = SharedSessions();
             using (sessionProvider)
             {
+                using var telemetry = new MultiplayerMetricCapture();
                 var ns = "api-deadline-" + Guid.NewGuid().ToString("N");
                 using var serverA = Server(shared, redisA, ns);
                 using var serverB = Server(shared, redisB, ns);
@@ -378,6 +379,16 @@ public sealed class RedisLobbyHttpIntegrationTests
                 using (var success = await memberA.SendAsync(leave))
                     Assert.Equal(HttpStatusCode.NoContent, success.StatusCode);
                 Assert.False(await db.KeyExistsAsync(roomKey));
+                var integrity = telemetry.For(
+                    MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+                foreach (var operation in new[] { "cas", "delete" })
+                    Assert.Contains(integrity, measurement =>
+                        measurement.Value == 1 &&
+                        measurement.Tags.Count == 1 &&
+                        measurement.Tags.TryGetValue("operation", out var label) &&
+                        label == operation);
+                Assert.All(integrity, measurement =>
+                    Assert.Equal(new[] { "operation" }, measurement.Tags.Keys));
             }
         }
     }
@@ -393,6 +404,7 @@ public sealed class RedisLobbyHttpIntegrationTests
             var (sessionProvider, shared) = SharedSessions();
             using (sessionProvider)
             {
+                using var telemetry = new MultiplayerMetricCapture();
                 var ns = "api-prune-live-" + Guid.NewGuid().ToString("N");
                 using var serverA = Server(shared, redisA, ns);
                 using var serverB = Server(shared, redisB, ns);
@@ -445,6 +457,15 @@ public sealed class RedisLobbyHttpIntegrationTests
                 var (newId, _) = await Create(ownerB);
                 Assert.NotEqual(existingId, newId);
                 Assert.Equal(2, await db.SortedSetLengthAsync(global));
+                var integrity = telemetry.For(
+                    MultiplayerMetrics.LobbyQuotaIntegrityRejectionsName);
+                Assert.Contains(integrity, measurement =>
+                    measurement.Value == 1 &&
+                    measurement.Tags.Count == 1 &&
+                    measurement.Tags.TryGetValue("operation", out var label) &&
+                    label == "create");
+                Assert.All(integrity, measurement =>
+                    Assert.Equal(new[] { "operation" }, measurement.Tags.Keys));
             }
         }
     }
