@@ -107,3 +107,38 @@ authenticated roster and issues no additional mutations. Existing
 .NET xUnit Redis TLS/HA and all frontend tests remain mandatory
 CI gates. This load-shedding is **per browser tab**, not a substitute
 for server-authoritative rate limiting or multi-pod staging under #21.
+
+
+## Fail-closed polling on lagging Redis replica HTTP 200 (#200)
+
+The public-client roster peek is an authenticated **member-only** read;
+it is not a game observation or permission to mutate. A replica behind
+the revision already confirmed in the browser may reply HTTP 200 with a
+strictly shaped, valid but **older** roster. That response must not
+replace the newer cached room, clear the `stale` indicator or prove that
+the authoritative service has recovered. In the earlier implementation
+the read was classified visually as `older` but still reset the
+exponential failure count to zero. This unintentionally scheduled 15s
+normal reads instead of continuing 30/60/120s backoff, and interacted
+with the one-time wake allowance from #199.
+
+The #200 fix treats an older-revision 200 as an **unverified freshness
+observation**: keep the current roster and its ETag/revision, increment
+the bounded failure counter (max 3) and retain the stale status. Once
+an early wake is spent, later focus/online/visibility hints cannot
+circumvent this backoff, even if a locally inconsistent counter is zero.
+An authenticated 304 or valid current/newer 200 is the only successful
+roster read that both resets the failure backoff and replenishes the
+early wake budget. A real, verified newer roster without the actor is
+still the only 200-based membership-loss evidence.
+
+Vitest tests the wake policy's fail-closed behavior for a consumed
+allowance even at count zero, and the older-revision reconciliation
+and status invariants. Playwright's browser fake-clock regression uses
+503, 503 (one expedited wake), **valid older 200**, repeated
+focus/online hints, then a verified newer 200 and a 304 in a later
+outage episode. It asserts no read earlier than the 120s backoff
+after stale replica evidence, unchanged old-room ETag, preserved
+identity/invitation, eventual recovery and **no mutation replay**.
+This is local resilience logic; it does not validate real staging
+Redis replication lag or Kubernetes ingress (remaining in #21).

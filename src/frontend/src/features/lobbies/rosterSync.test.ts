@@ -153,7 +153,9 @@ describe('pre-match authenticated lobby polling', () => {
     // Once the parent effect observes a verified response, it sets the
     // failure count and used allowance to 0/false.
     expect(rosterCanAdvanceOnWake(0, false)).toBe(true)
-    expect(rosterCanAdvanceOnWake(0, true)).toBe(true)
+    // Even if an inconsistent local counter briefly reads zero, a
+    // consumed allowance remains consumed until authoritative recovery.
+    expect(rosterCanAdvanceOnWake(0, true)).toBe(false)
   })
 
   it('fails closed for malformed wake/backoff state', () => {
@@ -187,8 +189,14 @@ describe('pre-match authenticated lobby polling', () => {
     }
     expect(reconcilePolledRoster(roster(7), roster(6), alice.playerId))
       .toBe('unchanged')
-    // A stale 200 must never replace the locally newer revision.
+    // A stale 200 must never replace the locally newer revision or
+    // replenish a consumed wake allowance. The browser E2E asserts that
+    // it also does not zero the 30/60/120s failure backoff.
     expect(roster(7).revision).toBeGreaterThan(roster(6).revision)
+    expect(nextRosterSyncStatus('current', 'older')).toBe('stale')
+    expect(rosterCanAdvanceOnWake(3, true)).toBe(false)
+    expect(rosterCanAdvanceOnWake(0, true)).toBe(false)
+    expect(rosterPollDelayMs(3, 0)).toBe(120_000)
   })
 
   it('clears the freshness warning only after an authorized 304 or verified same/newer 200', () => {

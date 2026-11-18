@@ -308,17 +308,22 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'invalid'))
           return
         }
-        // Valid, including a stale but well-formed revision, means the API
-        // is responsive. Do not penalize an authorized no-change snapshot.
+        if (latest.revision < current.revision) {
+          // A lagging replica can return a syntactically valid older 200.
+          // It is NOT proof of member-authorized freshness: keep the newer
+          // cached roster, continue the outage backoff and do not replenish
+          // the one-off wake hint allowance (including after prior 503s).
+          transientFailures = Math.min(3, transientFailures + 1)
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'older'))
+          return
+        }
+        // Only a current/newer, validated, member-authorized 200 (or 304
+        // above) is evidence of recovery. A read from a stale replica
+        // cannot reduce the backoff or authorize another early wake.
         transientFailures = 0
-        // Only an authoritative current/newer snapshot replenishes the
-        // one-off outage wake budget; stale replica data cannot do so.
-        if (latest.revision >= current.revision) outageWakeUsed = false
-        // A lagging replica's older 200 cannot establish freshness, even
-        // though it is well-formed and must not replace the local revision.
+        outageWakeUsed = false
         if (result !== 'missing')
-          setRosterSyncStatus(previous => nextRosterSyncStatus(previous,
-            latest.revision < current.revision ? 'older' : 'verified'))
+          setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'verified'))
         if (result === 'updated') {
           setRoom(previous =>
             previous?.lobbyId === roomId && previous.revision < latest.revision

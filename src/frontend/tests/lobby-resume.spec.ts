@@ -185,3 +185,119 @@ test('a persistent roster outage spends only one wake and preserves bounded back
   await expect(page.getByTestId('lobby-player')).toContainText(actor)
   expect(mutations).toBe(2) // never replay POST/PATCH/DELETE due to a hint
 })
+
+
+test('an old-revision 200 after Redis outage preserves backoff and cannot rearm wake hints', async ({ page }) => {
+  test.setTimeout(65_000)
+  // Simulate minutes of replica lag without long wall-clock Playwright sleeps.
+  await page.clock.install()
+  const code = 'room-' + 'c'.repeat(32)
+  const actor = 'guest-' + 'c'.repeat(32)
+  const original = {
+    lobbyId: code, revision: 4, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+  }
+  const older = { ...original, revision: 3 }
+  const newer = { ...original, revision: 5,
+    participants: [{ playerId: actor, teamId: 'black', heroId: null }] }
+  let signedIn = false
+  let reads = 0
+  let mutations = 0
+  const validators: (string | undefined)[] = []
+
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { kind: 'guest', playerId: actor } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    mutations++
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    mutations++
+    return route.fulfill({ status: 201, json: original })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
+    reads++
+    validators.push(route.request().headers()['if-none-match'])
+    if (reads <= 2 || reads === 5) return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+      json: { status: 'unavailable' },
+    })
+    if (reads === 3) return route.fulfill({
+      status: 200, headers: { 'Cache-Control': 'no-store' }, json: older,
+    })
+    if (reads === 4) return route.fulfill({
+      status: 200, headers: { 'Cache-Control': 'no-store' }, json: newer,
+    })
+    // A verified authorized 304 clears the second outage episode.
+    return route.fulfill({ status: 304, headers: { 'Cache-Control': 'no-store' } })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+  expect(mutations).toBe(2)
+
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(1)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+
+  // Consume exactly one early wake while the API keeps returning 503.
+  await page.evaluate(() => {
+    for (let i = 0; i < 40; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(2)
+  await page.clock.fastForward(60_100)
+  await expect.poll(() => reads).toBe(3)
+
+  // This third GET returned HTTP 200, but revision 3 is older than our
+  // locally verified 4. Do not adopt its payload or claim recovery.
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  expect(validators).toEqual(['"rev-4"', '"rev-4"', '"rev-4"'])
+
+  // Old, valid 200 is a failure of freshness. 40 fresh hints after the
+  // hint cooldown must not replace its next 120s automatic retry.
+  await page.clock.fastForward(30_100)
+  await page.evaluate(() => {
+    for (let i = 0; i < 40; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(16_000)
+  expect(reads).toBe(3)
+  await page.clock.fastForward(74_000)
+  await expect.poll(() => reads).toBe(4)
+  await expect(page.getByTestId('lobby-revision')).toContainText('5')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-roster')).toContainText('black')
+
+  // A fully verified revision 5 re-arms exactly one wake for the next
+  // outage. The next 503 stays stale; a subsequent 304 recovers it.
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(5)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await page.evaluate(() => {
+    for (let i = 0; i < 40; i++) window.dispatchEvent(new Event('online'))
+  })
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(6)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('5')
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  expect(validators).toEqual([
+    '"rev-4"', '"rev-4"', '"rev-4"', '"rev-4"', '"rev-5"', '"rev-5"',
+  ])
+  expect(mutations).toBe(2) // no POST/PATCH/DELETE retry during polling
+})
