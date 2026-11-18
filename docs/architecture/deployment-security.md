@@ -3721,3 +3721,41 @@ failover/SLO, guest revocation or match privacy. The operator must provide
 separate deployment topology, browser reconnect and Redis HA evidence under
 parent #21. The existing GitHub Actions suite still covers .NET xUnit,
 real Nginx/Kestrel fixtures, Redis TLS/ACL/HA, Vitest and Playwright.
+
+## External preStop readiness transition watch (#195)
+
+The standalone standard-library tool `scripts/staging_drain_watch.py`
+observes the public contract on ONE directly addressed HTTPS staging node,
+reusing #194 strict TLS validation, no redirects, no cookies, 1024-byte
+response limit and exact JSON/no-store checks. It never triggers preStop,
+writes to Redis or retries a game mutation.
+
+```sh
+python scripts/staging_drain_watch.py \
+  --base-url https://node-a.staging.example.invalid \
+  --max-polls 12 --stable-samples 3 --interval 2 --timeout 3
+```
+
+Replace the placeholder with a real certificate-verified direct-node origin.
+The first sample MUST be health 200 and readiness 200/ready. Only after
+that verified baseline is the operator prompted to **externally** begin
+SIGUSR1/preStop, keeping the draining node alive through the observation.
+Subsequent samples require health 200 throughout and readiness to become
+503/unavailable with at least 2 consecutive observations (3 by default).
+Any 503 before baseline, post-503 200, unexpected HTTP status, invalid
+headers/JSON, redirect, TLS or network failure, or deadline exhaustion
+fails the monitor. After it succeeds, the operator may terminate the
+node; do not use the watcher after SIGTERM when liveness is no longer 200.
+
+Bounds: 2–30 polls after baseline, 2–6 stable unready samples no more
+than the poll count, 0.25–10 seconds interval and per-request timeout.
+Each round uses at most two anonymous GETs. The output is intentionally
+aggregate-only: no hostname, URL, cookies, tokens, IPs, Redis secrets,
+response body or exception information. It verifies a finite window,
+**not** permanent monotonicity.
+
+The watcher cannot measure LB withdrawal time from the actual SIGUSR1
+because the operator initiates it externally, nor prove the origin is
+routed to a distinct pod. Validate pod identity/ingress updates and
+authenticated WSS reconnect independently in real staging under #21.
+CI continues to require .NET xUnit, Redis TLS/HA, Vitest and Playwright.
