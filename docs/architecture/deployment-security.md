@@ -3866,3 +3866,56 @@ The test does not prove authenticated WSS reconnect, edge TLS termination,
 Kubernetes pod identity, LB endpoint withdrawal or Redis HA/SLO. These
 remain operational prerequisites in parent #21. See
 [issue #197](https://github.com/KeyserDSoze/Game.Shirokuro/issues/197).
+
+
+## Three-origin public ingress continuity during external preStop (#198)
+
+`scripts/staging_drain_watch.py` now supports optional `--edge-url` when
+`--survivor-url` is also supplied. It observes a draining direct-node
+origin, a surviving direct-node origin and a public ingress HTTPS origin
+during a **separately orchestrated** drain:
+
+```sh
+python scripts/staging_drain_watch.py \
+  --base-url https://draining.staging.example.invalid \
+  --survivor-url https://survivor.staging.example.invalid \
+  --edge-url https://edge.staging.example.invalid \
+  --max-polls 12 --stable-samples 3 --interval 2 --timeout 3
+```
+
+All three targets must first prove HTTP 200 liveness and 200 readiness,
+with exact JSON, no-store and no cookies/redirects. Only then can an
+operator independently initiate SIGUSR1/preStop. During each subsequent
+sample, the draining process must remain live and its readiness must
+transition monotonically to 503/unavailable. The direct survivor AND the
+public ingress must remain 200/ready and live at **every** sample, including
+the last. A transient 503 at the ingress is deliberately a failed
+strict-continuity observation even if the next probe might recover.
+
+With no `--edge-url`, the existing single/two-node watcher behavior is
+unchanged. Edge-only mode is rejected: `--survivor-url` must also exist.
+All targets are validated before issuing any GET. Only bare HTTPS origins
+are accepted: no URL paths, query, fragment, userinfo or insecure HTTP.
+Obviously coincident hostnames (case-insensitive), default 443 ports
+and equivalent IPv6 addresses are rejected for **any** pair, but this
+does NOT certify real Kubernetes pod identity or deployment routing.
+All requests share the strict TLS/hostname, empty ProxyHandler and
+no-redirect/no-cookie opener of #195; there is no guest authentication,
+POST, mutation retry or action to trigger drain.
+
+This bounded tool makes at most **six GETs per observation**, one baseline
+and 2–30 poll rounds, with per-request 0.25–10 s socket timeout and
+0.25–10 s interval. Output never includes target hosts, guest IDs,
+tokens, cookies, payloads or exceptions. CI runs fake three-origin tests
+for baseline failures, later ingress outages (including the terminal
+sample), recovered ingress outages, input validation and privacy.
+The existing OpenSSL loopback TLS fixture also starts a third HTTPS
+listener, confirming good three-way transition and final-sample
+edge 503 rejection over actual encrypted sockets.
+
+This is a **public HTTP probe contract**, not proof of ingress
+endpoint withdrawal or correct routing of guest login, new lobby
+admissions or authenticated SignalR WebSocket upgrades. Only real
+staging pod mapping, load-balancer drill and private WSS reconnect
+checks can resolve parent
+[#21](https://github.com/KeyserDSoze/Game.Shirokuro/issues/21).
