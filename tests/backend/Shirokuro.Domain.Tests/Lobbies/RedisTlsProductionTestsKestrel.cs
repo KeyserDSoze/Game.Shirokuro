@@ -291,26 +291,53 @@ public sealed class RedisTlsProductionTestsKestrel
                  id.GetString() == invocation, token);
     }
 
+    // This is only for the CI edge-reload fixture. A single nginx worker
+    // may still route a new negotiate to the draining backend briefly.
+    // Retrying is legal only after an explicit 503 with a non-cacheable,
+    // cookie-free response: never replay an uncertain lobby mutation or
+    // an already-successful SignalR negotiate.
+    private static bool CanRetryPostDrainNegotiate(HttpResponseMessage response) =>
+        response.StatusCode == HttpStatusCode.ServiceUnavailable &&
+        response.Headers.CacheControl?.NoStore == true &&
+        !response.Headers.Contains("Set-Cookie") &&
+        !response.Headers.Contains("Location");
+
     private static async Task<(string Token, string Upstream)> NegotiateThroughEdgeAsync(
-        HttpClient client, CancellationToken token)
+        HttpClient client, CancellationToken token,
+        bool afterNginxDrainReload = false)
     {
-        using var request = Mutation(HttpMethod.Post, client,
-            "/hubs/lobbies/negotiate?negotiateVersion=1");
-        using var response = await client.SendAsync(request, token);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.True(response.Headers.TryGetValues("X-Shirokuro-CI-Upstream",
-            out var upstreamValues), "The edge must identify a test upstream.");
-        var upstream = Assert.Single(upstreamValues!);
-        using var json = JsonDocument.Parse(
-            await response.Content.ReadAsStringAsync(token));
-        // The connection token is private. Never include it, the negotiated
-        // JSON, or a request URL containing it in xUnit failure messages.
-        Assert.True(json.RootElement.TryGetProperty("connectionToken",
-            out var connectionToken), "SignalR must issue an opaque connection token.");
-        var value = connectionToken.GetString();
-        Assert.False(string.IsNullOrEmpty(value),
-            "Negotiated SignalR connection token must be nonempty.");
-        return (value!, upstream);
+        var maxAttempts = afterNginxDrainReload ? 8 : 1;
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            using var request = Mutation(HttpMethod.Post, client,
+                "/hubs/lobbies/negotiate?negotiateVersion=1");
+            using var response = await client.SendAsync(request, token);
+            if (afterNginxDrainReload && CanRetryPostDrainNegotiate(response))
+            {
+                if (attempt + 1 == maxAttempts)
+                    break;
+                await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+                continue;
+            }
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.True(response.Headers.TryGetValues("X-Shirokuro-CI-Upstream",
+                out var upstreamValues), "The edge must identify a test upstream.");
+            var upstream = Assert.Single(upstreamValues!);
+            using var json = JsonDocument.Parse(
+                await response.Content.ReadAsStringAsync(token));
+            // The connection token is private. Never include it, negotiated
+            // JSON or a request URL containing it in xUnit failure messages.
+            Assert.True(json.RootElement.TryGetProperty("connectionToken",
+                out var connectionToken),
+                "SignalR must issue an opaque connection token.");
+            var value = connectionToken.GetString();
+            Assert.False(string.IsNullOrEmpty(value),
+                "Negotiated SignalR connection token must be nonempty.");
+            return (value!, upstream);
+        }
+        throw new InvalidOperationException(
+            "Nginx post-drain converge check failed after bounded explicit 503 replies.");
     }
 
     private static async Task<ClientWebSocket> NegotiatedWssAsync(
@@ -1102,7 +1129,8 @@ public sealed class RedisTlsProductionTestsKestrel
                 "The preStop node remains alive until the orchestrator terminates it.");
 
             var (reconnectedToken, reconnectedUpstream) =
-                await NegotiateThroughEdgeAsync(recovered, timeout.Token);
+                await NegotiateThroughEdgeAsync(recovered, timeout.Token,
+                    afterNginxDrainReload: true);
             Assert.Equal($"127.0.0.1:{survivingPort}", reconnectedUpstream);
             using var reconnectedSocket = await NegotiatedWssAsync(
                 edgePort, bobCookie, reconnectedToken, timeout.Token);
@@ -1128,7 +1156,8 @@ public sealed class RedisTlsProductionTestsKestrel
                 visitorAfterDrain, timeout.Token);
             using var outsiderClient = Http(edgePort, outsiderCookie);
             var (outsiderToken, outsiderUpstream) =
-                await NegotiateThroughEdgeAsync(outsiderClient, timeout.Token);
+                await NegotiateThroughEdgeAsync(outsiderClient, timeout.Token,
+                    afterNginxDrainReload: true);
             Assert.Equal($"127.0.0.1:{survivingPort}", outsiderUpstream);
             using var outsiderSocket = await NegotiatedWssAsync(
                 edgePort, outsiderCookie, outsiderToken, timeout.Token);
