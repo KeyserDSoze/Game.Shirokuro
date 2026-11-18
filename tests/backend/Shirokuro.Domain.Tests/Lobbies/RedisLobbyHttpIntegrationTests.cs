@@ -1,4 +1,6 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Security.Claims;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -597,6 +599,83 @@ public sealed class RedisLobbyHttpIntegrationTests
                     new { heroId = "kira", expectedRevision = 1 });
                 using var blocked = await authorized.SendAsync(selection);
                 Assert.Equal(HttpStatusCode.NotFound, blocked.StatusCode);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task FutureIndexOrphanReleasesCreatorQuotaAcrossProductionNodes()
+    {
+        if (ConnectionString is null) return;
+        var (redisA, redisB) = await Redis();
+        using (redisA)
+        using (redisB)
+        {
+            var (sessionProvider, shared) = SharedSessions();
+            using (sessionProvider)
+            {
+                var ns = "api-future-orphan-" + Guid.NewGuid().ToString("N");
+                using var serverA = Server(shared, redisA, ns);
+                using var serverB = Server(shared, redisB, ns);
+                using var visitor = Client(serverA);
+                var (creatorId, cookie) = await Login(visitor);
+                using var nodeA = Client(serverA, cookie);
+                using var nodeB = Client(serverB, cookie);
+
+                var ids = new List<string>();
+                for (var n = 0; n < 4; n++)
+                    ids.Add((await Create(n % 2 == 0 ? nodeA : nodeB)).Id);
+                using (var attempt = Write(HttpMethod.Post, "/api/lobbies",
+                    new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+                using (var full = await nodeB.SendAsync(attempt))
+                {
+                    Assert.Equal(HttpStatusCode.TooManyRequests, full.StatusCode);
+                    Assert.Equal("no-store", full.Headers.CacheControl?.ToString());
+                }
+
+                static string Hash(string id) => Convert.ToHexStringLower(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(id)));
+                var prefix = "shirokuro:lobby:{" + ns + "}:v2:";
+                var creatorIndex = prefix + "capacity:creator:" + Hash(creatorId);
+                var globalIndex = prefix + "capacity:all";
+                var oldKey = prefix + "room:" + Hash(ids[0]);
+                var db = redisA.GetDatabase();
+                var score = await db.SortedSetScoreAsync(creatorIndex, oldKey);
+                Assert.NotNull(score);
+                Assert.True(score > DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                Assert.Equal(score,
+                    await db.SortedSetScoreAsync(globalIndex, oldKey));
+                Assert.True(await db.KeyDeleteAsync(oldKey));
+                Assert.Equal(score,
+                    await db.SortedSetScoreAsync(creatorIndex, oldKey));
+
+                // An early physical deletion is not a 429 quota, and is
+                // different from a damaged LIVE room which must return 503.
+                var (replacement, _) = await Create(nodeB);
+                Assert.DoesNotContain(replacement, ids);
+                Assert.Null(await db.SortedSetScoreAsync(creatorIndex, oldKey));
+                Assert.Equal(4, await db.SortedSetLengthAsync(creatorIndex));
+                using (var missing = await nodeA.GetAsync(
+                    "/api/lobbies/" + ids[0] + "/roster/peek"))
+                {
+                    Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+                    Assert.True(missing.Headers.CacheControl?.NoStore == true);
+                }
+                using (var authorized = await nodeA.GetAsync(
+                    "/api/lobbies/" + replacement + "/roster/peek"))
+                {
+                    Assert.Equal(HttpStatusCode.OK, authorized.StatusCode);
+                    using var json = JsonDocument.Parse(
+                        await authorized.Content.ReadAsStringAsync());
+                    Assert.Equal(replacement,
+                        json.RootElement.GetProperty("lobbyId").GetString());
+                    Assert.Equal(1, json.RootElement.GetProperty(
+                        "participants").GetArrayLength());
+                }
+                using (var fifth = Write(HttpMethod.Post, "/api/lobbies",
+                    new { teamIds = new[] { "white", "black" }, teamId = "white" }))
+                using (var stillFull = await nodeA.SendAsync(fifth))
+                    Assert.Equal(HttpStatusCode.TooManyRequests, stillFull.StatusCode);
             }
         }
     }
