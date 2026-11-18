@@ -3510,3 +3510,50 @@ parent #21 ancora aperta.
 **SUCCESS 3/3** sull'HEAD codice `0a8d47d`: 885 xUnit standard,
 21 Redis TLS/ACL/HA/Sentinel, Linux SIGUSR1, 347 Vitest,
 43 Playwright, 35 Python e builds.
+
+
+## Redis lobby quota integrity events (#189)
+
+The existing `Shirokuro.Api.Multiplayer` meter now publishes
+`Counter<long> shirokuro.redis.lobby_quota.integrity_rejections` with
+**one fixed `operation` label**: `create`, `cas`, or `delete`.
+There is **no** room ID, player/creator ID, cookie, IP, request path, key,
+namespace, replica endpoint, exception text or query-supplied label.
+The counter reports **rejected operations**, not distinct damaged rooms,
+not the number of corrupted entries, and not all HTTP 503 responses.
+
+The signal is emitted only **after an authoritative Redis Lua result**:
+
+- `create`: #188 rejected a due-index pruning candidate because its room
+  was still present, had no TTL, had a foreign/non-canonical key or exceeded
+  a bounded due window (`-4`), before any index or room mutation.
+- `cas`, `delete`: #187 found a missing or mismatched
+  `PEXPIRETIME` / global / creator index deadline on a current indexed
+  room (`-2`), before changing a room or index.
+- Normal capacity denial (429), stale revision conflict (409), guest
+  revocation, cancellation, Redis network loss/timeout, uncertain successful
+  write and failed post-write confirmation **never** emit this specific
+  counter. They retain their existing fail-closed/independent diagnostics.
+
+**Operator usage:** an increase in this counter during a staging soak or
+an actual deployment is evidence of a *known quota index inconsistency* and
+should trigger investigation of Redis persistence/failover/restore procedures.
+Do not treat a zero sample as proof that all keys are healthy: no Lua check
+may have run, and metrics export is disabled by default. Do not use this
+measurement as an auth/availability gate, automatically rewrite scores,
+remove room keys or include room/creator IDs in exporter labels. Review the
+two relevant Redis index/room TTL deadlines through a restricted offline
+operator process and plan an explicit repair or restore. This counter is
+optional OTLP telemetry over the pre-existing explicitly enabled HTTPS
+collector; **no public /metrics endpoint** is registered. Only the
+application's existing fixed-label meter is exported; this change
+does not make real multi-pod ingress or Redis HA production-tested.
+
+xUnit tests capture the actual `MeterListener` counter and validate its
+type, unit, exactly three server-controlled operations and rejected unknown
+enums; fake Redis confirms that only `-4/-2/-2` generate the metric, not
+ordinary limits/fences/conflicts. Real two-connector Redis and independent
+Production API TestServers verify a corrupt index produces the expected
+counter while preserving HTTP 503/no-store and explicit-repair recovery.
+See [issue #189](https://github.com/KeyserDSoze/Game.Shirokuro/issues/189);
+the final complete CI gate is recorded there. Parent #21 remains open.
