@@ -261,8 +261,15 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       if (!document.hidden) resume()
     }
     const onOffline = () => {
-      // The previously verified roster stays visible but no longer claims
-      // to reflect current server state until a real authorized response.
+      // A GET started while online must not promote an old 200/304 to
+      // authoritative freshness AFTER connectivity is lost. Abort the
+      // passive read even when the transport ignores cancellation (peek
+      // races its own abort signal). Never cancel a player mutation.
+      inFlightAbort?.abort()
+      // A wake pending before disconnection is no longer evidence of
+      // recovery and must not consume the one-off outage wake allowance.
+      resumePending = false
+      // Keep the last verified roster, but explicitly mark it stale.
       if (active && currentRoomRef.current?.lobbyId === roomId)
         setRosterSyncStatus(previous => nextRosterSyncStatus(previous, 'outage'))
     }
