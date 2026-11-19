@@ -97,7 +97,15 @@ def validate_response(path, status, headers, body, expected_ready):
     cache_control = single_header("Cache-Control")
     content_type = single_header("Content-Type")
     directives = [part.strip().lower() for part in cache_control.split(",")]
+    # The production probe contract is no-store. Do not certify an ingress
+    # that mixes it with a contradictory cacheability directive (public,
+    # max-age, immutable, stale-* or unknown extension). Only a small,
+    # explicit set of reinforcing directives is safe; repeated/empty tokens
+    # are ambiguous even within one Cache-Control header.
+    safe_directives = {"no-store", "private", "no-cache", "must-revalidate"}
     if ("no-store" not in directives or
+            len(directives) != len(set(directives)) or
+            not set(directives).issubset(safe_directives) or
             headers.get("Set-Cookie") is not None or
             headers.get("Location") is not None or
             headers.get("Retry-After") is not None or
