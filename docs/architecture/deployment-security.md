@@ -3919,3 +3919,27 @@ admissions or authenticated SignalR WebSocket upgrades. Only real
 staging pod mapping, load-balancer drill and private WSS reconnect
 checks can resolve parent
 [#21](https://github.com/KeyserDSoze/Game.Shirokuro/issues/21).
+
+## Unambiguous staging response headers (#203)
+
+The operator-only `scripts/staging_probe.py` and the three-target
+`scripts/staging_drain_watch.py` share `validate_response()`. For every
+public `/api/health` or `/api/ready` HTTPS result (including the expected
+503 during drain), exactly **one** `Cache-Control` field must carry the
+`no-store` directive and exactly **one** `Content-Type` field must denote
+`application/json`. Two copies are rejected **even when identical**.
+`urllib` exposes the complete HTTP header collection through
+`HTTPMessage.get_all()`; using only `get()` would check the first field
+and ignore a later contradictory ingress rewrite such as
+`Cache-Control: public, max-age=300` or `Content-Type: text/html`.
+
+The prior explicit rejections of `Set-Cookie`, `Location` and
+`Retry-After` remain in place, as do the exact status/JSON schema,
+duplicate JSON member rejection and the 1024-byte body cap. Tests cover
+ambiguous headers through both synthetic `HTTPMessage` and real OpenSSL
+loopback HTTPS; the drain watcher must reject an ambiguous **edge baseline**
+before telling the operator to initiate external preStop. No cookies,
+session data, server URLs or unexpected bodies are printed, and no
+readiness or gameplay endpoint changes. This is still **not** a staging
+Kubernetes load-balancer or pod-identity attestation; parent #21 remains
+open.
