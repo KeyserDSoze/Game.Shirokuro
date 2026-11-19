@@ -407,3 +407,99 @@ test('mismatched 304 never confirms roster freshness or bypasses bounded outage 
   expect(validators).toEqual(['"rev-4"', '"rev-4"', '"rev-4"'])
   expect(writes).toBe(2)
 })
+
+test('contradictory no-store 304 preserves stale roster and 60s retry budget', async ({ page }) => {
+  test.setTimeout(65_000)
+  await page.clock.install()
+  const code = 'room-' + 'b'.repeat(32)
+  const actor = 'guest-' + 'b'.repeat(32)
+  const snapshot = {
+    lobbyId: code, revision: 4, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+  }
+  let signedIn = false
+  let reads = 0
+  let writes = 0
+  const validators: (string | undefined)[] = []
+
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { kind: 'guest', playerId: actor } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    writes++
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    writes++
+    return route.fulfill({ status: 201, json: snapshot })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
+    reads++
+    validators.push(route.request().headers()['if-none-match'])
+    if (reads === 1) return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+      json: { status: 'unavailable' },
+    })
+    if (reads === 2) return route.fulfill({
+      status: 304, headers: {
+        ETag: '"rev-4"', 'Cache-Control': 'no-store, public, max-age=60',
+      },
+    })
+    return route.fulfill({
+      status: 304, headers: {
+        ETag: '"rev-4"', 'Cache-Control': 'private, no-store',
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  expect(writes).toBe(2)
+
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(1)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await page.clock.runFor(200)
+
+  // A single wake may advance the retry, not turn a cacheable 304 into a
+  // fresh roster. Even a matching strong ETag is insufficient.
+  await page.evaluate(() => {
+    for (let i = 0; i < 30; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_100)
+  await expect.poll(() => reads).toBe(2)
+  await page.clock.runFor(200)
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+
+  // After the bad 304, failure #2 requires 60..72s retry. A fresh focus
+  // burst after 30s must not bypass the consumed one-off wake allowance.
+  await page.clock.fastForward(35_000)
+  await page.evaluate(() => {
+    for (let i = 0; i < 30; i++) {
+      window.dispatchEvent(new Event('online'))
+      window.dispatchEvent(new Event('focus'))
+    }
+  })
+  await page.clock.fastForward(15_000)
+  expect(reads).toBe(2)
+  await page.clock.fastForward(25_000)
+  await expect.poll(() => reads).toBe(3)
+
+  // Only the later authorized 304 with an unambiguous no-store policy may
+  // mark the saved revision current. No revoked identity or room is invented.
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('4')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(validators).toEqual(['"rev-4"', '"rev-4"', '"rev-4"'])
+  expect(writes).toBe(2) // never replay mutating requests during polling
+})
