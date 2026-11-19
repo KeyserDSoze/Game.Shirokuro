@@ -75,6 +75,9 @@ public sealed class RedisDeploymentReadiness(
     // allocating one queued semaphore waiter per HTTP request.
     private readonly object _stateGate = new();
     private Task<bool>? _inFlight;
+    // A backwards UTC adjustment must never prolong an old positive result.
+    // Store the start of the last completed cache window as well as its end.
+    private DateTimeOffset _lastCompletedProbeUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _nextProbeUtc = DateTimeOffset.MinValue;
     private bool _lastResult;
 
@@ -86,7 +89,8 @@ public sealed class RedisDeploymentReadiness(
         TaskCompletionSource<bool>? started = null;
         lock (_stateGate)
         {
-            if (clock.GetUtcNow() < _nextProbeUtc)
+            var now = clock.GetUtcNow();
+            if (now >= _lastCompletedProbeUtc && now < _nextProbeUtc)
                 return Task.FromResult(_lastResult);
 
             if (_inFlight is null)
@@ -186,7 +190,8 @@ public sealed class RedisDeploymentReadiness(
         lock (_stateGate)
         {
             _lastResult = ready;
-            _nextProbeUtc = clock.GetUtcNow().Add(CachedFor);
+            _lastCompletedProbeUtc = clock.GetUtcNow();
+            _nextProbeUtc = _lastCompletedProbeUtc.Add(CachedFor);
             _inFlight = null;
         }
 
