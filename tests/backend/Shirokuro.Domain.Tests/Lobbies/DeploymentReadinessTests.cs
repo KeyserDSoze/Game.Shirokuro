@@ -263,6 +263,58 @@ public sealed class DeploymentReadinessTests
     }
 
     [Fact]
+    public async Task BackwardsUtcClockJumpCannotExtendCachedReadyThroughSessionOutage()
+    {
+        if (RedisAddress is null) return;
+        using var redis = await ConnectionMultiplexer.ConnectAsync(RedisAddress);
+        var sessions = new ToggleSessionStore();
+        var clock = new ManualClock();
+        using var server = Production(redis, sessions, clock);
+        using var client = Client(server);
+
+        using (var healthy = await client.GetAsync("/api/ready"))
+            await AssertStatus(healthy, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, sessions.Reads);
+        Assert.Equal(1, sessions.Writes);
+
+        // An ordinary request in the same three-second window must reuse
+        // the result rather than performing another Redis write.
+        sessions.Fail = true;
+        using (var cached = await client.GetAsync("/api/ready"))
+            await AssertStatus(cached, HttpStatusCode.OK, "ready");
+        Assert.Equal(1, sessions.Reads);
+
+        // NTP/VM clock correction can move wall time backwards without
+        // advancing it to the original expiry for a long time. A previous
+        // 200 must no longer certify the Redis outage for that duration.
+        clock.Advance(TimeSpan.FromHours(-1));
+        var responses = await Task.WhenAll(
+            Enumerable.Range(0, 16).Select(_ => client.GetAsync("/api/ready")));
+        foreach (var response in responses)
+        {
+            using (response)
+                await AssertStatus(response,
+                    HttpStatusCode.ServiceUnavailable, "unavailable");
+        }
+        Assert.Equal(2, sessions.Reads);
+        Assert.Equal(2, sessions.Writes);
+
+        // The failed recheck still owns its normal bounded cache window.
+        sessions.Fail = false;
+        clock.Advance(TimeSpan.FromSeconds(2));
+        using (var failedCached = await client.GetAsync("/api/ready"))
+            await AssertStatus(failedCached,
+                HttpStatusCode.ServiceUnavailable, "unavailable");
+        Assert.Equal(2, sessions.Reads);
+
+        clock.Advance(TimeSpan.FromSeconds(2));
+        using (var recovered = await client.GetAsync("/api/ready"))
+            await AssertStatus(recovered, HttpStatusCode.OK, "ready");
+        Assert.Equal(3, sessions.Reads);
+        Assert.Equal(3, sessions.Writes);
+    }
+
+    [Fact]
     public async Task StaleSessionProbeValueCannotHideSilentlyIgnoredCacheWrite()
     {
         if (RedisAddress is null) return;
