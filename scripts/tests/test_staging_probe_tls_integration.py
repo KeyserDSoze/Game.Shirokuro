@@ -40,6 +40,7 @@ class PublicProbeHandler(BaseHTTPRequestHandler):
             else:
                 mode = server.mode
             bad_cache = server.bad_cache
+            cache_override = server.cache_control_override
             extra_headers = server.extra_headers
 
         if self.path not in ("/api/health", "/api/ready"):
@@ -56,7 +57,8 @@ class PublicProbeHandler(BaseHTTPRequestHandler):
 
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "max-age=30" if bad_cache else "no-store")
+        self.send_header("Cache-Control", cache_override if cache_override is not None
+                         else ("max-age=30" if bad_cache else "no-store"))
         for name, value in extra_headers:
             # Simulate a real edge/proxy adding a second conflicting field.
             self.send_header(name, value)
@@ -82,6 +84,7 @@ class LocalTlsNode:
         self.server.ready_reads = 0
         self.server.request_count = 0
         self.server.bad_cache = False
+        self.server.cache_control_override = None
         self.server.extra_headers = ()
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -99,6 +102,7 @@ class LocalTlsNode:
             self.server.ready_reads = 0
             self.server.request_count = 0
             self.server.bad_cache = False
+            self.server.cache_control_override = None
             self.server.extra_headers = ()
 
     def close(self):
@@ -201,6 +205,42 @@ class RealStagingHttpsTests(unittest.TestCase):
         node.server.bad_cache = True
         with self.assertRaises(probe.ProbeError):
             probe.probe_one(opener, node.origin, "/api/ready", 2, "ready")
+
+    def test_real_tls_combined_cache_directives_fail_for_health_and_503(self):
+        node = self.nodes[0]
+        opener = self.trusted_opener()
+        for policy in ("no-store, public", "no-store, max-age=60",
+                       "private, no-store, immutable", "no-store, no-store"):
+            with self.subTest(policy=policy):
+                node.reset()
+                node.server.cache_control_override = policy
+                with self.assertRaises(probe.ProbeError):
+                    probe.run_checks([node.origin], "ready", 1, 0, 2,
+                                     opener=opener)
+                self.assertEqual(1, node.server.request_count)
+                # Even an expected 503 after drain cannot be trusted when
+                # its single Cache-Control field contradicts no-store.
+                node.server.mode = "unavailable"
+                with self.assertRaises(probe.ProbeError):
+                    probe.probe_one(opener, node.origin, "/api/ready", 2,
+                                    "unavailable")
+                self.assertEqual(2, node.server.request_count)
+
+    def test_three_node_drain_rejects_cacheable_edge_baseline_before_notice(self):
+        drained, survivor = self.nodes
+        edge = self.edge
+        edge.server.cache_control_override = "no-store, public, max-age=60"
+        notices = []
+        with self.assertRaises(probe.ProbeError):
+            drain.watch_drain(drained.origin, 2, 2, .25, 2,
+                              opener=self.trusted_opener(), sleep=lambda _: None,
+                              notify=notices.append,
+                              survivor_origin=survivor.origin,
+                              edge_origin=edge.origin)
+        self.assertEqual([], notices)
+        self.assertEqual(2, drained.server.request_count)
+        self.assertEqual(2, survivor.server.request_count)
+        self.assertEqual(1, edge.server.request_count)
 
     def test_actual_https_duplicate_cache_or_content_type_is_rejected(self):
         node = self.nodes[0]
