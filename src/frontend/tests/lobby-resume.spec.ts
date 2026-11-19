@@ -503,3 +503,112 @@ test('contradictory no-store 304 preserves stale roster and 60s retry budget', a
   expect(validators).toEqual(['"rev-4"', '"rev-4"', '"rev-4"'])
   expect(writes).toBe(2) // never replay mutating requests during polling
 })
+
+for (const lateStatus of [200, 304] as const) {
+  test(`offline aborts an in-flight roster GET and ignores a late HTTP ${lateStatus}`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const code = 'room-' + '9'.repeat(32)
+    const actor = 'guest-' + '9'.repeat(32)
+    const snapshot = {
+      lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+    }
+    let signedIn = false
+    let writes = 0
+    let newReads = 0
+
+    await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+      ? { status: 200, json: { kind: 'guest', playerId: actor } }
+      : { status: 401 }))
+    await page.route('**/api/sessions/guest', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      signedIn = true
+      writes++
+      return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+    })
+    await page.route('**/api/lobbies', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      writes++
+      return route.fulfill({ status: 201, json: snapshot })
+    })
+    await page.route('**/api/lobbies/' + code + '/roster/peek', route => {
+      newReads++
+      return route.fulfill({
+        status: 304,
+        headers: { ETag: '"rev-1"', 'Cache-Control': 'no-store' },
+      })
+    })
+
+    await page.goto('/')
+    // Model an abort-IGNORING fetch transport, stronger than actual browser
+    // fetch. It may deliver a stale 200/304 after offline and after abort.
+    // Only this first passive GET is intercepted; all other HTTP is real
+    // browser traffic routed through Playwright above.
+    await page.evaluate(() => {
+      const state = window as typeof window & {
+        __oldPeekStarted?: boolean
+        __oldPeekSignal?: AbortSignal
+        __finishOldPeek?: (response: Response) => void
+      }
+      const fetchOriginal = window.fetch.bind(window)
+      let intercepted = false
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        if (!intercepted && url.endsWith('/roster/peek')) {
+          intercepted = true
+          state.__oldPeekStarted = true
+          state.__oldPeekSignal = init?.signal ?? undefined
+          return new Promise<Response>(resolve => {
+            state.__finishOldPeek = resolve
+          })
+        }
+        return fetchOriginal(input, init)
+      }
+    })
+
+    await page.getByTestId('lobby-sign-in').click()
+    await page.getByTestId('lobby-create').click()
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    expect(writes).toBe(2)
+
+    await page.clock.fastForward(15_100)
+    await page.waitForFunction(() =>
+      (window as typeof window & { __oldPeekStarted?: boolean }).__oldPeekStarted)
+    expect(newReads).toBe(0)
+
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    expect(await page.evaluate(() =>
+      (window as typeof window & { __oldPeekSignal?: AbortSignal })
+        .__oldPeekSignal?.aborted)).toBe(true)
+
+    // Deliver the OLD response despite the aborted signal: it must not
+    // restore freshness or change the cached roster revision while offline.
+    await page.evaluate(({ lateStatus, snapshot }) => {
+      const state = window as typeof window & {
+        __finishOldPeek?: (response: Response) => void
+      }
+      const headers = { 'Cache-Control': 'no-store', ETag: '"rev-1"' }
+      state.__finishOldPeek?.(lateStatus === 304
+        ? new Response(null, { status: 304, headers })
+        : new Response(JSON.stringify(snapshot), {
+          status: 200, headers: { ...headers, 'Content-Type': 'application/json' },
+        }))
+    }, { lateStatus, snapshot })
+    await page.clock.runFor(200)
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    await expect(page.getByTestId('lobby-revision')).toContainText('1')
+    expect(newReads).toBe(0)
+
+    // Only a NEW, verified member-only GET after reconnect can clear stale.
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await page.clock.fastForward(15_100)
+    await expect.poll(() => newReads).toBe(1)
+    await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-player')).toContainText(actor)
+    expect(writes).toBe(2) // no automatic session issuance or room mutations
+  })
+}
