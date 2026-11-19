@@ -3943,3 +3943,29 @@ session data, server URLs or unexpected bodies are printed, and no
 readiness or gameplay endpoint changes. This is still **not** a staging
 Kubernetes load-balancer or pod-identity attestation; parent #21 remains
 open.
+
+## Redis readiness cache and UTC rollback (#204)
+
+Outside Development, `RedisDeploymentReadiness` coalesces public readiness
+requests and caches its last validated Redis/Data Protection result for just
+three seconds. It performs real write/read/TTL checks with a shared two-second
+budget, but the *cache age* must not become unlimited when the host UTC clock
+is adjusted backward by NTP, an operator or VM clock synchronization.
+
+Each completed probe now records both `_lastCompletedProbeUtc` and
+`_nextProbeUtc`. Its result can be reused only when
+`lastCompletedProbeUtc <= now < nextProbeUtc`. A backward UTC jump below
+the recorded start invalidates the cache immediately and starts one new,
+coalesced authoritative check. A normal monotonic advance continues to use
+the three-second window without extra Redis writes. A failed fresh check
+remains cacheable for only its own three-second window, and a later healthy
+check can restore readiness.
+
+This intentionally avoids requiring a monotonic timestamp implementation
+from every injected `TimeProvider`; a clock rollback simply fails open
+*to a new probe*, never to a previously cached 200. The test uses the
+injected manual clock and actual Redis to reproduce the rollback while
+the guest-session cache is unavailable, asserting 503, concurrent
+coalescing, normal backoff and recovery. This change does not add an
+endpoint, authenticate a player, run any gameplay logic or guarantee a real
+multi-pod staging deployment; parent #21 remains open.
