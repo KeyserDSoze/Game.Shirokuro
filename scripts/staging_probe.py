@@ -79,13 +79,29 @@ def validate_response(path, status, headers, body, expected_ready):
                      if path == "/api/health" else {"status": expected_ready})
     if path not in ("/api/health", "/api/ready") or status != expected_status:
         raise ProbeError("Unexpected probe status")
-    directives = [part.strip().lower()
-                  for part in (headers.get("Cache-Control") or "").split(",")]
+    def single_header(name):
+        # HTTPMessage.get() reads only the *first* occurrence. An ingress
+        # that sends contradictory caching or MIME headers must never make
+        # a public HTTPS probe appear healthy. Real urllib responses expose
+        # get_all(); mapping-only unit callers have at most one value.
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            values = get_all(name)
+        else:
+            value = headers.get(name)
+            values = [] if value is None else [value]
+        if not values or len(values) != 1 or not isinstance(values[0], str):
+            raise ProbeError("Missing or ambiguous probe headers")
+        return values[0]
+
+    cache_control = single_header("Cache-Control")
+    content_type = single_header("Content-Type")
+    directives = [part.strip().lower() for part in cache_control.split(",")]
     if ("no-store" not in directives or
             headers.get("Set-Cookie") is not None or
             headers.get("Location") is not None or
             headers.get("Retry-After") is not None or
-            (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            content_type.split(";", 1)[0].strip().lower()
             != "application/json"):
         raise ProbeError("Unexpected probe headers")
     if len(body) > MAX_RESPONSE_BYTES:
