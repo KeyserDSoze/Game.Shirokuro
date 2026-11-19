@@ -177,3 +177,32 @@ All legacy fake-304 test fixtures now mirror the actual .NET headers;
 the production server is unchanged. An ETag is not a replacement for
 TLS or authenticated membership, and the real multi-pod ingress/WSS
 validation is still tracked by parent #21.
+
+## Reject contradictory cache policy on member-authorized roster 304 (#206)
+
+After the strict validator checks in #201, the browser still accepted
+`Cache-Control: no-store, public, max-age=60` because the first match
+for the `no-store` token was treated as sufficient. An ingress that
+adds cache-enabling directives to that same field must not be promoted
+to evidence of authorized roster freshness or recovery after Redis
+failover. The production .NET endpoint continues to issue only
+`Cache-Control: no-store`; no backend API or PvP observation changes.
+
+The client now requires **both** an exact strong ETag matching the
+sent `If-None-Match` *and* an unambiguous caching policy with exactly
+one `no-store` directive. Only optional `private`, `no-cache`, and
+`must-revalidate` tokens are accepted, ignoring harmless case and
+surrounding spaces. Duplicate/empty tokens or any other directive
+(`public`, `max-age`, `s-maxage`, `immutable`, `stale-*`,
+unknown extensions) reject the 304 as a transient protocol failure.
+
+The already displayed room remains `stale`, identity and membership
+are not fabricated or revoked, the 30/60/120s backoff and single
+outage-wake budget stay in force, and **no mutation is replayed**.
+A later verified 304 or valid current/newer 200 can restore freshness.
+Vitest checks negative and positive 304 variants; Playwright exercises
+`503 → matching-ETag but cacheable 304 → verified 304`, including
+a burst of focus hints and the 60-second retry floor. This client
+defense does not establish that the ingress is correctly configured,
+or that a response was truly member-authorized without server checks;
+real staging verification remains open in #21.
