@@ -3969,3 +3969,32 @@ the guest-session cache is unavailable, asserting 503, concurrent
 coalescing, normal backoff and recovery. This change does not add an
 endpoint, authenticate a player, run any gameplay logic or guarantee a real
 multi-pod staging deployment; parent #21 remains open.
+
+## Single-header Cache-Control contradictions (#205)
+
+The previous duplicate-header protection (#203) prevents conflicting separate
+`Cache-Control` fields from looking healthy. A reverse proxy can also combine
+contradictory policy directives in **one field**: e.g.
+`Cache-Control: no-store, public, max-age=60`. The staging smoke formerly
+searched for the `no-store` token and silently ignored the rest. This could
+certify the wrong edge caching contract, even though the server itself emits
+only `no-store`.
+
+Shared `scripts/staging_probe.py:validate_response()` now accepts exactly
+one required `no-store` directive together with only the optional,
+non-cache-enabling `private`, `no-cache`, or `must-revalidate` directives
+(case-insensitive, whitespace-normalized). An empty token, repeated directive,
+unknown extension, `public`, any `max-age`/`s-maxage`, `immutable`, or
+`stale-*` fails closed. This stricter whitelist follows the fixed public
+health/readiness contract; it does **not** change response headers emitted
+by ASP.NET Core or allow caching of any player-scoped API.
+
+This validation applies to both 200 healthy replies and legitimate 503
+unavailable replies (including externally initiated preStop); the single-node
+smoke and two-/three-node watcher share the same path. Tests include
+combinatorial Python contract cases and real certificate-validated HTTPS
+loopback socket responses with contradictory directives. An ambiguous
+ingress baseline is rejected **before** the watcher announces that the
+operator may initiate drain. No session token, invitation, upstream URL
+or exception text is logged. Actual Kubernetes ingress continuity and
+HA verification still require real staging under parent #21.
