@@ -183,9 +183,17 @@ export const guestLobbyApi = {
         // protocol failure (stale + bounded backoff), never a 401/404.
         const expected = tag['If-None-Match']
         const cacheControl = response.headers?.get('Cache-Control')
-        const noStore = cacheControl?.split(',').some(value =>
-          value.trim().toLowerCase() === 'no-store') ?? false
-        if (!expected || response.headers?.get('ETag') !== expected || !noStore)
+        const directives = cacheControl?.split(',').map(value =>
+          value.trim().toLowerCase()) ?? []
+        // A single field can still carry contradictory directives even
+        // when it contains no-store. Do not treat a cacheable edge 304 as
+        // proof of member-authorized freshness or Redis recovery. The .NET
+        // route emits no-store; only explicit reinforcing tokens are safe.
+        const allowed = ['no-store', 'private', 'no-cache', 'must-revalidate']
+        const verifiedCache = directives.includes('no-store') &&
+          directives.length === new Set(directives).size &&
+          directives.every(value => allowed.includes(value))
+        if (!expected || response.headers?.get('ETag') !== expected || !verifiedCache)
           throw new Error('Unverified roster 304')
         return null
       }
