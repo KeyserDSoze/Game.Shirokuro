@@ -206,3 +206,32 @@ a burst of focus hints and the 60-second retry floor. This client
 defense does not establish that the ingress is correctly configured,
 or that a response was truly member-authorized without server checks;
 real staging verification remains open in #21.
+
+## In-flight roster reads invalidated on browser offline (#207)
+
+The pre-match browser shows the last member-authorized roster during an
+outage but must label it **stale** until a *new* authorized read verifies
+freshness. Previously the `offline` event set the stale badge without
+cancelling an already in-flight passive `GET /roster/peek`. A late HTTP
+200/304, begun before the connectivity transition, could overwrite the
+badge with `current` even while offline. The server-issued response
+might be well formed but is not evidence of recovery **after** that
+transition.
+
+`LobbyPanel` now aborts the in-flight **passive** roster controller on
+the `offline` event and clears any trailing wake hint collected while
+that read was active. `guestLobbyApi.peek()` races the abort signal
+against fetch/body parsing, so even a transport ignoring its abort
+signal cannot commit the late response to React state. Explicit
+player actions, including mutations, are not aborted by the
+connectivity listener. Polling remains suspended while offline; the
+next online/focus hint can schedule a new read subject to the existing
+15-second floor and bounded 30/60/120-second outage backoff. Only a
+**fresh** authorized 200/304 removes the stale badge.
+
+Playwright exercises both late 200 and late strong-ETag 304 with an
+abort-ignoring intercepted fetch, a real browser `offline` event,
+the aborted signal, a fresh 304 after `online`, and zero automatic
+POST/PATCH/DELETE replays. This is read-only pre-match state: the
+browser cannot revoke a guest, infer match secrets, or certify actual
+staging network conditions. Those requirements remain tracked by #21.
