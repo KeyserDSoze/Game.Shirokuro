@@ -149,11 +149,44 @@ describe('guest lobby client boundaries', () => {
   })
 
   it.each([
+    'no-store',
+    'private, no-store',
+    'NO-STORE, PRIVATE',
+    ' no-store , no-cache, must-revalidate ',
+  ])('accepts strongly validated 304 with compatible no-store policy (%s)',
+    async policy => {
+      const json = vi.fn(() => { throw new Error('304 must not parse JSON') })
+      const mocked = vi.fn().mockResolvedValue({
+        ok: false, status: 304, json,
+        headers: new Headers({
+          ETag: '"rev-7"',
+          'Cache-Control': policy,
+        }),
+      })
+      vi.stubGlobal('fetch', mocked)
+      await expect(guestLobbyApi.peek(roomCode, 7)).resolves.toBeNull()
+      expect(json).not.toHaveBeenCalled()
+      expect(mocked).toHaveBeenCalledOnce()
+      expect((mocked.mock.calls[0][1] as RequestInit).method).toBe('GET')
+    })
+
+  it.each([
     ['no ETag', {}, 7],
     ['wrong revision', { ETag: '"rev-6"', 'Cache-Control': 'no-store' }, 7],
     ['weak validator', { ETag: 'W/"rev-7"', 'Cache-Control': 'no-store' }, 7],
     ['extra ETag tokens', { ETag: '"rev-7", "rev-8"', 'Cache-Control': 'no-store' }, 7],
     ['cacheable', { ETag: '"rev-7"', 'Cache-Control': 'max-age=60' }, 7],
+    ['mixed public', { ETag: '"rev-7"', 'Cache-Control': 'no-store, public' }, 7],
+    ['mixed max-age', { ETag: '"rev-7"', 'Cache-Control': 'private, no-store, max-age=60' }, 7],
+    ['mixed s-maxage', { ETag: '"rev-7"', 'Cache-Control': 'no-store, s-maxage=60' }, 7],
+    ['mixed immutable', { ETag: '"rev-7"', 'Cache-Control': 'no-store, immutable' }, 7],
+    ['mixed stale-if-error', { ETag: '"rev-7"', 'Cache-Control': 'no-store, stale-if-error=15' }, 7],
+    ['unknown extension', { ETag: '"rev-7"', 'Cache-Control': 'no-store, x-cacheable' }, 7],
+    ['duplicate no-store', { ETag: '"rev-7"', 'Cache-Control': 'no-store, no-store' }, 7],
+    ['duplicate private', { ETag: '"rev-7"', 'Cache-Control': 'private, no-store, PRIVATE' }, 7],
+    ['trailing comma', { ETag: '"rev-7"', 'Cache-Control': 'no-store,' }, 7],
+    ['double comma', { ETag: '"rev-7"', 'Cache-Control': 'no-store,, private' }, 7],
+    ['unparameterized no-store', { ETag: '"rev-7"', 'Cache-Control': 'no-store=0' }, 7],
     ['no-store substring', { ETag: '"rev-7"', 'Cache-Control': 'x-no-store' }, 7],
     ['missing cache policy', { ETag: '"rev-7"' }, 7],
     ['no request validator', { ETag: '"rev-7"', 'Cache-Control': 'no-store' }, undefined],
