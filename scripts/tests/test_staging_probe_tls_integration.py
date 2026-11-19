@@ -40,6 +40,7 @@ class PublicProbeHandler(BaseHTTPRequestHandler):
             else:
                 mode = server.mode
             bad_cache = server.bad_cache
+            extra_headers = server.extra_headers
 
         if self.path not in ("/api/health", "/api/ready"):
             status, payload = 404, b'{"status":"missing"}'
@@ -56,6 +57,9 @@ class PublicProbeHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "max-age=30" if bad_cache else "no-store")
+        for name, value in extra_headers:
+            # Simulate a real edge/proxy adding a second conflicting field.
+            self.send_header(name, value)
         if status == 302:
             # This test must never issue a network request to that location.
             self.send_header("Location", "https://redirect-not-allowed.invalid/")
@@ -78,6 +82,7 @@ class LocalTlsNode:
         self.server.ready_reads = 0
         self.server.request_count = 0
         self.server.bad_cache = False
+        self.server.extra_headers = ()
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -94,6 +99,7 @@ class LocalTlsNode:
             self.server.ready_reads = 0
             self.server.request_count = 0
             self.server.bad_cache = False
+            self.server.extra_headers = ()
 
     def close(self):
         self.server.shutdown()
@@ -195,6 +201,40 @@ class RealStagingHttpsTests(unittest.TestCase):
         node.server.bad_cache = True
         with self.assertRaises(probe.ProbeError):
             probe.probe_one(opener, node.origin, "/api/ready", 2, "ready")
+
+    def test_actual_https_duplicate_cache_or_content_type_is_rejected(self):
+        node = self.nodes[0]
+        opener = self.trusted_opener()
+        for name, extra in (
+                ("Cache-Control", "public, max-age=300"),
+                ("Cache-Control", "no-store"),
+                ("Content-Type", "text/html"),
+                ("Content-Type", "application/json")):
+            with self.subTest(name=name, extra=extra):
+                node.reset()
+                node.server.extra_headers = ((name, extra),)
+                with self.assertRaises(probe.ProbeError):
+                    probe.run_checks([node.origin], "ready", 1, 0, 2,
+                                     opener=opener)
+                # The initial health GET is already untrustworthy; never
+                # advance to readiness or claim a healthy edge.
+                self.assertEqual(1, node.server.request_count)
+
+    def test_three_way_drain_rejects_ambiguous_ingress_baseline(self):
+        drained, survivor = self.nodes
+        edge = self.edge
+        edge.server.extra_headers = (("Cache-Control", "public, max-age=300"),)
+        notices = []
+        with self.assertRaises(probe.ProbeError):
+            drain.watch_drain(drained.origin, 2, 2, .25, 2,
+                              opener=self.trusted_opener(), sleep=lambda _: None,
+                              notify=notices.append,
+                              survivor_origin=survivor.origin,
+                              edge_origin=edge.origin)
+        self.assertEqual([], notices)
+        self.assertEqual(2, drained.server.request_count)
+        self.assertEqual(2, survivor.server.request_count)
+        self.assertEqual(1, edge.server.request_count)
 
     def test_paired_watcher_real_tls_surviving_node_remains_ready(self):
         drained, survivor = self.nodes
