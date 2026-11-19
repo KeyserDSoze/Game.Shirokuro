@@ -203,6 +203,57 @@ class StagingProbeTests(unittest.TestCase):
                 "Content-Type": "application/json",
             }, payload, "ready")
 
+    def test_no_store_cannot_mask_cacheable_directives_in_one_header(self):
+        # A single HTTP field (not duplicate fields from #203) may still
+        # contradict itself. No response status makes that safe.
+        forbidden = (
+            "no-store, public",
+            "public, no-store",
+            "no-store, max-age=300",
+            "no-store, s-maxage=60",
+            "no-store, immutable",
+            "no-store, stale-while-revalidate=30",
+            "no-store, stale-if-error=60",
+            "no-store, x-cacheable",
+            "no-store,",
+            ",no-store",
+            "no-store,,private",
+            "no-store, no-store",
+            "no-store, private, PRIVATE",
+            "private",
+            "no-store=0",
+        )
+        for policy in forbidden:
+            for path, status, body, expected in (
+                    ("/api/ready", 200, b'{"status":"ready"}', "ready"),
+                    ("/api/ready", 503, b'{"status":"unavailable"}',
+                     "unavailable"),
+                    ("/api/health", 200,
+                     b'{"status":"ok","application":"Shirokuro"}', "ready")):
+                with self.subTest(policy=policy, status=status, path=path):
+                    header = headers(Cache_Control=policy,
+                                     Content_Type="application/json")
+                    with self.assertRaises(probe.ProbeError):
+                        probe.validate_response(
+                            path, status, header, body, expected)
+
+    def test_safe_no_store_directive_combinations_remain_accepted(self):
+        safe = (
+            "no-store",
+            "private, no-store",
+            "NO-STORE, PRIVATE",
+            " no-store , no-cache , must-revalidate ",
+        )
+        for policy in safe:
+            with self.subTest(policy=policy):
+                header = headers(Cache_Control=policy,
+                                 Content_Type="application/json")
+                probe.validate_response("/api/ready", 200, header,
+                                        b'{"status":"ready"}', "ready")
+                probe.validate_response("/api/ready", 503, header,
+                                        b'{"status":"unavailable"}',
+                                        "unavailable")
+
     def test_bounded_gets_and_expected_drain(self):
         for mode in ("ready", "unavailable"):
             with self.subTest(mode=mode):
