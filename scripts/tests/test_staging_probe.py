@@ -170,6 +170,39 @@ class StagingProbeTests(unittest.TestCase):
                 probe.validate_response("/api/ready", 200, header,
                                         b'{"status":"ready"}', "ready")
 
+    def test_rejects_duplicate_security_headers_even_if_first_looks_valid(self):
+        # email.message.Message (as used by urllib HTTPMessage) preserves
+        # repeated fields but .get() returns only the FIRST occurrence.
+        for name, extra in (
+                ("cache-control", "public, max-age=300"),
+                ("CACHE-CONTROL", "no-store"),
+                ("content-type", "text/html"),
+                ("CONTENT-TYPE", "application/json")):
+            with self.subTest(header=name, extra=extra):
+                header = VALID_HEADERS()
+                self.assertEqual("no-store", header.get("Cache-Control"))
+                self.assertEqual("application/json; charset=utf-8",
+                                 header.get("Content-Type"))
+                header.add_header(name, extra)
+                self.assertEqual(2, len(header.get_all(name)))
+                with self.assertRaises(probe.ProbeError):
+                    probe.validate_response("/api/ready", 200, header,
+                                            b'{"status":"ready"}', "ready")
+
+    def test_mapping_only_headers_still_validate_exact_public_contract(self):
+        # A lightweight caller without HTTPMessage.get_all has one value
+        # per name; do not weaken the normal validation of single fields.
+        payload = b'{"status":"ready"}'
+        probe.validate_response("/api/ready", 200, {
+            "Cache-Control": "private, no-store",
+            "Content-Type": "application/json; charset=utf-8",
+        }, payload, "ready")
+        with self.assertRaises(probe.ProbeError):
+            probe.validate_response("/api/ready", 200, {
+                "Cache-Control": "public, max-age=300",
+                "Content-Type": "application/json",
+            }, payload, "ready")
+
     def test_bounded_gets_and_expected_drain(self):
         for mode in ("ready", "unavailable"):
             with self.subTest(mode=mode):
