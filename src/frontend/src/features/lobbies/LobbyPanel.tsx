@@ -11,7 +11,7 @@ import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
   classifyRosterPollFailure, isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
   rosterCanHonorResumeHint, rosterCanAdvanceOnWake,
-  rosterResumeDelayMs, nextRosterSyncStatus,
+  rosterResumeDelayMs, nextRosterSyncStatus, roomMutationOutcomeIsUncertain,
   type RosterSyncStatus,
 } from './rosterSync'
 import { sessionRecheckDelayMs } from './sessionRecheck'
@@ -434,8 +434,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       // rejections retain their original handling (409 refresh below).
       if (roomMutationMayHaveCommitted && conflictRoomId &&
           currentRoomRef.current?.lobbyId === conflictRoomId &&
-          !(error instanceof LobbyInputError) &&
-          (!(error instanceof LobbyHttpError) || error.status >= 500))
+          roomMutationOutcomeIsUncertain(error))
         setRosterSyncStatus('stale')
       if (error instanceof LobbyHttpError) {
         if (error.status === 401) {
