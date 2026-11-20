@@ -385,3 +385,43 @@ hero and team PATCH replies over an abort-ignoring transport, offline
 stale persistence, correct roster revision, no extra POST/PATCH, and
 recovery via deliberate member-only GET. This does not infer new PvP
 rules or modify the backend.
+
+## Offline guest session hints and connectivity-era identity fencing (#212)
+
+Cross-tab `BroadcastChannel('shirokuro:guest-session-changed')`,
+window focus and visibility changes are **hints**, not authenticated
+identity or permission to issue unbounded Redis-backed
+`GET /api/sessions/me` requests. The browser already coalesced bursts
+and enforced a 2-second monotonic minimum start interval (#122), but
+these checks continued **while offline** and a result initiated before
+disconnection could return afterwards with 401, `kind: other`, or a
+different guest ID. That could revoke or replace an existing verified
+guest/room from evidence belonging to the previous connectivity era.
+
+The session recheck effect now tracks a local offline flag and
+monotonically incremented connectivity epoch. Offline cancels a queued
+cooldown timer, retains a single pending verification, and suppresses
+all new `/sessions/me` rechecks even under an untrusted focus/
+cross-tab hint storm. The current in-flight request is not assumed
+cancelled: when it finishes, **both successful identities and 401
+errors** are ignored if offline occurred since its start. The
+existing generation guard still prevents a different guest/operation
+from acquiring stale room state.
+
+An `online` event releases exactly one coalesced recheck, subject
+to the original 2-second start-to-start minimum and existing single
+in-flight transport. This fresh, authenticated `/sessions/me` is
+allowed to recognize a legitimately revoked cookie (401), a newly
+issued guest, or a non-guest session. An unavailable service/503
+still neither logs out nor silently renews guests. No ticket, roster,
+invite, cookie or player ID travels over `BroadcastChannel` and
+nothing is automatically posted or patched.
+
+Playwright verifies three possible late pre-offline replies (401,
+different guest 200, other-kind 200), a burst of 50 cross-tab and
+focus hints while offline, zero extra server checks during outage,
+one check after online, preserved room/guest while stale, and a
+subsequent truly fresh authoritative 401. The roster poll abort,
+outage backoff and explicit player mutations remain separate.
+Server-side Redis authority remains the source of truth; no change
+to gameplay or staging acceptance under parent #21.
