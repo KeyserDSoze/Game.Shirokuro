@@ -612,3 +612,138 @@ for (const lateStatus of [200, 304] as const) {
     expect(writes).toBe(2) // no automatic session issuance or room mutations
   })
 }
+
+for (const readKind of ['manual', 'conflict'] as const) {
+  for (const lateStatus of [200, 401, 404] as const) {
+    test(`ignores pre-offline explicit roster ${readKind} GET late HTTP ${lateStatus}`, async ({ page }) => {
+      test.setTimeout(65_000)
+      // Freeze passive polling so only the member-initiated GET or the 409
+      // recovery GET is under test. The transport intentionally ignores
+      // AbortSignal, just as a slow/misbehaving edge may do.
+      await page.clock.install()
+      const code = 'room-' + 'e'.repeat(32)
+      const actor = 'guest-' + 'e'.repeat(32)
+      const initial = {
+        lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+        participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+      }
+      const next = { ...initial, revision: 2 }
+      let signedIn = false
+      let writes = 0
+      let conflictWrites = 0
+      let freshReads = 0
+
+      await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+        ? { status: 200, json: { kind: 'guest', playerId: actor } }
+        : { status: 401 }))
+      await page.route('**/api/sessions/guest', route => {
+        if (route.request().method() !== 'POST') return route.continue()
+        signedIn = true
+        writes++
+        return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+      })
+      await page.route('**/api/lobbies', route => {
+        if (route.request().method() !== 'POST') return route.continue()
+        writes++
+        return route.fulfill({ status: 201, json: initial })
+      })
+      await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
+        route.fulfill({
+          status: 304,
+          headers: {
+            ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+            'Cache-Control': 'no-store',
+          },
+        }))
+      await page.route('**/api/lobbies/' + code + '/roster', route => {
+        freshReads++
+        return route.fulfill({ status: 200, json: next })
+      })
+      await page.route('**/api/lobbies/' + code + '/team', route => {
+        conflictWrites++
+        return route.fulfill({
+          status: 409,
+          headers: { 'Cache-Control': 'no-store' },
+        })
+      })
+
+      await page.goto('/')
+      // Hold only the FIRST explicit member roster GET in a JS Promise.
+      // Unlike normal fetch, it can resolve after an offline transition.
+      await page.evaluate(() => {
+        const state = window as typeof window & {
+          __oldExplicitReadStarted?: boolean
+          __finishOldExplicitRead?: (response: Response) => void
+        }
+        const original = window.fetch.bind(window)
+        let intercepted = false
+        window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === 'string' ? input
+            : input instanceof Request ? input.url : String(input)
+          if (!intercepted && url.includes('/api/lobbies/') && url.endsWith('/roster')) {
+            intercepted = true
+            state.__oldExplicitReadStarted = true
+            return new Promise<Response>(resolve => {
+              state.__finishOldExplicitRead = resolve
+            })
+          }
+          return original(input, init)
+        }
+      })
+
+      await page.getByTestId('lobby-sign-in').click()
+      await page.getByTestId('lobby-create').click()
+      await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+      await expect(page.getByTestId('lobby-revision')).toContainText('1')
+      await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+
+      if (readKind === 'manual')
+        await page.getByTestId('lobby-refresh').click()
+      else
+        await page.getByTestId('lobby-change-team').click()
+      await page.waitForFunction(() =>
+        (window as typeof window & {
+          __oldExplicitReadStarted?: boolean
+        }).__oldExplicitReadStarted === true)
+
+      await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+      await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+
+      // Deliver a previously requested 200 or even 401/404 *after*
+      // offline. It must not replace the room or revoke the known guest.
+      await page.evaluate(({ lateStatus, next }) => {
+        const state = window as typeof window & {
+          __finishOldExplicitRead?: (response: Response) => void
+        }
+        const response = lateStatus === 200
+          ? new Response(JSON.stringify(next), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          })
+          : new Response(null, { status: lateStatus })
+        state.__finishOldExplicitRead?.(response)
+      }, { lateStatus, next })
+      await expect(page.getByTestId(
+        readKind === 'manual' ? 'lobby-refresh' : 'lobby-change-team',
+      )).toBeEnabled()
+      await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+      await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+      await expect(page.getByTestId('lobby-revision')).toContainText('1')
+      await expect(page.getByTestId('lobby-player')).toContainText(actor)
+      expect(freshReads).toBe(0)
+      expect(writes).toBe(2)
+      expect(conflictWrites).toBe(readKind === 'conflict' ? 1 : 0)
+
+      // Only a *new* verified GET, initiated after reconnect, may bring
+      // the room to revision 2 and remove the stale warning.
+      await page.evaluate(() => window.dispatchEvent(new Event('online')))
+      await page.getByTestId('lobby-refresh').click()
+      await expect(page.getByTestId('lobby-revision')).toContainText('2')
+      await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+      await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+      await expect(page.getByTestId('lobby-player')).toContainText(actor)
+      expect(freshReads).toBe(1)
+      expect(writes).toBe(2)
+      expect(conflictWrites).toBe(readKind === 'conflict' ? 1 : 0)
+    })
+  }
+}
