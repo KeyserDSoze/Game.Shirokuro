@@ -5,7 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { getHeroById } from '@/features/heroes/catalog'
 import {
   guestLobbyApi, LobbyHttpError, LobbyInputError, parseInviteCode, parseTeamIds,
-  type GuestSession, type LobbyRoster,
+  type GuestSession, type CurrentSession, type LobbyRoster,
 } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, classifyConflictRosterRefresh,
@@ -46,6 +46,15 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   // connection, including explicit refresh and 409 read-only recovery.
   // This never aborts a player PATCH/DELETE or changes guest authority.
   const rosterConnectivityEpochRef = useRef(0)
+  // Both mount/bootstrap and focus/cross-tab recheck use one authoritative
+  // GET per connectivity epoch, including React StrictMode effect remounts.
+  const sessionConnectivityEpochRef = useRef(0)
+  const activeSessionReadRef = useRef<{
+    epoch: number
+    promise: Promise<CurrentSession>
+  } | null>(null)
+  const lastSessionReadStartedAtRef = useRef<number | null>(null)
+  const pendingSessionHintRef = useRef(false)
   const roomId = room?.lobbyId
   const actorId = session?.playerId
 
@@ -67,6 +76,33 @@ export default function LobbyPanel({ previewHeroId }: Props) {
 
   const notifySessionChange = () => {
     sessionChannelRef.current?.postMessage('recheck')
+  }
+
+  // Deduplicate the *network operation*, not the browser's authority
+  // decisions. Each caller retains its own generation and offline guards.
+  // An older request crossing offline may still be physically in flight;
+  // it cannot be reused by a fresh online check in a different epoch.
+  const readCurrentSession = (): Promise<CurrentSession> => {
+    const epoch = sessionConnectivityEpochRef.current
+    const pending = activeSessionReadRef.current
+    if (pending?.epoch === epoch) return pending.promise
+    const promise = guestLobbyApi.session()
+    const entry = { epoch, promise }
+    activeSessionReadRef.current = entry
+    lastSessionReadStartedAtRef.current = performance.now()
+    // Always observe rejection, even if the effect that started the first
+    // request was disposed by React StrictMode before it settled.
+    void promise.then(
+      () => {
+        if (activeSessionReadRef.current === entry)
+          activeSessionReadRef.current = null
+      },
+      () => {
+        if (activeSessionReadRef.current === entry)
+          activeSessionReadRef.current = null
+      },
+    )
+    return promise
   }
 
   // Invalidate the old room *before* React updates its rendered state.
@@ -100,6 +136,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let connectionEpoch = 0
     const onOffline = () => {
       connectionEpoch++
+      sessionConnectivityEpochRef.current++
       // One global event boundary, even before a room exists. A create or
       // join POST can complete successfully after connectivity changed.
       // The passive roster effect only marks an existing room stale;
@@ -110,7 +147,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     // An initial GET may arrive after an explicit login, revocation or
     // browser disconnect: none may adopt an obsolete guest identity.
     if (!offlineAtStart) {
-      void guestLobbyApi.session()
+      void readCurrentSession()
         .then(identity => {
           if (active && connectionEpoch === 0 && navigator.onLine &&
               generation === sessionGenerationRef.current &&
@@ -135,7 +172,6 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let inFlight = false
     let pendingRecheck = false
     let cooldownTimer: number | undefined
-    let lastStartedAt: number | null = null
     // Browser connectivity hints are not session authority. Rechecks
     // started before an offline boundary cannot authorize a late 401 or
     // adoption of a different guest after that boundary.
@@ -148,19 +184,23 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // Coalesce all offline focus/cross-tab hints into a single read
         // when connectivity returns. Never spend Redis lookups offline.
         pendingRecheck = true
+        pendingSessionHintRef.current = true
         return
       }
       if (inFlight) {
         // Never lose a logout/login which happens during an outstanding GET,
         // but coalesce an arbitrary number of hints into one trailing check.
         pendingRecheck = true
+        pendingSessionHintRef.current = true
         return
       }
-      const delay = sessionRecheckDelayMs(lastStartedAt, performance.now())
+      const delay = sessionRecheckDelayMs(
+        lastSessionReadStartedAtRef.current, performance.now())
       if (delay > 0) {
         // Fast responses must not permit unlimited Redis-backed rechecks.
         // Keep the first deadline fixed even if more focus/BC hints arrive.
         pendingRecheck = true
+        pendingSessionHintRef.current = true
         if (cooldownTimer === undefined) {
           cooldownTimer = window.setTimeout(() => {
             cooldownTimer = undefined
@@ -175,11 +215,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         cooldownTimer = undefined
       }
       pendingRecheck = false
+      pendingSessionHintRef.current = false
       inFlight = true
-      lastStartedAt = performance.now()
       const generation = sessionGenerationRef.current
       const readEpoch = connectivityEpoch
-      void guestLobbyApi.session()
+      void readCurrentSession()
         .then(identity => {
           if (!active || generation !== sessionGenerationRef.current ||
               offline || readEpoch !== connectivityEpoch) return
@@ -231,6 +271,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       offline = true
       connectivityEpoch++
       pendingRecheck = true
+      pendingSessionHintRef.current = true
       // A pending cooldown is no longer a useful deadline while offline.
       // Recompute it from the last real GET when online, never spin timers.
       if (cooldownTimer !== undefined) {
@@ -254,6 +295,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     window.addEventListener('online', onOnline)
     document.addEventListener('visibilitychange', onVisible)
     channel?.addEventListener('message', onMessage)
+    // Session identity changes reinstall the effect. A focus/cross-tab hint
+    // queued while bootstrap adopted the guest must not disappear with the
+    // old effect's timer: retain exactly one bounded trailing verification.
+    if (pendingSessionHintRef.current) recheck()
     return () => {
       active = false
       window.clearTimeout(cooldownTimer)
