@@ -425,3 +425,42 @@ subsequent truly fresh authoritative 401. The roster poll abort,
 outage backoff and explicit player mutations remain separate.
 Server-side Redis authority remains the source of truth; no change
 to gameplay or staging acceptance under parent #21.
+
+## Initial guest bootstrap is not valid across offline transitions (#213)
+
+The initial `GET /api/sessions/me` that `LobbyPanel` starts when
+mounting the page is independent of the focus/visibility/cross-tab
+session recheck effect. The latter already suppresses offline GETs
+and ignores delayed identities (#212); the **initial bootstrap** did
+neither. In particular, a valid guest 200 begun before an `offline`
+event could arrive after disconnection and be newly adopted without
+any post-disconnect session authority confirmation.
+
+The one-time bootstrap now checks the browser connectivity flag **before
+dispatch**, and installs its own local, monotonically incrementing
+offline epoch while the bootstrap is outstanding. On receipt, a guest
+is adopted only if the component is still active, the session generation
+is unchanged, no offline boundary occurred after the request began,
+the browser currently reports online, and the reply passes the existing
+strict session-envelope validation. A late response after offline
+is ignored even if the browser emitted `online` again in the meantime.
+Neither old 401 nor transport failures can invent a guest identity.
+
+When the page loads offline, the bootstrap does not send a request at
+all. On a later `online` event, the already existing session recheck
+effect performs the server-authorized read with the original two-second
+start cooldown and coalescing; only that **new** 200 guest may restore
+an existing ticket, and a fresh 401 leaves the page anonymous.
+This preserves the existing generation guards for explicit login and
+cross-tab guest switches. No guest issuance POST, room creation,
+roster/guest invitation adoption, or match rule is triggered by
+connectivity events.
+
+Playwright holds an initial 200 over a simulated offline transition
+with an abort-ignoring transport, then tests reconnect with a fresh
+200 for a *different* guest and with a fresh 401. A third browser test
+starts with `navigator.onLine=false`, confirms no initial or
+focus-triggered `/sessions/me` requests, then verifies exactly one
+new GET on online and no guest POST. This is a client display safeguard;
+Redis session validity remains the authoritative server-side check.
+
