@@ -351,3 +351,37 @@ member-authorized 200 after reconnect restores the newest revision.
 Only the explicitly requested PATCH, if any, is sent. Real deployment
 and cookie revocation remain server-owned and tracked in #21.
 
+## Successful pre-offline mutations do not restore roster freshness (#211)
+
+The existing connectivity epoch (#210) fences explicit roster **GETs**
+that were started before an `offline` transition. A separate race
+remained for a confirmed **PATCH hero/team** on an already verified
+pre-match room: the player's request may have been sent while online
+and resolve with a valid, member-authorized 200 **after** the browser
+became offline. `showRoom()` accepted the new server revision and
+unconditionally set the roster status to `current`, clearing the
+offline warning even though the server had not been queried on the
+new connectivity epoch.
+
+The `runRoomMutation()` path now captures the same local connectivity
+epoch at the beginning of each explicit room mutation. After a
+successful action, and only for the same signed-in operation and room,
+it checks whether `offline` occurred during the operation. In that
+case the fully verified successful roster **is retained** (the
+command really succeeded and must not be replayed), but the freshness
+status is set back to `stale`. This is not a failed mutation or a
+revocation: the player sees the updated selection/revision, the guest
+and invitation remain valid, and the success message is preserved.
+An on-time 200 without an intervening offline transition remains
+`current`. A successful DELETE 204 has already cleared the room,
+so the stale policy cannot resurrect a departed room.
+
+Neither the mutation nor the server request is aborted, retried, or
+converted into a new GET. Existing uncertain-commit handling (#209)
+and 409 recovery (#208/#210) are unaffected. Only a subsequent
+**new, authorized and validated roster read** can prove freshness
+after reconnect. Two Playwright regressions cover late successful
+hero and team PATCH replies over an abort-ignoring transport, offline
+stale persistence, correct roster revision, no extra POST/PATCH, and
+recovery via deliberate member-only GET. This does not infer new PvP
+rules or modify the backend.
