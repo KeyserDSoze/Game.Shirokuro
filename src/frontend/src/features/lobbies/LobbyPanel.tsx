@@ -424,6 +424,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     // revision conflict only their authorized roster can be re-read.
     const conflictRoomId = room?.lobbyId
     const conflictPlayerId = session?.playerId
+    const startedAtConnectivityEpoch = rosterConnectivityEpochRef.current
     const isCurrent = () =>
       generation === sessionGenerationRef.current &&
       operation === operationRef.current
@@ -431,6 +432,16 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     setMessage('')
     try {
       await action(isCurrent)
+      // A valid PATCH response may arrive after a browser offline event.
+      // It confirms the player's change and can update the verified room,
+      // but it cannot certify the roster as current after connectivity was
+      // lost. showRoom() has already applied the response in that case;
+      // restore the stale label without cancelling/replaying the mutation.
+      // Successful DELETE has cleared currentRoomRef and is unaffected.
+      if (roomMutationMayHaveCommitted && isCurrent() &&
+          conflictRoomId && currentRoomRef.current?.lobbyId === conflictRoomId &&
+          startedAtConnectivityEpoch !== rosterConnectivityEpochRef.current)
+        setRosterSyncStatus('stale')
     } catch (error) {
       // An old 401 must not sign out a newer guest. Neither delayed errors
       // nor successful responses may change state after any identity switch.
