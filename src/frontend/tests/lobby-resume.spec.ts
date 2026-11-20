@@ -872,3 +872,146 @@ for (const action of ['hero', 'team'] as const) {
     expect(creates).toBe(1)
   })
 }
+
+for (const oldResult of ['401', 'different-guest', 'other-kind'] as const) {
+  test(`ignores a pre-offline guest session recheck (${oldResult}) and verifies fresh 401 after reconnect`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const roomId = 'room-' + 'f'.repeat(32)
+    const playerId = 'guest-' + 'f'.repeat(32)
+    const otherGuest = 'guest-' + 'd'.repeat(32)
+    const room = {
+      lobbyId: roomId, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId, teamId: 'white', heroId: null }],
+    }
+    let signedIn = false
+    let currentStatus: 200 | 401 = 200
+    let serverChecks = 0
+    let guestPosts = 0
+    let roomCreates = 0
+    await page.route('**/api/sessions/me', route => {
+      serverChecks++
+      if (!signedIn || currentStatus === 401)
+        return route.fulfill({ status: 401, headers: { 'Cache-Control': 'no-store' } })
+      return route.fulfill({ status: 200,
+        json: { kind: 'guest', playerId } })
+    })
+    await page.route('**/api/sessions/guest', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      signedIn = true
+      guestPosts++
+      return route.fulfill({ status: 200, json: { kind: 'guest', playerId } })
+    })
+    await page.route('**/api/lobbies', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      roomCreates++
+      return route.fulfill({ status: 201, json: room })
+    })
+    await page.route('**/api/lobbies/' + roomId + '/roster/peek', route =>
+      route.fulfill({ status: 304,
+        headers: {
+          ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+          'Cache-Control': 'no-store',
+        },
+      }))
+
+    await page.goto('/')
+    await page.getByTestId('lobby-sign-in').click()
+    await page.getByTestId('lobby-create').click()
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+    const baselineChecks = serverChecks
+    expect(guestPosts).toBe(1)
+    expect(roomCreates).toBe(1)
+
+    // Hold only the next session GET; its fetch disregards AbortSignal and
+    // returns an authoritative-looking stale 401 or changed identity.
+    await page.evaluate(() => {
+      const state = window as typeof window & {
+        __oldSessionStarted?: boolean
+        __releaseOldSession?: (response: Response) => void
+      }
+      const original = window.fetch.bind(window)
+      let intercepted = false
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        if (!intercepted && url.endsWith('/api/sessions/me')) {
+          intercepted = true
+          state.__oldSessionStarted = true
+          return new Promise<Response>(resolve => {
+            state.__releaseOldSession = resolve
+          })
+        }
+        return original(input, init)
+      }
+    })
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await page.waitForFunction(() => (window as typeof window & {
+      __oldSessionStarted?: boolean
+    }).__oldSessionStarted === true)
+    expect(serverChecks).toBe(baselineChecks)
+
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    // Offline hint storms cannot spend Redis lookups or queue 50 GETs.
+    await page.evaluate(() => {
+      const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+      for (let i = 0; i < 50; i++) {
+        window.dispatchEvent(new Event('focus'))
+        channel.postMessage('recheck')
+      }
+      channel.close()
+    })
+    await page.clock.fastForward(8_000)
+    expect(serverChecks).toBe(baselineChecks)
+
+    await page.evaluate(({ oldResult, otherGuest }) => {
+      const state = window as typeof window & {
+        __releaseOldSession?: (response: Response) => void
+      }
+      let response: Response
+      if (oldResult === '401') {
+        response = new Response(null, {
+          status: 401, headers: { 'Cache-Control': 'no-store' },
+        })
+      } else {
+        response = new Response(JSON.stringify(oldResult === 'different-guest'
+          ? { kind: 'guest', playerId: otherGuest }
+          : { kind: 'other', playerId: 'external-authenticated-user' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      }
+      state.__releaseOldSession?.(response)
+    }, { oldResult, otherGuest })
+    await page.clock.runFor(100)
+    await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+    await expect(page.getByTestId('lobby-revision')).toContainText('1')
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    expect(serverChecks).toBe(baselineChecks)
+
+    // All offline cross-tab/focus hints are coalesced: just one new
+    // server-authorized /me on online, not one per hint.
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await page.clock.runFor(100)
+    await expect.poll(() => serverChecks).toBe(baselineChecks + 1)
+    await expect(page.getByTestId('lobby-player')).toContainText(playerId)
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    expect(guestPosts).toBe(1)
+    expect(roomCreates).toBe(1)
+
+    // A fresh 401 started after reconnection IS authoritative and revokes
+    // the existing guest, unlike its pre-disconnect predecessor.
+    currentStatus = 401
+    await page.clock.fastForward(2_100)
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+    await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+    expect(serverChecks).toBe(baselineChecks + 2)
+    expect(guestPosts).toBe(1)
+    expect(roomCreates).toBe(1)
+  })
+}
