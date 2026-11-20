@@ -1293,3 +1293,108 @@ for (const admission of ['create', 'join'] as const) {
     expect(unexpectedRoomPosts).toBe(0)
   })
 }
+
+for (const followUp of ['same-guest', 'rotated-guest', 'bootstrap-401'] as const) {
+  test(`coalesces bootstrap, StrictMode and concurrent focus/BroadcastChannel session hints (${followUp})`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const firstGuest = 'guest-' + 'a'.repeat(32)
+    const nextGuest = 'guest-' + 'b'.repeat(32)
+    let actualReads = 0
+    let issuedGuests = 0
+    // The first mount /me request is deliberately never resolved by the
+    // transport until after a focus+cross-tab burst and >2s have elapsed.
+    // Counting *all* fetch calls catches duplicates from StrictMode remount.
+    await page.addInitScript(() => {
+      const state = window as typeof window & {
+        __sessionFetchCount?: number
+        __initialSessionHeld?: boolean
+        __releaseInitialSession?: (response: Response) => void
+      }
+      state.__sessionFetchCount = 0
+      const fetchOriginal = window.fetch.bind(window)
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        if (url.endsWith('/api/sessions/me')) {
+          state.__sessionFetchCount = (state.__sessionFetchCount ?? 0) + 1
+          if (state.__sessionFetchCount === 1) {
+            state.__initialSessionHeld = true
+            return new Promise<Response>(resolve => {
+              state.__releaseInitialSession = resolve
+            })
+          }
+        }
+        return fetchOriginal(input, init)
+      }
+    })
+    await page.route('**/api/sessions/me', route => {
+      actualReads++
+      return route.fulfill({
+        status: 200,
+        json: {
+          kind: 'guest',
+          playerId: followUp === 'same-guest' ? firstGuest : nextGuest,
+        },
+      })
+    })
+    await page.route('**/api/sessions/guest', route => {
+      issuedGuests++
+      return route.fulfill({ status: 503 })
+    })
+
+    await page.goto('/')
+    await page.waitForFunction(() => (window as typeof window & {
+      __initialSessionHeld?: boolean
+    }).__initialSessionHeld === true)
+    await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+    await page.evaluate(() => {
+      const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+      for (let i = 0; i < 50; i++) {
+        window.dispatchEvent(new Event('focus'))
+        channel.postMessage('recheck')
+      }
+      channel.close()
+    })
+    await page.clock.fastForward(2_500)
+    // Neither the second StrictMode setup nor any hint can launch another
+    // Redis-backed GET before the pending mount request has finished.
+    expect(actualReads).toBe(0)
+    expect(await page.evaluate(() => (window as typeof window & {
+      __sessionFetchCount?: number
+    }).__sessionFetchCount)).toBe(1)
+    await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+
+    await page.evaluate(({ followUp, firstGuest }) => {
+      const state = window as typeof window & {
+        __releaseInitialSession?: (response: Response) => void
+      }
+      state.__releaseInitialSession?.(followUp === 'bootstrap-401'
+        ? new Response(null, {
+          status: 401, headers: { 'Cache-Control': 'no-store' },
+        })
+        : new Response(JSON.stringify({ kind: 'guest', playerId: firstGuest }), {
+          status: 200, headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+          },
+        }))
+    }, { followUp, firstGuest })
+
+    // A burst contained a real pending recheck hint. Do not consume it
+    // merely by attaching a second observer to the old bootstrap result:
+    // issue exactly ONE fresh GET, after the same 2s start cooldown.
+    await expect.poll(() => actualReads).toBe(1)
+    await expect(page.getByTestId('lobby-player')).toContainText(
+      followUp === 'same-guest' ? firstGuest : nextGuest,
+    )
+    if (followUp !== 'same-guest')
+      await expect(page.getByTestId('lobby-player')).not.toContainText(firstGuest)
+    await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+    expect(await page.evaluate(() => (window as typeof window & {
+      __sessionFetchCount?: number
+    }).__sessionFetchCount)).toBe(2)
+    expect(actualReads).toBe(1)
+    expect(issuedGuests).toBe(0)
+  })
+}
