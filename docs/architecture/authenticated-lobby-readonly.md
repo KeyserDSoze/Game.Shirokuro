@@ -504,3 +504,50 @@ retained member/room/revision, stale warning, no additional POST or
 guest issuance, and a later member GET as the sole recovery path.
 The game remains pre-match and PvP rules are not inferred.
 
+## Single-flight session authority for mount and focus hints (#215)
+
+On initial page mount, two independent consumers previously called
+`GET /api/sessions/me`: the bootstrap effect (#213) and the
+focus/visibility/cross-tab recheck effect (#122/#212). A browser can
+fire `focus` during navigation and React StrictMode intentionally
+re-runs mount effects, so more than one Redis-authority check could be
+in flight for the same tab/guest. Previously the recheck's 2-second
+start-to-start cooldown did **not** include the separate bootstrap.
+A same-tab duplicate is unnecessary and puts extra load on the
+shared session authority in a multi-user deployment.
+
+The panel now shares `readCurrentSession()` between both consumers.
+It retains a single in-flight promise **per connectivity epoch**, plus
+the last actual network start timestamp. If the initial request is
+still pending, subsequent StrictMode setups join the same promise
+rather than issuing new HTTP GETs. Recheck hints that arrive during
+that bootstrap are compressed into a **single trailing verification**;
+they cannot treat another listener of the initial response as a fresh
+read. The trailing check starts only *after* the earlier request
+settles, subject to the pre-existing 2,000-ms minimum interval.
+The pending hint survives the recheck effect being reinstalled after
+a newly verified guest identity is adopted. This keeps the ability
+to detect a cross-tab logout or guest rotation that happened after
+the initial request was sent.
+
+The previous authority fences remain separate per consumer:
+bootstrap keeps its startup generation and offline check; rechecks
+validate both their generation and connectivity epoch before acting on
+a verified 200, 401 or non-guest identity. An `offline` event advances
+the request deduplication epoch, so an old fetch pending on an
+abort-ignoring transport can **never** be reused as a new authorized
+online check. The existing room connectivity epoch, passive roster
+poll aborts, user mutations, signed session cookies and Redis-based
+server authorization remain unchanged. No identity, invitation,
+roster or cookie is sent through BroadcastChannel.
+
+Three Playwright regressions hold the first GET while 50 focus and
+50 cross-tab hints arrive (including React StrictMode effect remounts),
+then complete it with a guest 200 or 401. Before completion there
+must be exactly one browser fetch and **zero** extra Redis-backed
+GETs. Afterwards exactly one fresh GET may preserve the guest,
+adopt a newly verified different guest, or recover a guest after an
+initial 401, without automatically issuing a new guest session POST.
+The existing #212/#213 browser tests continue to verify offline,
+late identity, and post-reconnect revocation semantics.
+
