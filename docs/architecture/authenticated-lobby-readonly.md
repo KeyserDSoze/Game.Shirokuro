@@ -311,3 +311,43 @@ authorized room loss. Tests assert only the original explicit mutations
 are dispatched, not automatic retries, and no new session identities
 are fabricated. No new rules, PvP match observation or backend API are
 introduced. True failover/staging verification remains under #21.
+
+## Explicit roster reads invalidated across offline transitions (#210)
+
+After the passive reader was fenced on browser `offline` in #207, two
+member-authorized **explicit** read paths could still consume a response
+that started **before** loss of connectivity: the player's Refresh button
+and the one read-only GET after a revision conflict 409. Both may have
+returned 200 after an `offline` event already marked the last verified
+roster `stale`, incorrectly clearing that warning with old evidence.
+A delayed explicit 401/404 could also alter guest or room state without
+a post-transition verification.
+
+`LobbyPanel` now increments a local
+`rosterConnectivityEpochRef` on every `offline` transition of the
+currently displayed room. A manual `GET /roster` or 409 read-only
+recovery captures that epoch **when the read begins**; before applying
+either a validated 200 or a thrown HTTP status, it rechecks both the
+existing guest/operation guards and the epoch. If offline intervened,
+the old result is ignored: the known member-only room and guest
+remain visible but `stale`, and only a subsequently started, fully
+verified HTTP request may restore `current` or authorize 401/404.
+This is a rejection of old *read evidence*, not a claim that an offline
+signal proves revocation or that all HTTP responses are untrustworthy.
+
+The operation is deliberately **not aborted**: explicit actions retain
+their 15-second timeout and server-side authority, and a partially
+committed PATCH/DELETE is never cancelled or replayed by the client.
+The existing passive poll AbortController, 15-second floor, wake budget
+and 30/60/120-second outage backoff are unchanged. This epoch is only
+an in-process browser validity guard; it carries no session, cookie,
+room invitation or player ID and does not attempt to synchronize
+clients across tabs.
+
+Playwright uses an abort-ignoring first roster fetch and six scenarios
+(Refresh and 409 conflict recovery, each with late 200/401/404). The
+old result cannot refresh or revoke a room after `offline`; a new
+member-authorized 200 after reconnect restores the newest revision.
+Only the explicitly requested PATCH, if any, is sent. Real deployment
+and cookie revocation remain server-owned and tracked in #21.
+
