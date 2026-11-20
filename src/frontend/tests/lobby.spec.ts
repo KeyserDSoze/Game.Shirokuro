@@ -1704,3 +1704,121 @@ test('hung passive roster GET times out without revoking guest or retrying immed
   expect(sessionPosts).toBe(1)
   expect(lobbyPosts).toBe(1)
 })
+
+test('manual roster verification failures and 409 conflicts keep the room stale until verified recovery', async ({ page }) => {
+  test.setTimeout(65_000)
+  // Test transport-only guest fixtures: no real shared-IP session quota and
+  // no untrusted player IDs supplied to lobby mutation requests.
+  const code = 'room-' + '7'.repeat(32)
+  const actor = 'guest-' + '7'.repeat(32)
+  const initial = {
+    lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+  }
+  let signedIn = false
+  let readMode: 'ok' | 'unavailable' | 'limited' | 'offline' | 'invalid' = 'ok'
+  let revision = 1
+  let reads = 0
+  let writes = 0
+  let conflictWrites = 0
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { kind: 'guest', playerId: actor } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    signedIn = true
+    writes++
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    writes++
+    return route.fulfill({ status: 201, json: initial })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
+    route.fulfill({
+      status: 304, headers: { ETag: '"rev-1"', 'Cache-Control': 'no-store' },
+    }))
+  await page.route('**/api/lobbies/' + code + '/roster', route => {
+    reads++
+    if (readMode === 'offline') return route.abort('failed')
+    if (readMode === 'unavailable') return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+    })
+    if (readMode === 'limited') return route.fulfill({
+      status: 429, headers: { 'Cache-Control': 'no-store' },
+    })
+    const latest = { ...initial, revision }
+    if (readMode === 'invalid') return route.fulfill({
+      status: 200, json: { ...latest, secretRoute: 'must-not-import' },
+    })
+    return route.fulfill({ status: 200, json: latest })
+  })
+  await page.route('**/api/lobbies/' + code + '/team', route => {
+    conflictWrites++
+    return route.fulfill({
+      status: 409, headers: { 'Cache-Control': 'no-store' },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  const verifiedView = await page.getByTestId('lobby-roster').textContent()
+  expect(writes).toBe(2)
+
+  // An explicit member GET is not proof of freshness until its response is
+  // verified. No 503/429/network error or forged 200 may keep "current".
+  for (const failure of ['unavailable', 'limited', 'offline', 'invalid'] as const) {
+    readMode = failure
+    await page.getByTestId('lobby-refresh').click()
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-revision')).toContainText('1')
+    await expect(page.getByTestId('lobby-roster')).toHaveText(verifiedView!)
+    await expect(page.getByTestId('lobby-player')).toContainText(actor)
+    await expect(page.getByTestId('lobby-copy-invite')).toBeEnabled()
+    expect(writes).toBe(2)
+  }
+  expect(reads).toBe(4)
+
+  readMode = 'ok'
+  revision = 2
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('Roster aggiornato')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+
+  // A 409 proves the submitted revision is no longer applicable. If the
+  // one permitted read-only follow-up is unavailable, the badge MUST stay
+  // stale; do not replay PATCH or revoke the signed guest/room.
+  readMode = 'unavailable'
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('aggiorna il roster')
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  expect(conflictWrites).toBe(1)
+  expect(writes).toBe(2)
+
+  // A malformed follow-up 200 cannot resolve the conflict either.
+  readMode = 'invalid'
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-message')).toContainText('aggiorna il roster')
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  expect(conflictWrites).toBe(2)
+
+  // Only a separate player-initiated, valid authorized refresh can restore
+  // freshness. The same PATCH cannot silently retry after 409.
+  readMode = 'ok'
+  revision = 3
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('3')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(reads).toBe(8)
+  expect(conflictWrites).toBe(2)
+  expect(writes).toBe(2) // only initial sign-in and create
+})
