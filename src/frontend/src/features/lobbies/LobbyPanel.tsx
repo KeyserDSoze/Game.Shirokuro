@@ -172,6 +172,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let inFlight = false
     let pendingRecheck = false
     let cooldownTimer: number | undefined
+    let waitingForBootstrap: Promise<CurrentSession> | null = null
     // Browser connectivity hints are not session authority. Rechecks
     // started before an offline boundary cannot authorize a late 401 or
     // adoption of a different guest after that boundary.
@@ -192,6 +193,30 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         // but coalesce an arbitrary number of hints into one trailing check.
         pendingRecheck = true
         pendingSessionHintRef.current = true
+        return
+      }
+      const bootstrap = activeSessionReadRef.current
+      if (bootstrap?.epoch === sessionConnectivityEpochRef.current) {
+        // A mount-level /me is already in flight. Don't start another
+        // request (or count the same old result as a trailing verification).
+        // Keep one hint and perform a NEW read after bootstrap settles,
+        // respecting the original 2s start-to-start cooldown.
+        pendingRecheck = true
+        pendingSessionHintRef.current = true
+        if (waitingForBootstrap !== bootstrap.promise) {
+          waitingForBootstrap = bootstrap.promise
+          const expectedGeneration = sessionGenerationRef.current
+          void bootstrap.promise.then(
+            () => {},
+            () => {},
+          ).then(() => {
+            if (!active) return
+            waitingForBootstrap = null
+            // A successful startup identity can reinstall this effect.
+            // Its new instance will honor pendingSessionHintRef.
+            if (expectedGeneration === sessionGenerationRef.current) recheck()
+          })
+        }
         return
       }
       const delay = sessionRecheckDelayMs(
