@@ -1828,3 +1828,158 @@ test('manual roster verification failures and 409 conflicts keep the room stale 
   expect(conflictWrites).toBe(2)
   expect(writes).toBe(2) // only initial sign-in and create
 })
+
+test('uncertain hero/team/leave commits require a new verified roster, not optimistic freshness', async ({ page }) => {
+  test.setTimeout(65_000)
+  // Do not let passive reads mask the freshness of explicit operations.
+  // Other Playwright cases cover 15s polls and bounded retry.
+  await page.clock.install()
+  const code = 'room-' + '8'.repeat(32)
+  const actor = 'guest-' + '8'.repeat(32)
+  let signedIn = false
+  let serverRevision = 1
+  let serverHero: string | null = null
+  let serverTeam = 'white'
+  let serverLeft = false
+  let creates = 0
+  let guestPosts = 0
+  let rosterReads = 0
+  let heroWrites = 0
+  let teamWrites = 0
+  let leaveWrites = 0
+  let teamResult: 'denied-400' | 'denied-403' | 'denied-429' | 'committed-503' =
+    'denied-400'
+  const issuedRevisions: number[] = []
+  const roster = () => ({
+    lobbyId: code, revision: serverRevision, teamIds: ['white', 'black'],
+    participants: [{ playerId: actor, teamId: serverTeam, heroId: serverHero }],
+  })
+
+  await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+    ? { status: 200, json: { playerId: actor, kind: 'guest' } }
+    : { status: 401 }))
+  await page.route('**/api/sessions/guest', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    guestPosts++
+    signedIn = true
+    return route.fulfill({ status: 200, json: { playerId: actor, kind: 'guest' } })
+  })
+  await page.route('**/api/lobbies', route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    creates++
+    return route.fulfill({ status: 201, json: roster() })
+  })
+  await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
+    route.fulfill({
+      status: 304, headers: {
+        ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+        'Cache-Control': 'no-store',
+      },
+    }))
+  await page.route('**/api/lobbies/' + code + '/roster', route => {
+    rosterReads++
+    return route.fulfill(serverLeft
+      ? { status: 404, headers: { 'Cache-Control': 'no-store' } }
+      : { status: 200, json: roster() })
+  })
+  await page.route('**/api/lobbies/' + code + '/hero', route => {
+    heroWrites++
+    const body = route.request().postDataJSON() as {
+      heroId: string; expectedRevision: number
+    }
+    issuedRevisions.push(body.expectedRevision)
+    // The server committed revision 2 but a corrupt proxy returned a
+    // syntactically valid 200 containing a forbidden private DTO field.
+    serverHero = body.heroId
+    serverRevision++
+    return route.fulfill({ status: 200, json: {
+      ...roster(), privateRoute: 'not-for-client',
+    } })
+  })
+  await page.route('**/api/lobbies/' + code + '/team', route => {
+    teamWrites++
+    const body = route.request().postDataJSON() as {
+      teamId: string; expectedRevision: number
+    }
+    issuedRevisions.push(body.expectedRevision)
+    if (teamResult !== 'committed-503') return route.fulfill({
+      status: teamResult === 'denied-400' ? 400
+        : teamResult === 'denied-403' ? 403 : 429,
+      headers: { 'Cache-Control': 'no-store' },
+    })
+    // A 503 does not prove the atomic PATCH was rolled back.
+    serverRevision++
+    serverTeam = body.teamId
+    return route.fulfill({
+      status: 503, headers: { 'Cache-Control': 'no-store' },
+    })
+  })
+  await page.route('**/api/lobbies/' + code + '/membership', route => {
+    leaveWrites++
+    const body = route.request().postDataJSON() as { expectedRevision: number }
+    issuedRevisions.push(body.expectedRevision)
+    // DELETE committed, but the HTTP connection failed before 204.
+    serverLeft = true
+    return route.abort('failed')
+  })
+
+  await page.goto('/')
+  await page.getByTestId('lobby-sign-in').click()
+  await page.getByTestId('lobby-create').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  expect(guestPosts).toBe(1)
+  expect(creates).toBe(1)
+
+  await page.getByTestId('lobby-pick-hero').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-revision')).toContainText('1')
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(heroWrites).toBe(1)
+  // Only the explicit, authenticated next GET may acknowledge the commit.
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+
+  await page.getByTestId('lobby-new-team').selectOption('black')
+  // Explicitly refused 4xx operations cannot have committed; do not
+  // manufacture a stale badge for an ordinary denied command.
+  for (const response of ['denied-400', 'denied-403', 'denied-429'] as const) {
+    teamResult = response
+    await page.getByTestId('lobby-change-team').click()
+    await expect(page.getByTestId('lobby-change-team')).toBeEnabled()
+    await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  }
+  teamResult = 'committed-503'
+  await page.getByTestId('lobby-change-team').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-revision')).toContainText('2')
+  expect(teamWrites).toBe(4)
+  expect(heroWrites).toBe(1)
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-revision')).toContainText('3')
+  await expect(page.getByTestId('lobby-roster')).toContainText('black')
+
+  await page.getByTestId('lobby-leave').click()
+  await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+  await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+  await expect(page.getByTestId('lobby-revision')).toContainText('3')
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(leaveWrites).toBe(1)
+  // Only a subsequent authoritative member GET 404 can clear a room
+  // after an unacknowledged DELETE. It must not revoke the guest.
+  await page.getByTestId('lobby-refresh').click()
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-invite-input')).toHaveValue('')
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  expect(rosterReads).toBe(3)
+  expect(issuedRevisions).toEqual([1, 2, 2, 2, 2, 3])
+  expect(guestPosts).toBe(1)
+  expect(creates).toBe(1)
+  expect(heroWrites).toBe(1)
+  expect(teamWrites).toBe(4)
+  expect(leaveWrites).toBe(1) // never retry a potentially committed DELETE
+})
