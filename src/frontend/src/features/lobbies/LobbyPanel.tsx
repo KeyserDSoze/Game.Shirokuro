@@ -115,9 +115,20 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     let pendingRecheck = false
     let cooldownTimer: number | undefined
     let lastStartedAt: number | null = null
+    // Browser connectivity hints are not session authority. Rechecks
+    // started before an offline boundary cannot authorize a late 401 or
+    // adoption of a different guest after that boundary.
+    let offline = !navigator.onLine
+    let connectivityEpoch = 0
 
     const recheck = () => {
       if (!active) return
+      if (offline || !navigator.onLine) {
+        // Coalesce all offline focus/cross-tab hints into a single read
+        // when connectivity returns. Never spend Redis lookups offline.
+        pendingRecheck = true
+        return
+      }
       if (inFlight) {
         // Never lose a logout/login which happens during an outstanding GET,
         // but coalesce an arbitrary number of hints into one trailing check.
@@ -146,9 +157,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       inFlight = true
       lastStartedAt = performance.now()
       const generation = sessionGenerationRef.current
+      const readEpoch = connectivityEpoch
       void guestLobbyApi.session()
         .then(identity => {
-          if (!active || generation !== sessionGenerationRef.current) return
+          if (!active || generation !== sessionGenerationRef.current ||
+              offline || readEpoch !== connectivityEpoch) return
           if (!session) {
             if (identity.kind !== 'guest') return
             // Adopt only a newly server-verified signed guest. A stale read
@@ -172,7 +185,8 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           // Only a confirmed 401 revokes an existing guest. A signed-out tab
           // stays signed out, and 403/503/fetch failures never invent/logout
           // an identity based on an unavailable server.
-          if (active && session &&
+          if (active && session && !offline &&
+              readEpoch === connectivityEpoch &&
               generation === sessionGenerationRef.current &&
               error instanceof LobbyHttpError && error.status === 401) {
             forgetGuest()
@@ -191,6 +205,23 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     const onVisible = () => {
       if (!document.hidden) recheck()
     }
+    const onOffline = () => {
+      if (!active) return
+      offline = true
+      connectivityEpoch++
+      pendingRecheck = true
+      // A pending cooldown is no longer a useful deadline while offline.
+      // Recompute it from the last real GET when online, never spin timers.
+      if (cooldownTimer !== undefined) {
+        window.clearTimeout(cooldownTimer)
+        cooldownTimer = undefined
+      }
+    }
+    const onOnline = () => {
+      if (!active) return
+      offline = false
+      recheck()
+    }
     // Ignore every non-protocol payload. The channel is a hint, never an
     // identity authority or permission to consume unlimited Redis lookups.
     const onMessage = (event: MessageEvent) => {
@@ -198,12 +229,16 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
     const channel = sessionChannelRef.current
     window.addEventListener('focus', recheck)
+    window.addEventListener('offline', onOffline)
+    window.addEventListener('online', onOnline)
     document.addEventListener('visibilitychange', onVisible)
     channel?.addEventListener('message', onMessage)
     return () => {
       active = false
       window.clearTimeout(cooldownTimer)
       window.removeEventListener('focus', recheck)
+      window.removeEventListener('offline', onOffline)
+      window.removeEventListener('online', onOnline)
       document.removeEventListener('visibilitychange', onVisible)
       channel?.removeEventListener('message', onMessage)
     }
