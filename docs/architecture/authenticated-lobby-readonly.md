@@ -276,3 +276,38 @@ test freezes background timers to isolate explicit requests; separate
 browser tests exercise passive poll/backoff. The server remains
 authoritative and the remaining staging and anti-Sybil requirements
 belong to parent #21.
+
+## Uncertain existing-room mutations cannot certify current roster (#209)
+
+An optimistic pre-match `PATCH hero`, `PATCH team`, or
+`DELETE membership` may commit on the .NET server even when its response
+is lost (browser transport failure, 15-second timeout), a 5xx is returned
+by the ingress, or the returned HTTP 200 JSON fails strict roster
+validation. In those cases the old browser revision is not evidence of
+current membership/team/hero selection. It is unsafe to automatically
+**retry** a command whose server-side outcome is unknown: this could
+repeat the user's intent against a changed revision.
+
+Only these three existing-room commands now use
+`runRoomMutation()`. Its shared error handler retains the last
+member-authorized room, guest, invitation and revision, but marks the
+roster `stale` for failed network/timeout/5xx or invalid successful
+payloads. A separately authorized, strictly validated **manual GET**
+can restore `current` and reveal the actual latest revision; a
+confirmed room-only GET 404 can clear the room while keeping the guest.
+No failed mutation is automatically replayed.
+
+Definite HTTP 400/403/429 responses and client-side input rejections do
+**not** mark an otherwise verified roster stale by themselves. A 409
+continues the single authorized read-only conflict recovery introduced
+in #208; confirmed 401/404 preserve their existing guest/room revocation
+semantics. The shared pure
+`roomMutationOutcomeIsUncertain(error)` decision is covered by Vitest
+for explicit 4xx, 5xx, timeouts, network failures, and malformed success
+payloads. Playwright exercises a committed hero update with malformed
+200, a committed team change answered 503, a committed leave whose
+response is lost, rejected 400/403/429, verified read recovery and
+authorized room loss. Tests assert only the original explicit mutations
+are dispatched, not automatic retries, and no new session identities
+are fabricated. No new rules, PvP match observation or backend API are
+introduced. True failover/staging verification remains under #21.
