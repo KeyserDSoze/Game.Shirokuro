@@ -432,6 +432,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
           return
         }
         if (error.status === 409 && conflictRoomId && conflictPlayerId) {
+          // A revision conflict means the previously displayed roster is
+          // no longer verified for this mutation. Mark it stale *before*
+          // re-reading; only an authorized, validated refresh restores
+          // freshness. Failed recovery must not leave a false "current".
+          if (currentRoomRef.current?.lobbyId === conflictRoomId)
+            setRosterSyncStatus('stale')
           // Never replay a rejected mutation: read the new server revision
           // once, then require a separate explicit player confirmation.
           try {
@@ -705,10 +711,24 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   data-testid="lobby-refresh"
                   disabled={busy}
                   onClick={() => void run(async isCurrent => {
-                    const result = await guestLobbyApi.read(room.lobbyId)
-                    if (!isCurrent()) return
-                    showRoom(result, room.lobbyId)
-                    setMessage(t('lobbyRefreshed'))
+                    const refreshRoomId = room.lobbyId
+                    try {
+                      const result = await guestLobbyApi.read(refreshRoomId)
+                      if (!isCurrent()) return
+                      showRoom(result, refreshRoomId)
+                      setMessage(t('lobbyRefreshed'))
+                    } catch (error) {
+                      // A failed explicit GET (or malformed 200) cannot prove
+                      // that the old roster is current. Keep the last
+                      // verified view and invite but label them stale. A
+                      // confirmed 401/404 still follows the existing logout/
+                      // room-loss path in run(); never invent a revocation.
+                      if (isCurrent() && currentRoomRef.current?.lobbyId === refreshRoomId &&
+                          !(error instanceof LobbyHttpError &&
+                            (error.status === 401 || error.status === 404)))
+                        setRosterSyncStatus('stale')
+                      throw error
+                    }
                   })}
                 >
                   {t('lobbyRefresh')}
