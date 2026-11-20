@@ -1707,6 +1707,9 @@ test('hung passive roster GET times out without revoking guest or retrying immed
 
 test('manual roster verification failures and 409 conflicts keep the room stale until verified recovery', async ({ page }) => {
   test.setTimeout(65_000)
+  // Freeze passive polling so this case isolates explicit GET decisions even
+  // on a slow CI machine; periodic roster polling is covered elsewhere.
+  await page.clock.install()
   // Test transport-only guest fixtures: no real shared-IP session quota and
   // no untrusted player IDs supplied to lobby mutation requests.
   const code = 'room-' + '7'.repeat(32)
@@ -1737,7 +1740,10 @@ test('manual roster verification failures and 409 conflicts keep the room stale 
   })
   await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
     route.fulfill({
-      status: 304, headers: { ETag: '"rev-1"', 'Cache-Control': 'no-store' },
+      status: 304, headers: {
+        ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+        'Cache-Control': 'no-store',
+      },
     }))
   await page.route('**/api/lobbies/' + code + '/roster', route => {
     reads++
@@ -1805,9 +1811,9 @@ test('manual roster verification failures and 409 conflicts keep the room stale 
   // A malformed follow-up 200 cannot resolve the conflict either.
   readMode = 'invalid'
   await page.getByTestId('lobby-change-team').click()
+  await expect.poll(() => conflictWrites).toBe(2)
   await expect(page.getByTestId('lobby-message')).toContainText('aggiorna il roster')
   await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
-  expect(conflictWrites).toBe(2)
 
   // Only a separate player-initiated, valid authorized refresh can restore
   // freshness. The same PATCH cannot silently retry after 409.
