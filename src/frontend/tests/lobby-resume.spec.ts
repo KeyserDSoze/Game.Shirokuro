@@ -1024,6 +1024,10 @@ for (const freshResult of ['different-guest', '401'] as const) {
     const newGuest = 'guest-' + 'b'.repeat(32)
     let serverChecks = 0
     let guestPosts = 0
+    // Browser focus can trigger an independent /me recheck on navigation.
+    // Treat those early checks as anonymous until the deliberate online
+    // transition; do not let them adopt the *future* identity before it.
+    let onlineVerificationAllowed = false
     // The bootstrap /me starts before the browser disconnects, but the
     // transport keeps its old HTTP 200 until after offline. All subsequent
     // GETs use a fresh server-side answer, not this delayed old ticket.
@@ -1049,7 +1053,7 @@ for (const freshResult of ['different-guest', '401'] as const) {
     })
     await page.route('**/api/sessions/me', route => {
       serverChecks++
-      return route.fulfill(freshResult === '401'
+      return route.fulfill(!onlineVerificationAllowed || freshResult === '401'
         ? { status: 401, headers: { 'Cache-Control': 'no-store' } }
         : { status: 200, json: { kind: 'guest', playerId: newGuest } })
     })
@@ -1063,7 +1067,10 @@ for (const freshResult of ['different-guest', '401'] as const) {
       __initialGuestReadStarted?: boolean
     }).__initialGuestReadStarted === true)
     await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
-    expect(serverChecks).toBe(0)
+    // A navigation focus recheck may have independently received a 401.
+    // Establish its baseline, then assert no new GET across offline.
+    await page.clock.runFor(100)
+    const beforeOfflineChecks = serverChecks
 
     await page.evaluate(() => window.dispatchEvent(new Event('offline')))
     await page.evaluate(oldGuest => {
@@ -1084,11 +1091,16 @@ for (const freshResult of ['different-guest', '401'] as const) {
     await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
     await expect(page.getByTestId('lobby-player')).toHaveCount(0)
     await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
-    expect(serverChecks).toBe(0)
+    expect(serverChecks).toBe(beforeOfflineChecks)
     expect(guestPosts).toBe(0)
 
+    onlineVerificationAllowed = true
     await page.evaluate(() => window.dispatchEvent(new Event('online')))
-    await expect.poll(() => serverChecks).toBe(1)
+    // If a normal navigation focus already used the 2s server recheck
+    // budget, honor that start-to-start cooldown instead of treating it
+    // as a new request for every reconnect hint.
+    await page.clock.fastForward(2_100)
+    await expect.poll(() => serverChecks).toBe(beforeOfflineChecks + 1)
     if (freshResult === '401') {
       await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
       await expect(page.getByTestId('lobby-player')).toHaveCount(0)
@@ -1097,7 +1109,7 @@ for (const freshResult of ['different-guest', '401'] as const) {
       await expect(page.getByTestId('lobby-player')).not.toContainText(oldGuest)
       await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
     }
-    expect(serverChecks).toBe(1)
+    expect(serverChecks).toBe(beforeOfflineChecks + 1)
     expect(guestPosts).toBe(0)
   })
 }
