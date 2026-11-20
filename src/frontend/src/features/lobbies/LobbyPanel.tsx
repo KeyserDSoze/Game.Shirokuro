@@ -42,6 +42,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   const currentRoomRef = useRef<LobbyRoster | null>(null)
   // Only passive roster reads can be cancelled; explicit commands are never aborted.
   const passivePollAbortRef = useRef<AbortController | null>(null)
+  // Every offline transition invalidates roster GETs begun on the old
+  // connection, including explicit refresh and 409 read-only recovery.
+  // This never aborts a player PATCH/DELETE or changes guest authority.
+  const rosterConnectivityEpochRef = useRef(0)
   const roomId = room?.lobbyId
   const actorId = session?.playerId
 
@@ -261,6 +265,11 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       if (!document.hidden) resume()
     }
     const onOffline = () => {
+      if (!active || currentRoomRef.current?.lobbyId !== roomId) return
+      // Mark every read started before this transition as untrustworthy.
+      // In particular explicit GET /roster has its own 15s deadline and
+      // cannot be aborted like the passive poll or a player mutation.
+      rosterConnectivityEpochRef.current++
       // A GET started while online must not promote an old 200/304 to
       // authoritative freshness AFTER connectivity is lost. Abort the
       // passive read even when the transport ignores cancellation (peek
@@ -453,9 +462,16 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             setRosterSyncStatus('stale')
           // Never replay a rejected mutation: read the new server revision
           // once, then require a separate explicit player confirmation.
+          const readEpoch = rosterConnectivityEpochRef.current
           try {
             const latest = await guestLobbyApi.read(conflictRoomId)
             if (!isCurrent()) return
+            if (readEpoch !== rosterConnectivityEpochRef.current) {
+              // The response was begun before browser offline: it cannot
+              // prove recovery, member loss or a new room revision.
+              setMessage(t('lobbyConflict'))
+              return
+            }
             // The 409 is authoritative for the rejected *mutation*, not
             // proof that this member has left. A malformed 200 must never
             // be promoted into a false membership-loss signal (#115).
@@ -479,6 +495,12 @@ export default function LobbyPanel({ previewHeroId }: Props) {
             return
           } catch (refreshError) {
             if (!isCurrent()) return
+            if (readEpoch !== rosterConnectivityEpochRef.current) {
+              // Likewise a delayed 401/404 cannot authorize a new room or
+              // guest transition after an offline boundary.
+              setMessage(t('lobbyConflict'))
+              return
+            }
             if (refreshError instanceof LobbyHttpError) {
               if (refreshError.status === 401) {
                 forgetGuest()
@@ -729,12 +751,26 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   disabled={busy}
                   onClick={() => void run(async isCurrent => {
                     const refreshRoomId = room.lobbyId
+                    const readEpoch = rosterConnectivityEpochRef.current
                     try {
                       const result = await guestLobbyApi.read(refreshRoomId)
                       if (!isCurrent()) return
+                      if (readEpoch !== rosterConnectivityEpochRef.current) {
+                        // A GET begun before offline cannot clear the stale
+                        // badge, even if its late 200 is structurally valid.
+                        setMessage(t('lobbyUnavailable'))
+                        return
+                      }
                       showRoom(result, refreshRoomId)
                       setMessage(t('lobbyRefreshed'))
                     } catch (error) {
+                      if (!isCurrent()) return
+                      if (readEpoch !== rosterConnectivityEpochRef.current) {
+                        // Ignore old 401/404 too: no identity/room revocation
+                        // based on a pre-disconnect read result.
+                        setMessage(t('lobbyUnavailable'))
+                        return
+                      }
                       // A failed explicit GET (or malformed 200) cannot prove
                       // that the old roster is current. Keep the last
                       // verified view and invite but label them stale. A
