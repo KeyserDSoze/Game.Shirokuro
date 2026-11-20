@@ -235,3 +235,44 @@ the aborted signal, a fresh 304 after `online`, and zero automatic
 POST/PATCH/DELETE replays. This is read-only pre-match state: the
 browser cannot revoke a guest, infer match secrets, or certify actual
 staging network conditions. Those requirements remain tracked by #21.
+
+## Explicit roster refresh and unresolved 409 must remain stale (#208)
+
+A roster is `current` only after the client has accepted a member-authorized,
+fully validated HTTP response. Passive polling already marks the last
+verified roster `stale` on 503/429, transport errors or malformed 200
+replies. However the player's **explicit Refresh** button previously
+reported an error without changing that freshness badge, leaving a visible
+`current` roster despite failed verification. The same misleading state
+occurred when an explicit hero/team/leave mutation received revision
+conflict **409** and the one permitted read-only conflict refresh then
+failed.
+
+A failed manual `GET /roster` (temporary HTTP errors, network failure, or
+a 200 that fails the strict room/revision/member/hero/team DTO validator)
+now preserves the last known room, player and invitation but marks its
+roster `stale`. The generic `run()` error path still handles confirmed
+401 guest revocation and 404 member-only room loss as before; an error
+must not fabricate either state transition. A subsequent explicit,
+fully validated current/newer 200 returns the badge to `current`.
+No passive poll can race a user operation, and failures never trigger
+automatic retries of POST/PATCH/DELETE.
+
+For 409 on an existing room, the roster is marked `stale` **before**
+the server-authorized read-only refresh: a rejected optimistic revision
+means the client's command was not accepted. If the same-room refresh
+validates a current/newer roster with membership intact, `showRoom`
+restores `current`; otherwise stale remains with the last verified
+view, until another deliberate refresh or a valid passive observation.
+A proven 401, 404 or verified member loss still follows the existing
+room/guest clearing logic. This is exclusively the pre-match roster
+transport, not match/fog-of-war state.
+
+Playwright covers manual 503, 429, network abort and malformed DTO
+replies, valid recovery, 409 plus failing/unverifiable follow-up, and a
+separate valid recovery. It asserts the retained guest/room/revision,
+no repeated mutations, and correct stale/current transitions. The
+test freezes background timers to isolate explicit requests; separate
+browser tests exercise passive poll/backoff. The server remains
+authoritative and the remaining staging and anti-Sybil requirements
+belong to parent #21.
