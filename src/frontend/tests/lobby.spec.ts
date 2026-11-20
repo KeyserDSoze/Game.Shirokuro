@@ -668,9 +668,22 @@ test('cross-tab recheck signals are strict and burst-coalesced without guest iss
     channel.close()
   })
   await expect.poll(() => checks).toBe(1)
+  // Mount and focus share the same cooldown (#215), so the first burst
+  // can coalesce into this one delayed GET. Send a second burst *while*
+  // that GET is truly in flight to prove exactly one trailing read survives.
+  await page.evaluate(async () => {
+    const channel = new BroadcastChannel('shirokuro:guest-session-changed')
+    for (let i = 0; i < 50; i++) {
+      channel.postMessage('recheck')
+      window.dispatchEvent(new Event('focus'))
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+    channel.close()
+  })
+  expect(checks).toBe(1)
   release()
-  // Trailing read is delayed to the 2-second monotonic cooldown rather
-  // than issued immediately after the first quick /me response (#122).
+  // The second burst is observed after the held read settles, never as
+  // 50 concurrent GETs or an immediate retry within the 2s budget.
   await expect.poll(() => checks, { timeout: 6_000 }).toBe(2)
   await page.waitForTimeout(150)
   expect(checks).toBe(2)
@@ -747,17 +760,19 @@ test('session hints are rate-limited after fast responses, but later 401 revokes
     await new Promise(resolve => setTimeout(resolve, 150))
     channel.close()
   })
-  // One request now, and at most one delayed read for all 100 hints.
-  expect(checks).toBe(before + 1)
-  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 2)
+  // The initial /me bootstrap now counts toward the same 2s minimum
+  // as focus and BroadcastChannel (#215). The entire burst can therefore
+  // coalesce into ONE delayed read, rather than a read immediately plus
+  // another trailing read. Still require eventual verification.
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 1)
   await page.waitForTimeout(150)
-  expect(checks).toBe(before + 2)
+  expect(checks).toBe(before + 1)
 
   // Even a failed server verification is neither an implicit logout nor
   // permission for immediate repeated Redis lookups.
   status = 503
   await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 3)
+  await expect.poll(() => checks, { timeout: 6_000 }).toBe(before + 2)
   await expect(page.getByTestId('lobby-player')).toContainText(actor)
   await expect(page.getByTestId('lobby-room-code')).toHaveText(roomId)
   await expect(page.getByTestId('lobby-roster')).toHaveText(initialRoster!)
@@ -779,7 +794,7 @@ test('session hints are rate-limited after fast responses, but later 401 revokes
   // An obsolete private invitation must not remain visible after 401.
   await expect(page.getByTestId('lobby-invite-input')).toHaveCount(0)
   await expect(page.getByTestId('lobby-message')).toContainText('scaduta o revocata')
-  expect(checks).toBe(before + 4)
+  expect(checks).toBe(before + 3)
   expect(issuances).toBe(1)
   expect(creates).toBe(1)
 })
