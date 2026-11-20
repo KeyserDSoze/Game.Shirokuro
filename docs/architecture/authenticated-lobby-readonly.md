@@ -464,3 +464,43 @@ focus-triggered `/sessions/me` requests, then verifies exactly one
 new GET on online and no guest POST. This is a client display safeguard;
 Redis session validity remains the authoritative server-side check.
 
+## Late successful create/join cannot certify freshness across offline (#214)
+
+A pre-match room creation `POST /api/lobbies` or invitation join
+`POST /api/lobbies/{id}/join` can be dispatched **before** a browser
+`offline` transition but acknowledged by a member-authorized 201/200
+**after** it. These operations begin when the panel has no room, so the
+existing room-scoped passive roster `offline` handler (#207/#210)
+is not active. Previously `showRoom()` always set the new room to
+`current`, even when its membership and revision were confirmed before
+the browser had re-established connectivity.
+
+The initial session bootstrap effect is mounted for the entire panel
+lifetime and now advances the shared `rosterConnectivityEpochRef`
+on **every** `offline` event, with or without a room. The passive
+roster offline listener still aborts its own GET and marks its room
+stale but no longer increments the epoch a second time. Every explicit
+operation captures that epoch at dispatch. After a validated successful
+create/join, the panel adopts the authentic room, member roster,
+revision, invitation and the original success feedback, but keeps
+the roster `stale` when the epoch changed meanwhile; it does the
+same for successful existing-room hero/team PATCHes (#211). The
+epoch check also holds if a reconnect `online` event occurred
+before the 201/200 finished. The confirmed result is **not**
+discarded, cancelled or replayed: repeating create could consume a
+second quota slot and repeating join could conflict with an already
+committed membership. A successful leave still clears its room.
+
+Only a subsequent strictly validated, member-scoped GET started after
+reconnect can establish roster `current` again. No cross-tab
+identity, guest cookie, invite code or roster is broadcast. Existing
+401/404 and 409 paths, passive poll timings, Redis authority and
+server-side quotas remain unchanged.
+
+Two Playwright cases simulate an abort-ignoring transport for
+user-initiated create (delayed HTTP 201, offline then online before
+resolution) and join (delayed HTTP 200 while offline). They check
+retained member/room/revision, stale warning, no additional POST or
+guest issuance, and a later member GET as the sole recovery path.
+The game remains pre-match and PvP rules are not inferred.
+
