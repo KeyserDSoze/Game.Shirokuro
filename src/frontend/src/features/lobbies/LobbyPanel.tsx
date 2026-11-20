@@ -98,7 +98,14 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     // if the page was loaded offline; the regular online recheck resumes.
     const offlineAtStart = !navigator.onLine
     let connectionEpoch = 0
-    const onOffline = () => { connectionEpoch++ }
+    const onOffline = () => {
+      connectionEpoch++
+      // One global event boundary, even before a room exists. A create or
+      // join POST can complete successfully after connectivity changed.
+      // The passive roster effect only marks an existing room stale;
+      // never increment this shared epoch in both listeners.
+      rosterConnectivityEpochRef.current++
+    }
     window.addEventListener('offline', onOffline)
     // An initial GET may arrive after an explicit login, revocation or
     // browser disconnect: none may adopt an obsolete guest identity.
@@ -315,10 +322,9 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
     const onOffline = () => {
       if (!active || currentRoomRef.current?.lobbyId !== roomId) return
-      // Mark every read started before this transition as untrustworthy.
-      // In particular explicit GET /roster has its own 15s deadline and
-      // cannot be aborted like the passive poll or a player mutation.
-      rosterConnectivityEpochRef.current++
+      // The mount-level listener has already advanced the shared epoch,
+      // including when no room was mounted (create/join in flight). Do not
+      // increment it here a second time.
       // A GET started while online must not promote an old 200/304 to
       // authoritative freshness AFTER connectivity is lost. Abort the
       // passive read even when the transport ignores cancellation (peek
@@ -481,15 +487,17 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     setMessage('')
     try {
       await action(isCurrent)
-      // A valid PATCH response may arrive after a browser offline event.
-      // It confirms the player's change and can update the verified room,
-      // but it cannot certify the roster as current after connectivity was
-      // lost. showRoom() has already applied the response in that case;
-      // restore the stale label without cancelling/replaying the mutation.
-      // Successful DELETE has cleared currentRoomRef and is unaffected.
-      if (roomMutationMayHaveCommitted && isCurrent() &&
-          conflictRoomId && currentRoomRef.current?.lobbyId === conflictRoomId &&
-          startedAtConnectivityEpoch !== rosterConnectivityEpochRef.current)
+      // A successful create/join or PATCH may acknowledge an authorized
+      // roster after a browser offline transition. Keep its verified room,
+      // guest, revision and success feedback, but do not call it freshly
+      // synced across that transition. No POST/PATCH retries or aborts.
+      // Room DELETE has already cleared currentRoomRef and stays deleted.
+      // Guest issuance has no existing room and cannot satisfy the guard.
+      if (isCurrent() && currentRoomRef.current &&
+          startedAtConnectivityEpoch !== rosterConnectivityEpochRef.current &&
+          (roomMutationMayHaveCommitted
+            ? conflictRoomId === currentRoomRef.current.lobbyId
+            : !conflictRoomId && Boolean(conflictPlayerId)))
         setRosterSyncStatus('stale')
     } catch (error) {
       // An old 401 must not sign out a newer guest. Neither delayed errors
