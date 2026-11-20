@@ -1015,3 +1015,137 @@ for (const oldResult of ['401', 'different-guest', 'other-kind'] as const) {
     expect(roomCreates).toBe(1)
   })
 }
+
+for (const freshResult of ['different-guest', '401'] as const) {
+  test(`ignores a guest bootstrap 200 delivered after offline; reconnect ${freshResult} wins`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const oldGuest = 'guest-' + 'a'.repeat(32)
+    const newGuest = 'guest-' + 'b'.repeat(32)
+    let serverChecks = 0
+    let guestPosts = 0
+    // The bootstrap /me starts before the browser disconnects, but the
+    // transport keeps its old HTTP 200 until after offline. All subsequent
+    // GETs use a fresh server-side answer, not this delayed old ticket.
+    await page.addInitScript(() => {
+      const state = window as typeof window & {
+        __initialGuestReadStarted?: boolean
+        __releaseInitialGuestRead?: (response: Response) => void
+      }
+      const original = window.fetch.bind(window)
+      let intercepted = false
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        if (!intercepted && url.endsWith('/api/sessions/me')) {
+          intercepted = true
+          state.__initialGuestReadStarted = true
+          return new Promise<Response>(resolve => {
+            state.__releaseInitialGuestRead = resolve
+          })
+        }
+        return original(input, init)
+      }
+    })
+    await page.route('**/api/sessions/me', route => {
+      serverChecks++
+      return route.fulfill(freshResult === '401'
+        ? { status: 401, headers: { 'Cache-Control': 'no-store' } }
+        : { status: 200, json: { kind: 'guest', playerId: newGuest } })
+    })
+    await page.route('**/api/sessions/guest', route => {
+      guestPosts++
+      return route.fulfill({ status: 503 })
+    })
+
+    await page.goto('/')
+    await page.waitForFunction(() => (window as typeof window & {
+      __initialGuestReadStarted?: boolean
+    }).__initialGuestReadStarted === true)
+    await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+    expect(serverChecks).toBe(0)
+
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+    await page.evaluate(oldGuest => {
+      const state = window as typeof window & {
+        __releaseInitialGuestRead?: (response: Response) => void
+      }
+      state.__releaseInitialGuestRead?.(new Response(
+        JSON.stringify({ kind: 'guest', playerId: oldGuest }), {
+          status: 200, headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+          },
+        }))
+    }, oldGuest)
+    await page.clock.runFor(100)
+    // A verified guest from an old connection must NOT be newly adopted
+    // while offline. It cannot reveal any room controls or invitation.
+    await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+    await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+    expect(serverChecks).toBe(0)
+    expect(guestPosts).toBe(0)
+
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await expect.poll(() => serverChecks).toBe(1)
+    if (freshResult === '401') {
+      await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+      await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+    } else {
+      await expect(page.getByTestId('lobby-player')).toContainText(newGuest)
+      await expect(page.getByTestId('lobby-player')).not.toContainText(oldGuest)
+      await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+    }
+    expect(serverChecks).toBe(1)
+    expect(guestPosts).toBe(0)
+  })
+}
+
+test('loading an offline page skips initial guest bootstrap until online verification', async ({ page }) => {
+  test.setTimeout(65_000)
+  await page.clock.install()
+  const actor = 'guest-' + 'd'.repeat(32)
+  let checks = 0
+  let guestPosts = 0
+  // Keep network delivery available for Vite while simulating the browser
+  // navigator.onLine flag being false *before* the React mount effect runs.
+  await page.addInitScript(() => {
+    const state = window as typeof window & { __testOnline?: boolean }
+    state.__testOnline = false
+    Object.defineProperty(navigator, 'onLine', {
+      configurable: true,
+      get: () => state.__testOnline === true,
+    })
+  })
+  await page.route('**/api/sessions/me', route => {
+    checks++
+    return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+  })
+  await page.route('**/api/sessions/guest', route => {
+    guestPosts++
+    return route.fulfill({ status: 503 })
+  })
+
+  await page.goto('/')
+  await expect(page.getByTestId('lobby-sign-in')).toBeVisible()
+  await page.evaluate(() => {
+    for (let i = 0; i < 30; i++) window.dispatchEvent(new Event('focus'))
+  })
+  await page.clock.fastForward(10_000)
+  expect(checks).toBe(0)
+  expect(guestPosts).toBe(0)
+  await expect(page.getByTestId('lobby-player')).toHaveCount(0)
+
+  // The pre-existing session is only adopted via the fresh recheck, not
+  // via a deferred bootstrap request or an automatic guest POST.
+  await page.evaluate(() => {
+    (window as typeof window & { __testOnline?: boolean }).__testOnline = true
+    window.dispatchEvent(new Event('online'))
+  })
+  await expect.poll(() => checks).toBe(1)
+  await expect(page.getByTestId('lobby-player')).toContainText(actor)
+  await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+  expect(checks).toBe(1)
+  expect(guestPosts).toBe(0)
+})
