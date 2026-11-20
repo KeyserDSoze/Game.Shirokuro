@@ -1161,3 +1161,135 @@ test('loading an offline page skips initial guest bootstrap until online verific
   expect(checks).toBe(1)
   expect(guestPosts).toBe(0)
 })
+
+for (const admission of ['create', 'join'] as const) {
+  test(`retains a late successful room acquisition as stale (${admission})`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const code = 'room-' + '7'.repeat(32)
+    const actor = 'guest-' + '7'.repeat(32)
+    const owner = 'guest-' + '3'.repeat(32)
+    const roster = {
+      lobbyId: code, revision: admission === 'create' ? 1 : 2,
+      teamIds: ['white', 'black'],
+      participants: admission === 'create'
+        ? [{ playerId: actor, teamId: 'white', heroId: null }]
+        : [{ playerId: owner, teamId: 'white', heroId: null },
+          { playerId: actor, teamId: 'black', heroId: null }],
+    }
+    let signedIn = false
+    let guestPosts = 0
+    let unexpectedRoomPosts = 0
+    let memberReads = 0
+    await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+      ? { status: 200, json: { kind: 'guest', playerId: actor } }
+      : { status: 401 }))
+    await page.route('**/api/sessions/guest', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      signedIn = true
+      guestPosts++
+      return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+    })
+    await page.route('**/api/lobbies', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      unexpectedRoomPosts++
+      return route.fulfill({ status: 500 })
+    })
+    await page.route('**/api/lobbies/' + code + '/join', route => {
+      unexpectedRoomPosts++
+      return route.fulfill({ status: 500 })
+    })
+    await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
+      route.fulfill({ status: 304, headers: {
+        ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+        'Cache-Control': 'no-store',
+      } }))
+    await page.route('**/api/lobbies/' + code + '/roster', route => {
+      memberReads++
+      return route.fulfill({ status: 200, json: roster })
+    })
+
+    await page.goto('/')
+    await page.getByTestId('lobby-sign-in').click()
+    await expect(page.getByTestId('lobby-player')).toContainText(actor)
+    await expect(page.getByTestId('lobby-room-code')).toHaveCount(0)
+
+    // Hold the *one* player-issued POST until after a browser disconnect.
+    // The browser transport ignores AbortSignal even though the operation
+    // may have committed on the server. Never post again automatically.
+    await page.evaluate(({ admission, code }) => {
+      const state = window as typeof window & {
+        __roomAdmissionStarted?: boolean
+        __roomAdmissionCount?: number
+        __releaseRoomAdmission?: (roster: object, status: number) => void
+      }
+      const original = window.fetch.bind(window)
+      let intercepted = false
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        const target = admission === 'create'
+          ? url.endsWith('/api/lobbies')
+          : url.endsWith('/api/lobbies/' + code + '/join')
+        if (!intercepted && target && init?.method === 'POST') {
+          intercepted = true
+          state.__roomAdmissionStarted = true
+          state.__roomAdmissionCount = (state.__roomAdmissionCount ?? 0) + 1
+          return new Promise<Response>(resolve => {
+            state.__releaseRoomAdmission = (roster, status) =>
+              resolve(new Response(JSON.stringify(roster), { status,
+                headers: { 'Content-Type': 'application/json' } }))
+          })
+        }
+        return original(input, init)
+      }
+    }, { admission, code })
+
+    if (admission === 'create') {
+      await page.getByTestId('lobby-create').click()
+    } else {
+      await page.getByTestId('lobby-invite-input').fill(code)
+      await page.getByTestId('lobby-join').click()
+    }
+    await page.waitForFunction(() => (window as typeof window & {
+      __roomAdmissionStarted?: boolean
+    }).__roomAdmissionStarted === true)
+
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+    if (admission === 'create') {
+      // A later online hint does not erase the offline epoch of an
+      // in-flight create, even if the 201 arrives after reconnect.
+      await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    }
+    await page.evaluate(({ roster, admission }) => {
+      (window as typeof window & {
+        __releaseRoomAdmission?: (roster: object, status: number) => void
+      }).__releaseRoomAdmission?.(roster, admission === 'create' ? 201 : 200)
+    }, { roster, admission })
+
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-revision'))
+      .toContainText(String(roster.revision))
+    await expect(page.getByTestId('lobby-player')).toContainText(actor)
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    if (admission === 'join')
+      await expect(page.getByTestId('lobby-roster').locator('p')).toHaveCount(2)
+    expect(guestPosts).toBe(1)
+    expect(unexpectedRoomPosts).toBe(0)
+    expect(memberReads).toBe(0)
+    expect(await page.evaluate(() => (window as typeof window & {
+      __roomAdmissionCount?: number
+    }).__roomAdmissionCount)).toBe(1)
+
+    // A deliberately initiated member GET after online is the only new
+    // proof of room freshness. It must not replay create/join or issue
+    // a second guest identity.
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await page.getByTestId('lobby-refresh').click()
+    await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    expect(memberReads).toBe(1)
+    expect(guestPosts).toBe(1)
+    expect(unexpectedRoomPosts).toBe(0)
+  })
+}
