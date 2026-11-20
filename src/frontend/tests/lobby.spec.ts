@@ -1945,9 +1945,18 @@ test('uncertain hero/team/leave commits require a new verified roster, not optim
   await page.getByTestId('lobby-new-team').selectOption('black')
   // Explicitly refused 4xx operations cannot have committed; do not
   // manufacture a stale badge for an ordinary denied command.
+  const rejectedMessages = {
+    'denied-400': 'Richiesta non valida',
+    'denied-403': 'Accesso non autorizzato',
+    'denied-429': 'Troppe richieste',
+  } as const
   for (const response of ['denied-400', 'denied-403', 'denied-429'] as const) {
     teamResult = response
     await page.getByTestId('lobby-change-team').click()
+    // Wait for the actual HTTP rejection and the busy flag to clear before
+    // the next click, not merely an early enabled-button observation.
+    await expect(page.getByTestId('lobby-message'))
+      .toContainText(rejectedMessages[response])
     await expect(page.getByTestId('lobby-change-team')).toBeEnabled()
     await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
     await expect(page.getByTestId('lobby-revision')).toContainText('2')
