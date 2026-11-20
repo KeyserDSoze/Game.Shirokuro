@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { heroRoster } from '@/features/heroes/catalog'
-import type { LobbyRoster } from './api'
+import { LobbyHttpError, LobbyInputError, type LobbyRoster } from './api'
 import {
   LOBBY_ROSTER_POLL_INTERVAL_MS, LOBBY_ROSTER_MAX_BACKOFF_MS,
   LOBBY_ROSTER_RESUME_HINT_COOLDOWN_MS,
   classifyConflictRosterRefresh, classifyRosterPollFailure,
   isVerifiedLobbyRoster, reconcilePolledRoster, rosterPollDelayMs,
   rosterCanHonorResumeHint, rosterCanAdvanceOnWake,
-  rosterResumeDelayMs, nextRosterSyncStatus,
+  rosterResumeDelayMs, nextRosterSyncStatus, roomMutationOutcomeIsUncertain,
 } from './rosterSync'
 
 const lobbyId = 'room-' + 'a'.repeat(32)
@@ -560,5 +560,36 @@ describe('409 conflict refresh requires validated membership proof (#115)', () =
   it('rejects invalid local actor IDs without trusting server-looking JSON', () => {
     expect(classifyConflictRosterRefresh(roster(4), roster(5, [bob]), 'guest-alice'))
       .toBe('invalid')
+  })
+})
+
+describe('uncertain existing-room mutation outcomes (#209)', () => {
+  it.each([400, 401, 403, 404, 409, 422, 429])(
+    'preserves definite HTTP %i rejection handling without inventing a commit', status => {
+      expect(roomMutationOutcomeIsUncertain(new LobbyHttpError(status))).toBe(false)
+    },
+  )
+
+  it.each([500, 502, 503, 504, 599])(
+    'treats HTTP %i as potentially committed, never retryable by the browser', status => {
+      expect(roomMutationOutcomeIsUncertain(new LobbyHttpError(status))).toBe(true)
+    },
+  )
+
+  it.each([
+    new Error('Lobby request timed out'),
+    new TypeError('Failed to fetch'),
+    new SyntaxError('Bad JSON after successful PATCH'),
+    new Error('Invalid authenticated lobby roster response'),
+    null,
+    undefined,
+  ])('fails closed when the acknowledgement cannot be verified (%s)', error => {
+    expect(roomMutationOutcomeIsUncertain(error)).toBe(true)
+  })
+
+  it('never turns a local input validation error into an uncertain commit', () => {
+    expect(roomMutationOutcomeIsUncertain(
+      new LobbyInputError('Invalid invitation'),
+    )).toBe(false)
   })
 })
