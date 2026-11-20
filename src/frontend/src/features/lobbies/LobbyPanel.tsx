@@ -92,18 +92,32 @@ export default function LobbyPanel({ previewHeroId }: Props) {
   useEffect(() => {
     let active = true
     const generation = sessionGenerationRef.current
-    // An initial GET may arrive after an explicit login or a revocation:
-    // it must never overwrite a newer server-issued guest identity.
-    void guestLobbyApi.session()
-      .then(identity => {
-        if (active && generation === sessionGenerationRef.current &&
-            identity.kind === 'guest') {
-          sessionGenerationRef.current++
-          setSession(identity)
-        }
-      })
-      .catch(() => { /* API may be offline when exploring the local preview. */ })
-    return () => { active = false }
+    // Startup is a separate /sessions/me from cross-tab session rechecks.
+    // Its response is NOT evidence of a current guest once the browser has
+    // crossed an offline boundary. Do not issue an avoidable initial GET
+    // if the page was loaded offline; the regular online recheck resumes.
+    const offlineAtStart = !navigator.onLine
+    let connectionEpoch = 0
+    const onOffline = () => { connectionEpoch++ }
+    window.addEventListener('offline', onOffline)
+    // An initial GET may arrive after an explicit login, revocation or
+    // browser disconnect: none may adopt an obsolete guest identity.
+    if (!offlineAtStart) {
+      void guestLobbyApi.session()
+        .then(identity => {
+          if (active && connectionEpoch === 0 && navigator.onLine &&
+              generation === sessionGenerationRef.current &&
+              identity.kind === 'guest') {
+            sessionGenerationRef.current++
+            setSession(identity)
+          }
+        })
+        .catch(() => { /* API may be offline when exploring the local preview. */ })
+    }
+    return () => {
+      active = false
+      window.removeEventListener('offline', onOffline)
+    }
   }, [])
 
   // A tab can be signed out or signed in when another tab changes its
