@@ -1,5 +1,5 @@
 import { getHeroById } from '@/features/heroes/catalog'
-import { isCanonicalGuestPlayerId, type LobbyRoster } from './api'
+import { isCanonicalGuestPlayerId, LobbyHttpError, LobbyInputError, type LobbyRoster } from './api'
 
 /** Read-only, member-scoped, pre-match synchronization; not match state. */
 export const LOBBY_ROSTER_POLL_INTERVAL_MS = 15_000
@@ -63,6 +63,19 @@ export function rosterCanAdvanceOnWake(
   return Number.isSafeInteger(consecutiveFailures) &&
     consecutiveFailures >= 0 &&
     !outageWakeUsed
+}
+
+/**
+ * A failed existing-room PATCH/DELETE has an *unknown* commit outcome when
+ * the network/timeout lost the acknowledgement, the server returned 5xx, or
+ * a successful HTTP response could not be validated. Do not claim that the
+ * client's old roster revision is current or replay the command. A locally
+ * rejected input or a definite HTTP 4xx did not commit through this API.
+ * 409 has its own read-only recovery path in LobbyPanel (#208).
+ */
+export function roomMutationOutcomeIsUncertain(error: unknown): boolean {
+  if (error instanceof LobbyInputError) return false
+  return !(error instanceof LobbyHttpError) || error.status >= 500
 }
 
 export type PolledRosterDecision = 'updated' | 'unchanged' | 'missing' | 'invalid'
