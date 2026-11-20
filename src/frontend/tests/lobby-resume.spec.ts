@@ -747,3 +747,128 @@ for (const readKind of ['manual', 'conflict'] as const) {
     })
   }
 }
+
+for (const action of ['hero', 'team'] as const) {
+  test(`keeps a late successful room mutation stale across offline (${action})`, async ({ page }) => {
+    test.setTimeout(65_000)
+    await page.clock.install()
+    const code = 'room-' + '6'.repeat(32)
+    const actor = 'guest-' + '6'.repeat(32)
+    const initial = {
+      lobbyId: code, revision: 1, teamIds: ['white', 'black'],
+      participants: [{ playerId: actor, teamId: 'white', heroId: null }],
+    }
+    const updated = {
+      ...initial, revision: 2,
+      participants: [{ ...initial.participants[0],
+        teamId: action === 'team' ? 'black' : 'white',
+        heroId: action === 'hero' ? 'kira' : null }],
+    }
+    let signedIn = false
+    let signIns = 0
+    let creates = 0
+    let mutationNetworkCalls = 0
+    let memberReads = 0
+    await page.route('**/api/sessions/me', route => route.fulfill(signedIn
+      ? { status: 200, json: { kind: 'guest', playerId: actor } }
+      : { status: 401 }))
+    await page.route('**/api/sessions/guest', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      signedIn = true
+      signIns++
+      return route.fulfill({ status: 200, json: { kind: 'guest', playerId: actor } })
+    })
+    await page.route('**/api/lobbies', route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      creates++
+      return route.fulfill({ status: 201, json: initial })
+    })
+    await page.route('**/api/lobbies/' + code + '/roster/peek', route =>
+      route.fulfill({ status: 304, headers: {
+        ETag: route.request().headers()['if-none-match'] ?? '"rev-1"',
+        'Cache-Control': 'no-store',
+      } }))
+    await page.route('**/api/lobbies/' + code + '/roster', route => {
+      memberReads++
+      return route.fulfill({ status: 200, json: updated })
+    })
+    await page.route('**/api/lobbies/' + code + '/' + action, route => {
+      // The first PATCH is intercepted in page JS, so this route must
+      // never be hit unless the client wrongly replays the mutation.
+      mutationNetworkCalls++
+      return route.fulfill({ status: 200, json: updated })
+    })
+
+    await page.goto('/')
+    // Model a transport that keeps the PATCH response pending even after
+    // offline, then resolves it with an authoritative, validated 200.
+    // The application must keep its verified revision but *not* claim
+    // post-disconnect freshness; do not abort or replay the player's PATCH.
+    await page.evaluate(action => {
+      const state = window as typeof window & {
+        __heldMutationStarted?: boolean
+        __heldMutationCount?: number
+        __releaseHeldMutation?: (body: object) => void
+      }
+      const original = window.fetch.bind(window)
+      let intercepted = false
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input
+          : input instanceof Request ? input.url : String(input)
+        if (!intercepted && url.endsWith('/' + action) && init?.method === 'PATCH') {
+          intercepted = true
+          state.__heldMutationCount = (state.__heldMutationCount ?? 0) + 1
+          state.__heldMutationStarted = true
+          return new Promise<Response>(resolve => {
+            state.__releaseHeldMutation = body => resolve(new Response(
+              JSON.stringify(body), { status: 200,
+                headers: { 'Content-Type': 'application/json' } },
+            ))
+          })
+        }
+        return original(input, init)
+      }
+    }, action)
+    await page.getByTestId('lobby-sign-in').click()
+    await page.getByTestId('lobby-create').click()
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+    if (action === 'team')
+      await page.getByTestId('lobby-new-team').selectOption('black')
+    await page.getByTestId(action === 'team' ? 'lobby-change-team' : 'lobby-pick-hero').click()
+    await page.waitForFunction(() => (window as typeof window & {
+      __heldMutationStarted?: boolean
+    }).__heldMutationStarted === true)
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')))
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    await page.evaluate(updated => {
+      (window as typeof window & {
+        __releaseHeldMutation?: (body: object) => void
+      }).__releaseHeldMutation?.(updated)
+    }, updated)
+    await expect(page.getByTestId('lobby-revision')).toContainText('2')
+    await expect(page.getByTestId('lobby-roster-stale')).toBeVisible()
+    await expect(page.getByTestId('lobby-room-code')).toHaveText(code)
+    await expect(page.getByTestId('lobby-player')).toContainText(actor)
+    if (action === 'team') await expect(page.getByTestId('lobby-roster')).toContainText('black')
+    await expect(page.getByTestId('lobby-change-team')).toBeEnabled()
+    expect(memberReads).toBe(0)
+    expect(mutationNetworkCalls).toBe(0)
+    expect(signIns).toBe(1)
+    expect(creates).toBe(1)
+    expect(await page.evaluate(() => (window as typeof window & {
+      __heldMutationCount?: number
+    }).__heldMutationCount)).toBe(1)
+
+    // A later, explicitly authorized GET, initiated after reconnect, can
+    // certify that revision as current without replaying the PATCH.
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await page.getByTestId('lobby-refresh').click()
+    await expect(page.getByTestId('lobby-roster-stale')).toHaveCount(0)
+    await expect(page.getByTestId('lobby-revision')).toContainText('2')
+    expect(memberReads).toBe(1)
+    expect(mutationNetworkCalls).toBe(0)
+    expect(signIns).toBe(1)
+    expect(creates).toBe(1)
+  })
+}
