@@ -401,7 +401,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
     }
   }, [roomId, actorId, forgetGuest, forgetRoom, t])
 
-  async function run(action: (isCurrent: () => boolean) => Promise<void>) {
+  async function run(
+    action: (isCurrent: () => boolean) => Promise<void>,
+    roomMutationMayHaveCommitted = false,
+  ) {
     if (busyRef.current) return
     busyRef.current = true
     // User intent supersedes a passive read; never abort the user's mutation.
@@ -423,6 +426,17 @@ export default function LobbyPanel({ previewHeroId }: Props) {
       // An old 401 must not sign out a newer guest. Neither delayed errors
       // nor successful responses may change state after any identity switch.
       if (!isCurrent()) return
+      // A timed-out/failed PATCH or DELETE may already have committed on
+      // the server, even when the client never received an acknowledgement.
+      // An invalid success DTO is equally untrustworthy. Only these three
+      // existing-room mutations use this policy, not read-only refresh,
+      // guest sign-in or local input validation. Definite HTTP 4xx
+      // rejections retain their original handling (409 refresh below).
+      if (roomMutationMayHaveCommitted && conflictRoomId &&
+          currentRoomRef.current?.lobbyId === conflictRoomId &&
+          !(error instanceof LobbyInputError) &&
+          (!(error instanceof LobbyHttpError) || error.status >= 500))
+        setRosterSyncStatus('stale')
       if (error instanceof LobbyHttpError) {
         if (error.status === 401) {
           // The authoritative guest ticket no longer exists; an old room
@@ -512,6 +526,10 @@ export default function LobbyPanel({ previewHeroId }: Props) {
         setBusy(false)
       }
     }
+  }
+
+  function runRoomMutation(action: (isCurrent: () => boolean) => Promise<void>) {
+    return run(action, true)
   }
 
   function showRoom(next: LobbyRoster, expectedRoomId?: string) {
@@ -737,7 +755,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   type="button"
                   data-testid="lobby-pick-hero"
                   disabled={busy}
-                  onClick={() => void run(async isCurrent => {
+                  onClick={() => void runRoomMutation(async isCurrent => {
                     const result = await guestLobbyApi.chooseHero(
                       room.lobbyId, previewHeroId, room.revision)
                     if (!isCurrent()) return
@@ -764,7 +782,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   data-testid="lobby-change-team"
                   disabled={busy}
-                  onClick={() => void run(async isCurrent => {
+                  onClick={() => void runRoomMutation(async isCurrent => {
                     const result = await guestLobbyApi.changeTeam(
                       room.lobbyId, newTeam, room.revision)
                     if (!isCurrent()) return
@@ -779,7 +797,7 @@ export default function LobbyPanel({ previewHeroId }: Props) {
                   variant="outline"
                   data-testid="lobby-leave"
                   disabled={busy}
-                  onClick={() => void run(async isCurrent => {
+                  onClick={() => void runRoomMutation(async isCurrent => {
                     await guestLobbyApi.leave(room.lobbyId, room.revision)
                     if (!isCurrent()) return
                     // Clear the passive poll's current-room identity before
